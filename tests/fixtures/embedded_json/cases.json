@@ -1,0 +1,86 @@
+[
+  {
+    "id": "embedded_object",
+    "input": "2026-08-23T10:00:00Z INFO response={\"ok\":true,\"count\":2}",
+    "detect": true,
+    "start_line": 0,
+    "end_line": 0,
+    "root_kind": "object"
+  },
+  {
+    "id": "embedded_array",
+    "input": "payload: [1, {\"name\":\"Ada\"}, null] trailing text",
+    "detect": true,
+    "start_line": 0,
+    "end_line": 0,
+    "root_kind": "array"
+  },
+  {
+    "id": "multiline_nested",
+    "input": "INFO body={\n  \"user\": {\n    \"id\": 42,\n    \"roles\": [\"admin\", \"reader\"]\n  }\n}\nINFO completed",
+    "detect": true,
+    "start_line": 0,
+    "end_line": 5,
+    "root_kind": "object"
+  },
+  {
+    "id": "quoted_delimiters",
+    "input": "DEBUG data={\"text\":\"a } and ] stay inside\",\"quote\":\"\\\"{\\\"\"}",
+    "detect": true,
+    "start_line": 0,
+    "end_line": 0,
+    "root_kind": "object"
+  },
+  {
+    "id": "unicode_and_crlf",
+    "input": "INFO {\r\n  \"message\": \"ঢাকা 🚀\"\r\n}",
+    "detect": true,
+    "start_line": 0,
+    "end_line": 2,
+    "root_kind": "object"
+  },
+  {
+    "id": "nested_prefers_outer",
+    "input": "value={\"outer\":{\"inner\":1}}",
+    "detect": true,
+    "start_line": 0,
+    "end_line": 0,
+    "root_kind": "object"
+  },
+  {
+    "id": "malformed_unclosed",
+    "input": "INFO response={\"ok\": true\nnext log record",
+    "detect": false
+  },
+  {
+    "id": "balanced_but_invalid",
+    "input": "INFO response={ok: true}",
+    "detect": false
+  },
+  {
+    "id": "ordinary_braces",
+    "input": "formatter reported {placeholder} and continued",
+    "detect": false
+  },
+  {
+    "id": "bracketed_log_metadata",
+    "input": "2026-08-23 [INFO] [worker-2] request complete",
+    "detect": false
+  },
+  {
+    "id": "empty_object",
+    "input": "payload={}",
+    "detect": true,
+    "start_line": 0,
+    "end_line": 0,
+    "root_kind": "object"
+  },
+  {
+    "id": "empty_array",
+    "input": "payload=[]",
+    "detect": true,
+    "start_line": 0,
+    "end_line": 0,
+    "root_kind": "array"
+  }
+]

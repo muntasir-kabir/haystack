@@ -1,0 +1,262 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            # NSIS → native Windows installer: logotomy-<version>-setup.exe
+            formats: nsis
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            # Debian package + AppImage for Ubuntu/Linux
+            formats: deb,appimage
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            # Apple Silicon; format "app" produces the .app bundle used by dmg
+            formats: app,dmg
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            # Intel macOS
+            formats: app,dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Validate release version
+        shell: bash
+        run: |
+          package_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "logotomy") | .version')
+          packager_version=$(awk '
+            /^\[package\.metadata\.packager\]$/ { in_packager=1; next }
+            /^\[/ { in_packager=0 }
+            in_packager && /^version[[:space:]]*=/ {
+              gsub(/[" ]/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          test "$package_version" = "$tag_version" || {
+            echo "Cargo package version ($package_version) does not match tag ($tag_version)"
+            exit 1
+          }
+          test "$packager_version" = "$tag_version" || {
+            echo "Packager version ($packager_version) does not match tag ($tag_version)"
+            exit 1
+          }
+      - name: Validate file associations
+        shell: bash
+        run: |
+          expected='["csv","err","evt","evtx","json","log","md","out","sys","txt","xml"]'
+          actual=$(cargo metadata --no-deps --format-version 1 \
+            | jq -c '[.packages[]
+              | select(.name == "logotomy")
+              | .metadata.packager["file-associations"][]
+              | .extensions[]] | sort')
+          test "$actual" = "$expected" || {
+            echo "File associations do not match expected extensions"
+            echo "expected: $expected"
+            echo "actual:   $actual"
+            exit 1
+          }
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: target
+      - name: Install NSIS (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nsis -y
+      - name: Cache cargo-packager binary
+        id: cache-packager
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-packager*
+          # Bump this key when you want CI to rebuild the tool (version pin).
+          # Include the host architecture: macOS release jobs run on both
+          # Apple Silicon and Intel, and cargo-packager is a host executable.
+          key: cargo-packager-${{ runner.os }}-${{ runner.arch }}-0.11.8
+      - name: Install cargo-packager
+        if: steps.cache-packager.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --locked --version 0.11.8
+      - name: Run Cargo Test (main app)
+        shell: bash
+        run: cargo test --release --target ${{ matrix.target }}
+      - name: Run Cargo Test (gen_ios_logs example)
+        shell: bash
+        run: cargo test --release --target ${{ matrix.target }} --example gen_ios_logs
+      - name: Generate iOS test log
+        shell: bash
+        run: cargo run --release --target ${{ matrix.target }} --example gen_ios_logs -- 100K
+      - name: Run Cargo Bench (iOS log)
+        shell: bash
+        run: |
+          {
+            echo "# logotomy benchmark"
+            echo "target: ${{ matrix.target }}"
+            echo "tag: ${{ github.ref_name }}"
+            echo "runner: ${{ matrix.os }}"
+            echo "command: cargo run --release --target ${{ matrix.target }} --example bench -- iOS-100K.log ERROR user_id"
+            echo
+            cargo run --release --target ${{ matrix.target }} --example bench -- iOS-100K.log ERROR user_id
+          } 2>&1 | tee "benchmark-${{ matrix.target }}.txt"
+      - name: Build release binary
+        # packager does NOT build the binary itself; cargo test leaves only test-harness binaries
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Smoke-test built binary
+        shell: bash
+        run: |
+          BIN="./target/${{ matrix.target }}/release/logotomy"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then BIN="${BIN}.exe"; fi
+          "$BIN" --help
+      # cargo-packager reads [package.metadata.packager] from Cargo.toml,
+      # wraps the already-built binary, and emits installers to --out-dir
+      # (default: target/<triple>/release).
+      - name: Build native installers
+        shell: bash
+        run: |
+          mkdir -p dist
+          cargo packager --release --out-dir dist --formats ${{ matrix.formats }} --target ${{ matrix.target }}
+          ls -la dist/
+      - name: Collect installer artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          # Copy installers out of dist/ (excludes the .app bundle dir + the
+          # packager's internal .cargo-packager staging) and rename them to a
+          # collision-free, explicit scheme: logotomy-<tag>-<target>.<ext>.
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.exe|*.deb|*.dmg|*.AppImage) ;;
+              *) continue ;;
+            esac
+            cp "$f" "artifacts/logotomy-${{ github.ref_name }}-${{ matrix.target }}.${f##*.}"
+          done
+          cp "benchmark-${{ matrix.target }}.txt" artifacts/
+          echo "--- installers ---"
+          ls -la artifacts/
+          test -n "$(ls -A artifacts)" || { echo "::error::no installer artifacts produced"; exit 1; }
+      - name: Verify runnable binary extension (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          test -f "target/${{ matrix.target }}/release/logotomy.exe" \
+            && echo "OK: Windows binary is logotomy.exe" || { echo "ERROR: expected .exe"; exit 1; }
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logotomy-${{ matrix.target }}
+          path: artifacts/
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: logotomy-*
+          merge-multiple: true
+      - name: Combine benchmark results
+        shell: bash
+        run: |
+          : > benchmark-results.txt
+          for f in benchmark-*.txt; do
+            [ "$f" = "benchmark-results.txt" ] && continue
+            [ -f "$f" ] || continue
+            {
+              echo "============================================================"
+              echo "${f}"
+              echo "============================================================"
+              cat "$f"
+              echo
+            } >> benchmark-results.txt
+          done
+          cat benchmark-results.txt
+      - name: Generate checksums
+        shell: bash
+        run: |
+          sha256sum logotomy* benchmark-results.txt > checksums.sha256
+          cat checksums.sha256
+      - name: Generate release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          ## Downloads
+
+          Choose the installer for your operating system. Verify downloads with `checksums.sha256` before running them.
+
+          ### macOS
+
+          The current macOS builds are not code-signed or notarized. After opening the DMG, drag `logotomy.app` to Applications. On the first launch, right-click the app, choose **Open**, and confirm **Open**.
+
+          If macOS still blocks the app, use this command after verifying the checksum and download source:
+
+          ```bash
+          xattr -d com.apple.quarantine /Applications/logotomy.app
+          ```
+
+          Do not use Recovery-mode `csrutil` commands; Logotomy is a normal user-space application and does not require kernel/system extensions.
+
+          ### Windows
+
+          The Windows installer is currently unsigned. If Microsoft Defender SmartScreen shows “Windows protected your PC”, verify the download, click **More info**, then **Run anyway**.
+
+          ### Ubuntu/Linux
+
+          For the `.deb` package:
+
+          ```bash
+          sudo apt install ./logotomy-*.deb
+          ```
+
+          For the AppImage:
+
+          ```bash
+          chmod +x logotomy-*.AppImage
+          ./logotomy-*.AppImage
+          ```
+
+          ## Benchmark results
+
+          See `benchmark-results.txt` for the release benchmark output from every target.
+          EOF
+          cat release-notes.md
+      - name: Create GitHub Release and Upload Installers
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          files: |
+            logotomy-*.exe
+            logotomy-*.deb
+            logotomy-*.dmg
+            logotomy-*.AppImage
+            benchmark-results.txt
+            checksums.sha256

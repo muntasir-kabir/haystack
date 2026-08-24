@@ -1,0 +1,98 @@
+[package]
+name = "logotomy"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance log analysis & visualization. 50MB log file? logotomy happened in there — let's find out."
+
+[features]
+default = ["gui"]
+gui = ["eframe", "rfd", "egui_dock", "resvg", "dep:image"]
+
+[lib]
+name = "logotomy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "logotomy"
+path = "src/main.rs"
+
+[dependencies]
+# GUI dependencies (behind "gui" feature)
+eframe = { version = "0.35", optional = true }
+egui_dock = { version = "0.20", optional = true }
+rfd = { version = "0.17", optional = true }
+resvg = { version = "0.48", optional = true, default-features = false }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+
+# Core dependencies (always required)
+memmap2 = "0.9"
+memchr = "2"
+aho-corasick = "1"
+chrono = "0.4"
+regex = "1"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+dirs = "6.0"
+fs2 = "0.4.3"
+rustc-hash = "2"
+rand = "0.8"
+
+[dev-dependencies]
+rand_pcg = "0.3"
+
+# Static .exe icon + version-info resources (embedded by build.rs). Only
+# active on Windows targets; no-op everywhere else.
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Native OS installer configuration (cargo-packager).
+# See https://github.com/crabnebula-dev/cargo-packager — `cargo packager` reads
+# this table. Build on each host OS: NSIS .exe (Windows), .deb/.AppImage
+# (Ubuntu), .dmg/.app (macOS Intel + Apple Silicon).
+# Note: the packager wraps the binary you already built (it does NOT build it
+# itself unless `before-packaging-command` is set) — first run
+# `cargo build --release --target <triple>`, then `cargo packager ...`.
+[package.metadata.packager]
+identifier = "com.muntasir-kabir.logotomy"
+product-name = "logotomy"
+version = "0.1.0"
+description = "High-performance log analysis & visualization"
+homepage = "https://github.com/muntasir-kabir/logotomy"
+authors = ["MK <muntasir.kabir@gmail.com>"]
+copyright = "Copyright (c) 2026 MK"
+license-file = "LICENSE"
+# PNGs are auto-converted to .ico/.icns by the packager as needed;
+# logotomy.ico is committed for the NSIS installer icon + Windows exe icon.
+icons = [
+  "assets/icons/logotomy_128.png",
+  "assets/icons/logotomy_256.png",
+  "assets/icons/logotomy_512.png",
+]
+# Register files that logotomy can open with the native installers. Extensions
+# omit the leading dot because that is the cargo-packager format.
+file-associations = [
+  { extensions = ["log", "txt", "out", "err"], mime-type = "text/plain", name = "Log file", description = "Log file", role = "viewer" },
+  { extensions = ["evt", "evtx", "sys"], mime-type = "application/octet-stream", name = "System log file", description = "System log file", role = "viewer" },
+  { extensions = ["csv"], mime-type = "text/csv", name = "CSV log file", description = "CSV log file", role = "viewer" },
+  { extensions = ["json"], mime-type = "application/json", name = "JSON log file", description = "JSON log file", role = "viewer" },
+  { extensions = ["xml"], mime-type = "application/xml", name = "XML log file", description = "XML log file", role = "viewer" },
+  { extensions = ["md"], mime-type = "text/markdown", name = "Markdown log file", description = "Markdown log file", role = "viewer" },
+]
+
+[package.metadata.packager.linux]
+generate-desktop-entry = true
+
+[package.metadata.packager.macos]
+minimum-system-version = "10.15"
+
+[package.metadata.packager.nsis]
+installMode = "currentUser"
+installer-icon = "assets/icons/logotomy.ico"

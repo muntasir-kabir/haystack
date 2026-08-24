@@ -1,0 +1,41 @@
+name: Multi-Platform CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Build and Check
+    # The matrix targets three different runner operating systems
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Run Cargo Check
+        run: cargo check --all-targets
+
+      - name: Run Cargo Test (main app)
+        run: cargo test --release
+
+      - name: Run Cargo Test (gen_ios_logs example)
+        run: cargo test --release --example gen_ios_logs
+
+      - name: Generate iOS test log
+        run: cargo run --release --example gen_ios_logs -- 100K
+
+      - name: Run Cargo Bench (iOS log)
+        run: cargo run --release --example bench -- iOS-100K.log ERROR user_id

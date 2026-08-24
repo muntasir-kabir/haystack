@@ -1,0 +1,1 @@
+# Read `AI_ASSISTANT.md` for project rules and context.
