@@ -7,6 +7,7 @@ High-performance Rust log analyzer & visualizer (GUI + MCP server for AI assista
 2. **Fixes** — add a 1-2 sentence entry at the top of `changes.md` describing what changed and why.
 3. **Tests** — run `cargo test` after code changes; all must pass. Always add test for new feature or bug changes
 4. **No Python** — template mining is native Rust (Drain). Never shell out.
+5. **Releases** — before creating or pushing a `vX.Y.Z` tag, set both `package.version` and `[package.metadata.packager].version` in `Cargo.toml` to the same `X.Y.Z`, let Cargo refresh the matching `Cargo.lock` package version, and run the exact **Validate release version** step from `.github/workflows/release.yml` locally. It checks the Cargo metadata package version and the packager-table version independently against the tag before tagging.
 
 ## Try to follow
 - Focus on code quality & maintainence 
