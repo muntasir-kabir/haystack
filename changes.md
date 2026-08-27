@@ -1,3 +1,7 @@
+# Fix v0.1.1 packager metadata
+
+Aligned the cargo-packager installer version with the `0.1.1` crate and release tag so the GitHub release workflow validates successfully.
+
 # Make GUI-agent investigation guidance flexible
 
 Reworked the GUI MCP instruction from a rigid sequence into a concise suggested approach: use the GUI-bound document, understand the user's findings, explore log shape, narrow hypotheses only when useful, and publish evidence-backed conclusions.

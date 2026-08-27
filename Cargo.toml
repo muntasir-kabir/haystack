@@ -63,7 +63,7 @@ codegen-units = 1
 [package.metadata.packager]
 identifier = "com.muntasir-kabir.logotomy"
 product-name = "logotomy"
-version = "0.1.0"
+version = "0.1.1"
 description = "High-performance log analysis & visualization"
 homepage = "https://github.com/muntasir-kabir/logotomy"
 authors = ["MK <muntasir.kabir@gmail.com>"]
