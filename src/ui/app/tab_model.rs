@@ -31,7 +31,7 @@ impl LogTab {
             pending_scroll: None,
             show_templates: false,
             timeline_zoom: None,
-            selected_diamond: None,
+            timeline_brush_start: None,
             selected_lane: None,
             pending_toast: None,
             filter_input: String::new(),
@@ -83,6 +83,7 @@ impl LogTab {
             search_focus_requested: false,
             search_focus_anim: None,
             filter_highlight: None,
+            occurrence_navigation_animation: None,
             dock_state,
             detached_views: HashSet::new(),
             detached_locations: HashMap::new(),
@@ -382,7 +383,6 @@ impl LogTab {
         }
         if self.selected_lane == Some(idx) {
             self.selected_lane = None;
-            self.selected_diamond = None;
         } else if let Some(selected) = self.selected_lane {
             if selected > idx {
                 self.selected_lane = Some(selected - 1);
@@ -401,7 +401,6 @@ impl LogTab {
         self.filters.clear();
         self.everything_else_active = true;
         self.selected_lane = None;
-        self.selected_diamond = None;
         self.rescan_filters();
     }
 
@@ -451,7 +450,6 @@ impl LogTab {
 
         if self.filters.is_empty() {
             self.selected_lane = None;
-            self.selected_diamond = None;
             self.matches = Arc::new(Vec::new());
             self.timeline = Timeline::build_u32(&self.doc, &[], DEFAULT_BUCKETS);
             self.search_rx = None;
@@ -594,7 +592,7 @@ impl LogTab {
                 (start_ms, end_ms)
             }
             logotomy::core::timeline::TimelineDomain::Sequence => {
-                (1, self.doc.total_lines() as i64)
+                (0, self.doc.total_lines().saturating_sub(1) as i64)
             }
         };
         let (view_start, view_end) = match self.timeline_zoom {
@@ -635,7 +633,7 @@ impl LogTab {
                     _ => return,
                 }
             }
-            logotomy::core::timeline::TimelineDomain::Sequence => first_line as i64 + 1,
+            logotomy::core::timeline::TimelineDomain::Sequence => first_line as i64,
         };
         let v1 = match self.timeline.domain {
             logotomy::core::timeline::TimelineDomain::Time { .. } => {
@@ -644,7 +642,7 @@ impl LogTab {
                     _ => return,
                 }
             }
-            logotomy::core::timeline::TimelineDomain::Sequence => last_line as i64 + 1,
+            logotomy::core::timeline::TimelineDomain::Sequence => last_line as i64,
         };
         // Match the shadow renderer: only act when the mapped values are valid.
         if v0 < 0 || v1 < 0 {
@@ -655,7 +653,7 @@ impl LogTab {
                 (start_ms, end_ms)
             }
             logotomy::core::timeline::TimelineDomain::Sequence => {
-                (1, self.doc.total_lines() as i64)
+                (0, self.doc.total_lines().saturating_sub(1) as i64)
             }
         };
         let (view_start, view_end) = match self.timeline_zoom {
@@ -702,7 +700,6 @@ impl LogTab {
         self.visible_lines = None;
         self.timeline_zoom = None;
         self.context_line = None;
-        self.selected_diamond = None;
         self.pending_filter_removal = None;
         self.pending_clear_filters = false;
         self.pins.clear();
@@ -746,7 +743,6 @@ impl LogTab {
         self.visible_lines = None;
         self.timeline_zoom = None;
         self.context_line = None;
-        self.selected_diamond = None;
         self.pending_filter_removal = None;
         self.pending_clear_filters = false;
         self.pins.clear();
@@ -951,7 +947,6 @@ impl LogTab {
 
         self.context_line = Some(target);
         self.pending_scroll = Some(target);
-        self.sync_timeline_selection_to_line(target);
         self.ensure_visible();
     }
 
@@ -961,7 +956,6 @@ impl LogTab {
             return;
         }
         self.selected_lane = Some(lane);
-        self.selected_diamond = None;
         self.pending_toast =
             Some("Left Arrow/Right Arrow to select previous/Next filter occurrence".to_string());
     }
@@ -987,11 +981,7 @@ impl LogTab {
             return;
         }
 
-        let current = self
-            .selected_diamond
-            .filter(|(selected_lane, _)| *selected_lane == lane)
-            .map(|(_, line)| line)
-            .or(self.context_line);
+        let current = self.context_line;
         let target = if let Some(current) = current {
             if next {
                 matches
@@ -1015,7 +1005,6 @@ impl LogTab {
 
         self.context_line = Some(target);
         self.pending_scroll = Some(target);
-        self.selected_diamond = Some((lane, target));
         self.sync_navigation_positions(target);
         self.ensure_visible();
     }
@@ -1023,33 +1012,23 @@ impl LogTab {
     /// Keep the lane and Log View search cursors aligned when both are active.
     /// Each cursor moves to the nearest occurrence in its own sorted list.
     pub(crate) fn sync_navigation_positions(&mut self, line: usize) {
-        if let Some(lane) = self.selected_lane {
-            if let Some(matches) = self.matches.get(lane) {
-                if let Some(nearest) = nearest_occurrence(matches.iter().map(|&m| m as usize), line)
-                {
-                    self.selected_diamond = Some((lane, nearest.1));
-                }
-            }
-        }
         if let Some(nearest) = nearest_occurrence(self.find_matches.iter().copied(), line) {
             self.find_pos = Some(nearest.0);
         }
     }
 
-    /// Update the selected diamond for a newly selected log line without
-    /// changing the user's selected lane. A line that does not match that
-    /// lane clears the diamond and its occurrence status.
-    pub(crate) fn sync_timeline_selection_to_line(&mut self, line: usize) {
-        if let Some(lane) = self.selected_lane {
-            let matches_line = self
-                .matches
-                .get(lane)
-                .is_some_and(|occurrences| occurrences.binary_search(&(line as u32)).is_ok())
-                && self.lane_active.get(lane).copied().unwrap_or(true);
-            self.selected_diamond = matches_line.then_some((lane, line));
-        } else {
-            self.selected_diamond = None;
-        }
+    /// Derive the current lane occurrence instead of storing duplicate
+    /// selection state. An arbitrary log line is not an occurrence unless it
+    /// belongs to the selected, enabled lane.
+    pub(crate) fn selected_occurrence(&self) -> Option<(usize, usize)> {
+        let lane = self.selected_lane?;
+        let line = self.context_line?;
+        let active = self.lane_active.get(lane).copied().unwrap_or(true);
+        let matches_line = self
+            .matches
+            .get(lane)
+            .is_some_and(|occurrences| occurrences.binary_search(&(line as u32)).is_ok());
+        (active && matches_line).then_some((lane, line))
     }
 
     /// Select a line chosen from the timeline. When a lane supplied the click,
@@ -1057,19 +1036,6 @@ impl LogTab {
     pub(crate) fn select_timeline_line(&mut self, line: usize, clicked_lane: Option<usize>) {
         if let Some(lane) = clicked_lane {
             self.selected_lane = Some(lane);
-            let matches_line = self
-                .matches
-                .get(lane)
-                .is_some_and(|occurrences| occurrences.binary_search(&(line as u32)).is_ok());
-            self.selected_diamond = matches_line.then_some((lane, line));
-        } else if self
-            .matches
-            .iter()
-            .any(|occurrences| occurrences.binary_search(&(line as u32)).is_ok())
-        {
-            self.sync_timeline_selection_to_line(line);
-        } else {
-            self.selected_diamond = None;
         }
         self.context_line = Some(line);
         self.pending_scroll = Some(line);
@@ -1082,7 +1048,6 @@ impl LogTab {
         self.find_pos = Some(i.min(self.find_matches.len().saturating_sub(1)));
         self.context_line = Some(line);
         self.pending_scroll = Some(line);
-        self.sync_timeline_selection_to_line(line);
         self.ensure_visible();
     }
 

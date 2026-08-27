@@ -24,7 +24,6 @@ pub(super) fn template_browser(ui: &mut egui::Ui, tab: &mut LogTab) {
                 );
                 if resp.clicked() {
                     tab.context_line = Some(example_line);
-                    tab.sync_timeline_selection_to_line(example_line);
                     tab.pending_scroll = Some(example_line);
                 }
                 if resp.hovered() {

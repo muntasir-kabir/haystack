@@ -209,12 +209,14 @@ impl LogotomyApp {
         self.poll_loaders();
         self.poll_mcp_dirty();
         self.poll_mcp_filters();
+        self.poll_mcp_analyses();
         self.poll_tail_updates();
         self.poll_file_updates();
         // Push any GUI-originated doc mutations (trim/append) into MCP state.
         self.sync_mcp_active_doc();
         // Push any GUI-originated filter-set changes into MCP state.
         self.sync_mcp_filters();
+        self.sync_mcp_analyses();
         let mut any_search = false;
         for tab in &mut self.tabs {
             if tab.poll_search() {

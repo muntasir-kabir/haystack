@@ -1,20 +1,20 @@
 //! The timeline strip: whole-file line density (gray histogram) with one
-//! colored lane per filter underneath. Filter occurrences are shown as
-//! selectable ◆ diamonds. Zoom with scroll wheel, pan with drag, brush
+//! colored lane per filter underneath. Single filter occurrences are shown at
+//! their exact position; aggregated buckets join into a continuous density
+//! strip. Zoom with scroll wheel, pan with drag, brush
 //! select a range with shift+drag. A minimap below shows the full-file
 //! overview with the current zoom window highlighted.
 //!
-//! Click any diamond → context panel shows that line ± radius with line
-//! numbers and original log text.
+//! Click any occurrence mark → jump the Log View to that real line.
 
 use std::time::Duration;
 
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
 use logotomy::core::document::LogDocument;
 use logotomy::core::time::format_ms;
-use logotomy::core::timeline::{Timeline, TimelineDomain};
+use logotomy::core::timeline::TimelineDomain;
 
 use crate::ui::app::model::LogTab;
 use crate::ui::filters as filter_strip;
@@ -24,14 +24,21 @@ use crate::ui::theme::Theme;
 const HISTO_HEIGHT: f32 = 68.0;
 const LANE_HEIGHT: f32 = 14.0;
 const MAX_LANES: usize = 20;
-/// When the visible filter points in a lane exceed this threshold,
-/// fall back to bucket bars instead of individual diamonds.
-const DIAMOND_LIMIT: usize = 500;
+// Occurrence/bucket dimensions are intentionally centralized here so the lane
+// scale can be customized without touching rendering logic.
+const OCCURRENCE_BUCKET_WIDTH: f32 = 8.0;
+const SINGLE_OCCURRENCE_WIDTH: f32 = 3.0;
+const SINGLE_OCCURRENCE_HEIGHT: f32 = 7.0;
+const SMALL_BUCKET_HEIGHT: f32 = 7.0;
+const MEDIUM_BUCKET_HEIGHT: f32 = 9.0;
+const DENSE_BUCKET_HEIGHT: f32 = 11.0;
+
+// Count thresholds for the three aggregated bucket tiers.
+const SMALL_BUCKET_MAX_OCCURRENCES: u32 = 4;
+const MEDIUM_BUCKET_MAX_OCCURRENCES: u32 = 16;
 const MINIMAP_HEIGHT: f32 = 12.0;
 /// Zoom factor per scroll tick.
 const ZOOM_FACTOR: f64 = 1.18;
-/// Minimum zoom span as fraction of total span.
-const MIN_ZOOM_FRAC: f64 = 0.0005;
 /// Width of the left column for filter labels + visibility/delete controls.
 const LABEL_WIDTH: f32 = 216.0;
 /// Left padding from the label column edge to the eye icon.
@@ -163,13 +170,26 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     ui.label(RichText::new("Use").small().color(theme.text_muted));
                     if let Some(text) = occurrence_navigation_text(tab) {
                         ui.add_space(10.0);
-                        show_occurrence_navigation(ui, &text, theme);
+                        let changed = tab
+                            .occurrence_navigation_animation
+                            .as_ref()
+                            .is_none_or(|(last_text, _)| last_text != &text);
+                        if changed {
+                            tab.occurrence_navigation_animation =
+                                Some((text.clone(), std::time::Instant::now()));
+                        }
+                        let elapsed = tab
+                            .occurrence_navigation_animation
+                            .as_ref()
+                            .map(|(_, at)| at.elapsed());
+                        show_occurrence_navigation(ui, &text, theme, elapsed);
+                    } else {
+                        tab.occurrence_navigation_animation = None;
                     }
                 },
             );
             if unselect {
                 tab.selected_lane = None;
-                tab.selected_diamond = None;
             }
         }
     });
@@ -248,9 +268,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     };
 
     // ---- density histogram (full-height background) ----
-    let density_bins = aggregate_timeline_bins(
-        &tab.timeline,
-        &tab.timeline.density,
+    let density_bins = tab.timeline.resolve_density_bins(
+        &tab.doc,
         view_start,
         view_end,
         hist.width().ceil() as usize,
@@ -284,14 +303,13 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let mut toggle_ee: Option<bool> = None;
     let mut toggle_kw: Option<(usize, bool)> = None;
     let mut select_lane: Option<usize> = None;
-    let mut selected_occurrence = false;
+    let mut clicked_occurrence = false;
     // Lane hit targets can consume the pointer event before the outer timeline
     // response sees it. Keep the position so an empty lane click still moves
     // the log view.
     let mut lane_click_pos: Option<Pos2> = None;
     let mut lane_click_lane: Option<usize> = None;
-    let mut sync_line: Option<usize> = None;
-    // Deferred ensure_visible (diamond click sets context_line within an immutably-borrowed loop).
+    // Deferred ensure_visible (occurrence clicks happen inside an immutably-borrowed loop).
     let mut ensure_line: Option<usize> = None;
 
     if has_filters {
@@ -380,7 +398,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 theme.text_muted
             },
         );
-        // No density line, no diamonds for Everything Else lane.
+        // No density line or occurrence buckets for Everything Else lane.
     }
 
     // ---- filter lanes (index 1..total_lanes) ----
@@ -455,7 +473,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             let kw_label_id = ui.id().with(("kw_lane", ki));
             let kw_check_resp = ui.interact(kw_label_rect, kw_label_id, Sense::click());
             if kw_check_resp.clicked() {
-                select_lane = Some(ki);
+                toggle_kw = Some((ki, !is_active));
             }
             // Native visible/invisible toggle button
             let kw_marker_pos =
@@ -596,7 +614,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             }
 
             if !is_active {
-                // Lane is disabled: skip density line and diamonds.
+                // Lane is disabled: skip density line and occurrence buckets.
                 continue;
             }
 
@@ -610,99 +628,113 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 ],
                 Stroke::new(1.0_f32, color),
             );
-            let kb = &tab.timeline.filter_buckets[ki];
-
-            // ---- filter occurrences: diamonds (sparse) or bucket bars (dense) ----
-            let point_count = tab.timeline.point_count_in_range(ki, view_start, view_end);
-
-            if point_count > 0 && point_count <= DIAMOND_LIMIT {
-                // --- individual diamonds ---
-                if let Some(pts) = tab.timeline.points_in_range(ki, view_start, view_end) {
-                    for &(line_idx, xv) in pts {
-                        let cx = x_to_px(xv);
-                        let cy = y + LANE_HEIGHT / 2.0; // vertical center of the lane
-                        let half = 5.0_f32;
-                        let diamond = Shape::convex_polygon(
-                            vec![
-                                Pos2::new(cx, cy - half),
-                                Pos2::new(cx + half, cy),
-                                Pos2::new(cx, cy + half),
-                                Pos2::new(cx - half, cy),
-                            ],
-                            color,
-                            Stroke::new(
-                                if tab.selected_diamond == Some((ki, line_idx as usize)) {
-                                    1.5_f32
-                                } else {
-                                    0.0_f32
-                                },
-                                theme.diamond_stroke,
-                            ),
-                        );
-                        painter.add(diamond);
-
-                        // Invisible click target per diamond (bigger to match larger diamond).
-                        let click_rect =
-                            Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(12.0, 12.0));
-                        let click_id = ui.id().with(("diamond", ki, line_idx));
-                        let click_resp = ui.interact(click_rect, click_id, Sense::click());
-                        if click_resp.clicked() {
-                            select_lane = Some(ki);
-                            selected_occurrence = true;
-                            tab.context_line = Some(line_idx as usize);
-                            tab.selected_diamond = Some((ki, line_idx as usize));
-                            tab.pending_scroll = Some(line_idx as usize);
-                            sync_line = Some(line_idx as usize);
-                            ensure_line = Some(line_idx as usize);
-                        }
-                        if click_resp.hovered() {
-                            painter.add(Shape::convex_polygon(
-                                vec![
-                                    Pos2::new(cx, cy - half - 1.0),
-                                    Pos2::new(cx + half + 1.0, cy),
-                                    Pos2::new(cx, cy + half + 1.0),
-                                    Pos2::new(cx - half - 1.0, cy),
-                                ],
-                                Color32::TRANSPARENT,
-                                Stroke::new(1.5_f32, theme.diamond_hover),
-                            ));
-                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-                            let tip = format!("◆ {} — line {}", tab.filters[ki].text, line_idx + 1);
-                            click_resp.on_hover_text(tip);
-                        }
-                    }
+            // ---- exact adaptive filter occurrences ----
+            // Resolve by marker footprint, not by the fixed whole-file buckets.
+            // Zooming therefore splits close points as soon as the screen can
+            // distinguish them, while every non-empty cell remains visible.
+            let marker_columns = (hist.width() / OCCURRENCE_BUCKET_WIDTH).ceil().max(1.0) as usize;
+            let resolved =
+                tab.timeline
+                    .resolve_filter_bins(ki, view_start, view_end, marker_columns);
+            for (bin_index, bin) in resolved.iter().enumerate() {
+                if bin.count == 0 {
+                    continue;
                 }
-            } else if point_count > DIAMOND_LIMIT {
-                // --- too many points: fall back to bucket bars ---
-                let bins = aggregate_timeline_bins(
-                    &tab.timeline,
-                    kb,
-                    view_start,
-                    view_end,
-                    hist.width().ceil() as usize,
-                );
-                for (i, &c) in bins.iter().enumerate() {
-                    if c == 0 {
-                        continue;
-                    }
-                    let x0 = hist.left() + i as f32 * hist.width() / bins.len() as f32;
-                    let x1 = hist.left() + (i + 1) as f32 * hist.width() / bins.len() as f32;
-                    let center_y = y + LANE_HEIGHT / 2.0;
-                    let h = (c as f32 / max_d).clamp(1.0, LANE_HEIGHT / 2.0 - 1.0);
-                    painter.rect_filled(
-                        Rect::from_min_max(
-                            Pos2::new(x0.max(hist.left()), center_y - h),
-                            Pos2::new(x1.min(hist.right()), center_y),
-                        ),
-                        egui::CornerRadius::ZERO,
-                        color,
+                let cell_x0 =
+                    hist.left() + bin_index as f32 * hist.width() / resolved.len().max(1) as f32;
+                let cell_x1 = hist.left()
+                    + (bin_index + 1) as f32 * hist.width() / resolved.len().max(1) as f32;
+                let cy = y + LANE_HEIGHT / 2.0;
+
+                if let Some((line_idx, xv)) = bin.sole_point {
+                    let cx = x_to_px(xv);
+                    let occurrence_rect = Rect::from_center_size(
+                        Pos2::new(cx, cy),
+                        Vec2::new(SINGLE_OCCURRENCE_WIDTH, SINGLE_OCCURRENCE_HEIGHT),
                     );
+                    painter.rect_filled(occurrence_rect, egui::CornerRadius::same(1), color);
+
+                    // Comfortable invisible hit target around the exact
+                    // 2px-wide occurrence marker.
+                    let click_rect =
+                        Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(8.0, 10.0));
+                    let click_id = ui.id().with(("occurrence", ki, line_idx));
+                    let click_resp = ui.interact(click_rect, click_id, Sense::click());
+                    if click_resp.clicked() {
+                        select_lane = Some(ki);
+                        clicked_occurrence = true;
+                        tab.context_line = Some(line_idx as usize);
+                        tab.pending_scroll = Some(line_idx as usize);
+                        ensure_line = Some(line_idx as usize);
+                    }
+                    if click_resp.hovered() {
+                        painter.rect_stroke(
+                            occurrence_rect.expand(1.0),
+                            egui::CornerRadius::same(1),
+                            Stroke::new(1.5_f32, theme.occurrence_hover),
+                            egui::StrokeKind::Middle,
+                        );
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                        let tip = format!("{} — line {}", tab.filters[ki].text, line_idx + 1);
+                        click_resp.on_hover_text(tip);
+                    }
+                } else {
+                    let (height, alpha) = cluster_style(bin.count);
+                    // Cluster width represents the resolved timeline bucket,
+                    // while height/opacity represents its small/medium/large
+                    // occurrence tier.
+                    let left = cell_x0;
+                    let right = cell_x1.max(left + 1.0);
+                    let cluster_color =
+                        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+                    let cluster_rect = Rect::from_min_max(
+                        Pos2::new(left, cy - height / 2.0),
+                        Pos2::new(right.max(left + 1.0), cy + height / 2.0),
+                    );
+                    painter.rect_filled(cluster_rect, egui::CornerRadius::ZERO, cluster_color);
+                    let hit_rect = Rect::from_min_max(
+                        Pos2::new(cell_x0, y),
+                        Pos2::new(cell_x1, y + LANE_HEIGHT),
+                    );
+                    let cluster_resp = ui.interact(
+                        hit_rect,
+                        ui.id().with(("cluster", ki, bin_index)),
+                        Sense::click(),
+                    );
+                    if cluster_resp.clicked() {
+                        if let Some(pos) = cluster_resp.interact_pointer_pos() {
+                            let xv = px_to_x(pos.x);
+                            if let Some(line) = tab.timeline.nearest_match_line_in_filter(ki, xv) {
+                                select_lane = Some(ki);
+                                clicked_occurrence = true;
+                                tab.context_line = Some(line);
+                                tab.pending_scroll = Some(line);
+                                ensure_line = Some(line);
+                            }
+                        }
+                    }
+                    if cluster_resp.hovered() {
+                        painter.rect_stroke(
+                            cluster_rect.expand(1.0),
+                            egui::CornerRadius::ZERO,
+                            Stroke::new(1.0, theme.occurrence_hover),
+                            egui::StrokeKind::Middle,
+                        );
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                        cluster_resp.on_hover_text(format!(
+                            "{} — {} occurrences (boundary lines {} / {})",
+                            tab.filters[ki].text,
+                            bin.count,
+                            bin.first_line + 1,
+                            bin.last_line + 1,
+                        ));
+                    }
                 }
             }
         }
     }
 
-    // Apply deferred ensure_visible (after diamond click during immutable borrow).
+    // Apply deferred ensure_visible after occurrence clicks.
     if let Some(_line) = ensure_line {
         tab.ensure_visible();
     }
@@ -715,14 +747,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         if let Some(active) = tab.lane_active.get_mut(ki) {
             *active = true;
         }
-        let occurrence = tab.selected_diamond;
         tab.select_lane(ki);
-        if selected_occurrence {
-            tab.selected_diamond = occurrence;
-        }
-    }
-    if let Some(line) = sync_line {
-        tab.sync_timeline_selection_to_line(line);
     }
 
     // Apply deferred lane toggles.
@@ -735,7 +760,6 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             tab.lane_active[ki] = active;
             if !active && tab.selected_lane == Some(ki) {
                 tab.selected_lane = None;
-                tab.selected_diamond = None;
             }
             // Check if this was the last active filter and everything else is off.
             let active_filter_count = tab.lane_active.iter().filter(|&&b| b).count();
@@ -824,15 +848,21 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     }
 
     // ---- axis tick labels (smart shorthand) ----
-    let n_ticks = 7_usize;
+    let max_ticks_for_width = (hist.width() / 120.0).floor().clamp(2.0, 7.0) as usize;
+    let domain_units = view_end.saturating_sub(view_start).saturating_add(1);
+    let n_ticks = max_ticks_for_width.min(domain_units.clamp(1, 7) as usize);
     let label_y = lanes_bottom + 4.0;
-    let font_id = egui::FontId::monospace(10.0);
+    let font_id = egui::FontId::monospace(12.0);
     let mut tick_xs: Vec<f32> = Vec::with_capacity(n_ticks);
     let mut tick_vs: Vec<i64> = Vec::with_capacity(n_ticks);
 
     // Determine tick positions and values.
     for i in 0..n_ticks {
-        let frac = i as f64 / (n_ticks - 1) as f64;
+        let frac = if n_ticks == 1 {
+            0.0
+        } else {
+            i as f64 / (n_ticks - 1) as f64
+        };
         let v = view_start + (frac * view_span as f64) as i64;
         let x = hist.left() + frac as f32 * hist.width();
         tick_xs.push(x);
@@ -871,7 +901,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 _ => tick_vs.iter().map(|&v| format_ms(v)).collect(),
             }
         }
-        TimelineDomain::Sequence => tick_vs.iter().map(|&v| format!("L{v}")).collect(),
+        TimelineDomain::Sequence => tick_vs.iter().map(|&v| format!("L{}", v + 1)).collect(),
     };
 
     // Draw tick marks and labels.
@@ -882,19 +912,28 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             [Pos2::new(x, label_y), Pos2::new(x, label_y + 6.0)],
             Stroke::new(1.0_f32, theme.axis),
         );
-        // Label.
-        let (align, offset) = (egui::Align2::CENTER_TOP, Vec2::new(0.0, 2.0));
-        painter.text(
-            Pos2::new(x, label_y) + offset,
-            align,
-            &labels[i],
-            font_id.clone(),
-            theme.axis,
+        // Label. Use an egui label here so the time/line captions can be bold.
+        let galley = ui.ctx().fonts_mut(|fonts| {
+            fonts.layout_no_wrap(labels[i].clone(), font_id.clone(), theme.axis)
+        });
+        let label_rect = Rect::from_center_size(
+            Pos2::new(x, label_y + 2.0 + galley.size().y / 2.0),
+            galley.size(),
+        );
+        ui.put(
+            label_rect,
+            egui::Label::new(
+                RichText::new(&labels[i])
+                    .monospace()
+                    .size(12.0)
+                    .strong()
+                    .color(theme.axis),
+            ),
         );
     }
 
     // ---- duration labels BETWEEN each pair of adjacent tick labels ----
-    let dur_font = egui::FontId::monospace(7.5);
+    let dur_font = egui::FontId::monospace(9.5);
     for i in 1..n_ticks {
         let mid_x = (tick_xs[i - 1] + tick_xs[i]) / 2.0;
         let delta = tick_vs[i] - tick_vs[i - 1];
@@ -937,7 +976,6 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         let reset_resp = icons::icon_button_at(ui, reset_rect, Icon::Reset, theme.text_muted);
         if reset_resp.clicked() {
             tab.timeline_zoom = None;
-            tab.selected_diamond = None;
         }
         if reset_resp.hovered() {
             reset_resp.on_hover_text("Reset zoom to full log");
@@ -1007,9 +1045,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     painter.rect_filled(minimap, egui::CornerRadius::same(2), theme.minimap_bg);
     // Draw full-range density in one bar per minimap pixel.
     let full_span = (full_end - full_start).max(1);
-    let minimap_bins = aggregate_timeline_bins(
-        &tab.timeline,
-        &tab.timeline.density,
+    let minimap_bins = tab.timeline.resolve_density_bins(
+        &tab.doc,
         full_start,
         full_end,
         minimap.width().ceil() as usize,
@@ -1057,12 +1094,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             if let Some(pos) = minimap_resp.interact_pointer_pos() {
                 let frac = ((pos.x - minimap.left()) / minimap.width()).clamp(0.0, 1.0) as f64;
                 let center = full_start + (frac * full_span as f64) as i64;
-                let half = view_span / 2;
-                tab.timeline_zoom = Some((
-                    (center - half).max(full_start),
-                    (center + half).min(full_end),
-                ));
-                tab.selected_diamond = None;
+                let window = centered_window(center, view_span, full_start, full_end);
+                tab.timeline_zoom = (window != (full_start, full_end)).then_some(window);
             }
         }
         if minimap_resp.hovered() {
@@ -1109,7 +1142,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 1.0 / ZOOM_FACTOR.powf(scroll_delta.abs() as f64 / 60.0)
             };
             let new_span = ((view_span as f64) / factor) as i64;
-            let min_span = ((full_span as f64) * MIN_ZOOM_FRAC) as i64;
+            let min_span = 1_i64;
             let new_span = new_span.max(min_span).min(full_span);
             let ratio = (mouse_x - view_start) as f64 / view_span as f64;
             let new_start = mouse_x - (new_span as f64 * ratio) as i64;
@@ -1121,13 +1154,14 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             } else {
                 tab.timeline_zoom = Some((new_start, new_end));
             }
-            tab.selected_diamond = None;
         }
     }
 
     // ---- pan via drag (left button only) ----
     if !ui.input(|i| i.modifiers.shift) && response.dragged() {
-        let dx_px = response.drag_delta().x;
+        // Pointer delta is frame-local. Applying egui's cumulative drag_delta
+        // to the already-shifted viewport compounds the movement every frame.
+        let dx_px = ui.input(|i| i.pointer.delta().x);
         let dx_val = (dx_px as f64 / hist.width() as f64 * view_span as f64) as i64;
         let new_start = (view_start - dx_val).clamp(full_start, full_end - view_span);
         let new_end = new_start + view_span;
@@ -1136,20 +1170,24 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         } else {
             tab.timeline_zoom = Some((new_start, new_end));
         }
-        tab.selected_diamond = None;
     }
 
     // ---- brush-select (shift+drag) ----
-    if ui.input(|i| i.modifiers.shift) {
+    let shift_down = ui.input(|i| i.modifiers.shift);
+    if shift_down && response.drag_started() {
+        tab.timeline_brush_start = response.interact_pointer_pos().map(|pos| pos.x);
+    }
+    if let Some(drag_origin_x) = tab.timeline_brush_start {
+        let current_x = ui
+            .input(|i| i.pointer.hover_pos())
+            .map_or(drag_origin_x, |pos| pos.x);
         if response.dragged() {
-            let Some(drag_origin) = ui.input(|i| i.pointer.interact_pos()) else {
-                return;
-            };
-            let Some(current) = ui.input(|i| i.pointer.interact_pos()) else {
-                return;
-            };
-            let brush_left = drag_origin.x.min(current.x);
-            let brush_right = drag_origin.x.max(current.x);
+            let brush_left = drag_origin_x
+                .min(current_x)
+                .clamp(hist.left(), hist.right());
+            let brush_right = drag_origin_x
+                .max(current_x)
+                .clamp(hist.left(), hist.right());
             let brush_rect = Rect::from_min_max(
                 Pos2::new(brush_left, hist.top()),
                 Pos2::new(brush_right, lanes_bottom),
@@ -1163,15 +1201,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             );
         }
         if response.drag_stopped() {
-            if let Some(start) = ui.input(|i| i.pointer.interact_pos()) {
-                let drag_origin = response.interact_pointer_pos().unwrap_or(start);
-                if let Some(current) = Some(start) {
-                    let x1 = px_to_x(drag_origin.x.min(current.x));
-                    let x2 = px_to_x(drag_origin.x.max(current.x));
-                    if (x2 - x1).abs() > 100 {
-                        tab.timeline_zoom = Some((x1.max(full_start), x2.min(full_end)));
-                        tab.selected_diamond = None;
-                    }
+            tab.timeline_brush_start = None;
+            if (current_x - drag_origin_x).abs() >= 4.0 {
+                let x1 = px_to_x(drag_origin_x.min(current_x));
+                let x2 = px_to_x(drag_origin_x.max(current_x));
+                if x2 > x1 {
+                    tab.timeline_zoom = Some((x1.max(full_start), x2.min(full_end)));
                 }
             }
         }
@@ -1180,13 +1215,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     // ---- double-click to reset zoom and snap to nearest match ----
     if response.double_clicked() {
         tab.timeline_zoom = None;
-        tab.selected_diamond = None;
         if let Some(pos) = response.interact_pointer_pos() {
             let v = px_to_x(pos.x);
             let target = tab
                 .timeline
                 .nearest_match_line(v)
-                .or_else(|| approx_line(&tab.doc, &tab.timeline.domain, v, full_start, full_end));
+                .or_else(|| tab.timeline.nearest_line(&tab.doc, v));
             tab.context_line = target;
             if target.is_some() {
                 tab.pending_scroll = target;
@@ -1204,9 +1238,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 .flatten()
         });
         if let Some(pos) = click_pos {
-            if !response.dragged() && !selected_occurrence {
+            if !response.dragged() && !clicked_occurrence {
                 let v = px_to_x(pos.x);
-                let target = approx_line(&tab.doc, &tab.timeline.domain, v, full_start, full_end);
+                let target = tab.timeline.nearest_line(&tab.doc, v);
                 if let Some(line) = target {
                     tab.select_timeline_line(line, lane_click_lane);
                 }
@@ -1228,7 +1262,6 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     //     if let Some(line) = click_line {
     //         // Select this line so the user sees which line will be trimmed.
     //         tab.context_line = Some(line);
-    //         tab.selected_diamond = None;
     //         tab.pending_scroll = Some(line);
     //         tab.ensure_visible();
     //
@@ -1255,18 +1288,33 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                 let v = px_to_x(pos.x);
                 ui.label(RichText::new(v_caption(tab.timeline.domain, v)).strong());
-                let b = tab.timeline.bucket_for(v, tab.doc.total_lines());
-                ui.label(format!("{} lines in bucket", tab.timeline.density[b]));
-                for (ki, kb) in tab
+                let density_column = (((pos.x - hist.left()) / hist.width())
+                    * density_bins.len() as f32)
+                    .floor()
+                    .clamp(0.0, density_bins.len().saturating_sub(1) as f32)
+                    as usize;
+                ui.label(format!(
+                    "{} lines in visible column",
+                    density_bins[density_column]
+                ));
+                let marker_half_span = ((view_span as f64 * OCCURRENCE_BUCKET_WIDTH as f64
+                    / hist.width().max(1.0) as f64)
+                    / 2.0)
+                    .ceil() as i64;
+                for ki in 0..tab
                     .timeline
-                    .filter_buckets
-                    .iter()
-                    .enumerate()
-                    .take(MAX_LANES.min(tab.filters.len()))
+                    .filter_points
+                    .len()
+                    .min(MAX_LANES.min(tab.filters.len()))
                 {
-                    if kb[b] > 0 {
+                    let count = tab.timeline.point_count_in_range(
+                        ki,
+                        v.saturating_sub(marker_half_span),
+                        v.saturating_add(marker_half_span),
+                    );
+                    if count > 0 {
                         ui.label(
-                            RichText::new(format!("◆ {} ×{}", tab.filters[ki].text, kb[b]))
+                            RichText::new(format!("▌ {} ×{}", tab.filters[ki].text, count))
                                 .color(tab.filters[ki].color),
                         );
                     }
@@ -1320,6 +1368,18 @@ fn format_duration_ms(ms: i64) -> String {
     }
 }
 
+/// Visual tiers for collision cells. Exact counts remain available in the
+/// tooltip; the tiers make small, medium, and dense groups distinguishable at
+/// a glance without letting a two-point cluster disappear into the baseline.
+fn cluster_style(count: u32) -> (f32, u8) {
+    match count {
+        0 | 1 => (0.0, 0),
+        count if count <= SMALL_BUCKET_MAX_OCCURRENCES => (SMALL_BUCKET_HEIGHT, 170),
+        count if count <= MEDIUM_BUCKET_MAX_OCCURRENCES => (MEDIUM_BUCKET_HEIGHT, 210),
+        _ => (DENSE_BUCKET_HEIGHT, 245),
+    }
+}
+
 fn format_human_duration_ms(ms: i64) -> String {
     let ms = ms.max(0);
     if ms >= 3600000 {
@@ -1346,14 +1406,12 @@ fn format_human_duration_ms(ms: i64) -> String {
 }
 
 fn occurrence_navigation_text(tab: &LogTab) -> Option<String> {
-    let (lane, line) = tab.selected_diamond?;
+    let (lane, line) = tab.selected_occurrence()?;
     let matches = tab.matches.get(lane)?;
     let position = matches
         .iter()
         .position(|&match_line| match_line as usize == line)?;
-    let mut text = format!("Occurrence {} / {}", position + 1, matches.len());
-
-    if position > 0 {
+    let previous = if position > 0 {
         let previous = matches[position - 1] as usize;
         let delta = match tab.timeline.domain {
             TimelineDomain::Time { .. } => tab
@@ -1364,9 +1422,11 @@ fn occurrence_navigation_text(tab: &LogTab) -> Option<String> {
                 .unwrap_or_else(|| format!("{} lines", line - previous)),
             TimelineDomain::Sequence => format!("{} lines", line - previous),
         };
-        text.push_str(&format!(" | prev {delta} ago"));
-    }
-    if position + 1 < matches.len() {
+        Some(delta)
+    } else {
+        None
+    };
+    let next = if position + 1 < matches.len() {
         let next = matches[position + 1] as usize;
         let delta = match tab.timeline.domain {
             TimelineDomain::Time { .. } => tab
@@ -1377,46 +1437,65 @@ fn occurrence_navigation_text(tab: &LogTab) -> Option<String> {
                 .unwrap_or_else(|| format!("{} lines", next - line)),
             TimelineDomain::Sequence => format!("{} lines", next - line),
         };
-        text.push_str(&format!(" | next {delta} after"));
-    }
-    Some(text)
-}
-
-fn show_occurrence_navigation(ui: &mut egui::Ui, text: &str, theme: &Theme) {
-    let normal = |text: &str| RichText::new(text).size(11.0).color(theme.text_muted);
-    let emphasized = |text: &str| {
-        RichText::new(text)
-            .size(11.0)
-            .strong()
-            .color(theme.text_muted)
+        Some(delta)
+    } else {
+        None
     };
 
-    ui.horizontal(|ui| {
-        let mut sections = text.split(" | ");
-        if let Some(occurrence) = sections.next() {
-            if let Some(value) = occurrence.strip_prefix("Occurrence ") {
-                ui.label(normal("Occurrence "));
-                ui.label(emphasized(value));
-            } else {
-                ui.label(normal(occurrence));
-            }
-        }
-        for section in sections {
-            ui.label(normal(" | "));
-            if let Some((prefix, value)) = section.split_once(' ') {
-                ui.label(normal(&format!("{prefix} ")));
-                ui.label(emphasized(value));
-            } else {
-                ui.label(normal(section));
-            }
-        }
-    });
+    Some(format_occurrence_navigation_text(
+        position + 1,
+        matches.len(),
+        next.as_deref(),
+        previous.as_deref(),
+    ))
+}
+
+fn format_occurrence_navigation_text(
+    position: usize,
+    total: usize,
+    next: Option<&str>,
+    previous: Option<&str>,
+) -> String {
+    format!(
+        "OCCURANCE: {position}/{total}  |  PREV: {} ago  |  NEXT: after {}",
+        previous.unwrap_or("—"),
+        next.unwrap_or("—")
+    )
+}
+
+fn show_occurrence_navigation(
+    ui: &mut egui::Ui,
+    text: &str,
+    theme: &Theme,
+    elapsed: Option<Duration>,
+) {
+    let progress = elapsed
+        .map(|elapsed| (elapsed.as_secs_f32() / 0.1).clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    if progress < 1.0 {
+        ui.ctx().request_repaint();
+    }
+    let offset = (1.0 - progress) * 3.0;
+    let animated_color = |color: Color32| {
+        Color32::from_rgba_unmultiplied(
+            color.r(),
+            color.g(),
+            color.b(),
+            (color.a() as f32 * (0.65 + progress * 0.35)) as u8,
+        )
+    };
+    ui.add_space(offset);
+    ui.label(
+        RichText::new(text)
+            .size(14.0)
+            .color(animated_color(theme.text_muted)),
+    );
 }
 
 fn domain_span(domain: &TimelineDomain, total_lines: usize) -> (i64, i64) {
     match domain {
         TimelineDomain::Time { start_ms, end_ms } => (*start_ms, *end_ms),
-        TimelineDomain::Sequence => (1, total_lines as i64),
+        TimelineDomain::Sequence => (0, total_lines.saturating_sub(1) as i64),
     }
 }
 
@@ -1427,80 +1506,27 @@ fn effective_zoom(zoom: &Option<(i64, i64)>, full_start: i64, full_end: i64) -> 
     }
 }
 
-/// Aggregate stored timeline buckets into screen columns for a domain range.
-/// The original buckets remain unchanged for hover details and navigation.
-fn aggregate_timeline_bins(
-    timeline: &Timeline,
-    counts: &[u32],
-    start: i64,
-    end: i64,
-    columns: usize,
-) -> Vec<u32> {
-    let columns = columns.max(1).min(counts.len().max(1));
-    let mut out = vec![0u32; columns];
-    let span = (end - start).max(1);
-    for (bucket, &count) in counts.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
-        let x = timeline.bucket_center(bucket);
-        if x < start || x > end {
-            continue;
-        }
-        let col = (((x - start).clamp(0, span) * columns as i64) / (span + 1)) as usize;
-        out[col.min(columns - 1)] = out[col.min(columns - 1)].saturating_add(count);
-    }
-    out
+/// Center a fixed-span inclusive viewport while preserving its size at both
+/// domain boundaries.
+fn centered_window(center: i64, span: i64, full_start: i64, full_end: i64) -> (i64, i64) {
+    let span = span.max(0).min(full_end.saturating_sub(full_start));
+    let start = center
+        .saturating_sub(span / 2)
+        .clamp(full_start, full_end.saturating_sub(span));
+    (start, start.saturating_add(span).min(full_end))
 }
 
 fn x_of_line(doc: &LogDocument, domain: &TimelineDomain, line: usize) -> i64 {
     match domain {
         TimelineDomain::Time { .. } => doc.ts_at(line),
-        // Sequence domain uses 1-based line numbering to match domain_span (1..total_lines).
-        TimelineDomain::Sequence => line as i64 + 1,
+        TimelineDomain::Sequence => line as i64,
     }
 }
 
 fn v_caption(domain: TimelineDomain, v: i64) -> String {
     match domain {
         TimelineDomain::Time { .. } => format_ms(v),
-        TimelineDomain::Sequence => format!("~line {v}"),
-    }
-}
-
-/// With no filter matches to snap to, approximate a line index for the click.
-fn approx_line(
-    doc: &LogDocument,
-    domain: &TimelineDomain,
-    v: i64,
-    view_start: i64,
-    view_end: i64,
-) -> Option<usize> {
-    let n = doc.total_lines();
-    if n == 0 {
-        return None;
-    }
-    match domain {
-        TimelineDomain::Time { .. } => {
-            for i in 0..n {
-                let t = doc.ts_at(i);
-                if t >= v && t >= 0 {
-                    return Some(i);
-                }
-            }
-            for i in (0..n).rev() {
-                let t = doc.ts_at(i);
-                if t >= 0 && t <= v {
-                    return Some(i);
-                }
-            }
-            Some(n - 1)
-        }
-        TimelineDomain::Sequence => {
-            let frac =
-                ((v - view_start) as f64 / (view_end - view_start).max(1) as f64).clamp(0.0, 1.0);
-            Some((frac * (n - 1) as f64) as usize)
-        }
+        TimelineDomain::Sequence => format!("~line {}", v + 1),
     }
 }
 
@@ -1509,38 +1535,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aggregate_bins_preserves_visible_count() {
-        let timeline = Timeline {
-            domain: TimelineDomain::Sequence,
-            n_buckets: 8,
-            density: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            filter_buckets: Vec::new(),
-            filter_points: Vec::new(),
-            max_density: 8,
-        };
-        let bins = aggregate_timeline_bins(&timeline, &timeline.density, 0, 7, 3);
-        assert_eq!(bins.len(), 3);
-        assert_eq!(bins.iter().sum::<u32>(), 36);
-    }
-
-    #[test]
-    fn aggregate_bins_ignores_values_outside_range() {
-        let timeline = Timeline {
-            domain: TimelineDomain::Sequence,
-            n_buckets: 4,
-            density: vec![1, 2, 3, 4],
-            filter_buckets: Vec::new(),
-            filter_points: Vec::new(),
-            max_density: 4,
-        };
-        let bins = aggregate_timeline_bins(&timeline, &timeline.density, 1, 2, 8);
-        assert_eq!(bins.iter().sum::<u32>(), 5);
-    }
-
-    #[test]
     fn human_duration_formats_occurrence_deltas() {
         assert_eq!(format_human_duration_ms(3_900_000), "1h 5m");
         assert_eq!(format_human_duration_ms(1_500), "1.5sec");
         assert_eq!(format_human_duration_ms(200), "200ms");
+    }
+
+    #[test]
+    fn occurrence_navigation_uses_one_fixed_label_template() {
+        assert_eq!(
+            format_occurrence_navigation_text(2, 8, Some("200ms"), Some("1.5sec")),
+            "OCCURANCE: 2/8  |  PREV: 1.5sec ago  |  NEXT: after 200ms"
+        );
+        assert_eq!(
+            format_occurrence_navigation_text(1, 1, None, None),
+            "OCCURANCE: 1/1  |  PREV: — ago  |  NEXT: after —"
+        );
+    }
+
+    #[test]
+    fn cluster_styles_distinguish_small_medium_and_dense_groups() {
+        assert_eq!(cluster_style(1), (0.0, 0));
+        assert_eq!(cluster_style(2), (SMALL_BUCKET_HEIGHT, 170));
+        assert_eq!(
+            cluster_style(SMALL_BUCKET_MAX_OCCURRENCES),
+            (SMALL_BUCKET_HEIGHT, 170)
+        );
+        assert_eq!(
+            cluster_style(SMALL_BUCKET_MAX_OCCURRENCES + 1),
+            (MEDIUM_BUCKET_HEIGHT, 210)
+        );
+        assert_eq!(
+            cluster_style(MEDIUM_BUCKET_MAX_OCCURRENCES),
+            (MEDIUM_BUCKET_HEIGHT, 210)
+        );
+        assert_eq!(
+            cluster_style(MEDIUM_BUCKET_MAX_OCCURRENCES + 1),
+            (DENSE_BUCKET_HEIGHT, 245)
+        );
+        assert_eq!(
+            (SINGLE_OCCURRENCE_WIDTH, SINGLE_OCCURRENCE_HEIGHT),
+            (3.0, 7.0)
+        );
+        assert_eq!(SMALL_BUCKET_HEIGHT, SINGLE_OCCURRENCE_HEIGHT);
+        assert_eq!(MEDIUM_BUCKET_HEIGHT, 9.0);
+        assert_eq!(DENSE_BUCKET_HEIGHT, 11.0);
+    }
+
+    #[test]
+    fn centered_window_preserves_span_at_boundaries() {
+        assert_eq!(centered_window(0, 20, 0, 100), (0, 20));
+        assert_eq!(centered_window(100, 20, 0, 100), (80, 100));
+        assert_eq!(centered_window(50, 20, 0, 100), (40, 60));
+        assert_eq!(centered_window(50, 200, 0, 100), (0, 100));
     }
 }

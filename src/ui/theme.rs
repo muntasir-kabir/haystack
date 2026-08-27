@@ -95,10 +95,8 @@ pub struct Theme {
     pub minimap_zoom: Color32,
     /// Selection marker vertical line.
     pub selection_line: Color32,
-    /// Diamond click target hover border.
-    pub diamond_hover: Color32,
-    /// Diamond selection stroke.
-    pub diamond_stroke: Color32,
+    /// Timeline occurrence hover border.
+    pub occurrence_hover: Color32,
     /// MCP status indicator grey (stopped).
     pub status_grey: Color32,
     /// MCP URL text colour.
@@ -149,8 +147,7 @@ impl Theme {
             brush_stroke: Color32::from_rgb(120, 180, 255),
             minimap_zoom: Color32::from_rgb(100, 160, 240),
             selection_line: Color32::WHITE,
-            diamond_hover: Color32::WHITE,
-            diamond_stroke: Color32::WHITE,
+            occurrence_hover: Color32::WHITE,
             status_grey: Color32::from_gray(128),
             url_text: Color32::LIGHT_BLUE,
             placeholder: Color32::GRAY,
@@ -188,8 +185,7 @@ impl Theme {
             brush_stroke: Color32::from_rgb(60, 120, 200),
             minimap_zoom: Color32::from_rgb(60, 120, 200),
             selection_line: Color32::from_rgb(0, 0, 0),
-            diamond_hover: Color32::from_rgb(0, 0, 0),
-            diamond_stroke: Color32::from_rgb(0, 0, 0),
+            occurrence_hover: Color32::from_rgb(0, 0, 0),
             status_grey: Color32::from_gray(160),
             url_text: Color32::from_rgb(0, 80, 180),
             placeholder: Color32::GRAY,

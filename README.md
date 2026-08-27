@@ -95,12 +95,13 @@ the same document without adding a temporary server to the agent.
 Available tools include:
 
 - `load_log`, `list_logs`, and `close_log`
-- `find_occurrences` with pagination, context, and first/last-seen information
+- `find_occurrences` with paginated `[line_number, epoch_ms|null]` results, filter scope, and case mode
 - `summarize_log` and `get_timeline_histogram`
 - `get_template`, `get_template_samples`, and `get_template_anomalies`
 - `log_sequence` for compact time/line/template triples
 - `raw_log` for exact lines in a line or time range
 - `filters_get`, `filters_add`, and `filters_remove`
+- `get_analysis` and `add_analysis` for user-visible Pin-tab notes in GUI-attached mode
 
 ## Install
 
@@ -172,8 +173,11 @@ Configure one stdio server for standalone and GUI-assisted work:
 
 For standalone analysis, the agent calls `load_log` with an absolute path. For the live GUI,
 open a log, click **Start MCP**, copy the GUI session instruction, and give it to the agent. It
-calls `attach_gui_session` with the temporary ID; no MCP configuration changes. Logotomy exposes
-MCP only over stdio and uses authenticated private local IPC for GUI routing.
+calls `attach_gui_session` with the temporary ID; no MCP configuration changes. The GUI already
+provides the log, so no `log_id` is needed. A useful approach is to read user findings with
+`get_analysis`, explore log shape with summaries and targeted searches, narrow a hypothesis with
+filters or `trim`, and post evidence-backed root-cause conclusions with `add_analysis`.
+Logotomy exposes MCP only over stdio and uses authenticated private local IPC for GUI routing.
 
 For protocol details, tool arguments, ranges, filtering semantics, and a manual JSON-RPC smoke
 test, see [`docs/mcp.md`](docs/mcp.md).

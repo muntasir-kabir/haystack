@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::core::settings::Settings;
 
 const SESSION_FILE: &str = "mcp-gui-session.json";
+const SESSION_ID_BYTES: usize = 6;
+const SESSION_ID_HEX_LEN: usize = SESSION_ID_BYTES * 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GuiSession {
@@ -19,7 +21,7 @@ pub struct GuiSession {
 }
 
 pub fn generate_session_id() -> String {
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; SESSION_ID_BYTES];
     rand::thread_rng().fill_bytes(&mut bytes);
     let mut session_id = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -90,7 +92,9 @@ pub fn load_for_id(session_id: &str) -> Result<GuiSession, String> {
 }
 
 fn load_for_id_at(path: &Path, session_id: &str) -> Result<GuiSession, String> {
-    if session_id.len() != 64 || !session_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if session_id.len() != SESSION_ID_HEX_LEN
+        || !session_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err("GUI session ID is invalid or expired".to_string());
     }
     let session = load_at(path).map_err(|_| "GUI session ID is invalid or expired".to_string())?;
@@ -112,7 +116,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub(crate) fn session_id_matches(expected: &str, supplied: &str) -> bool {
-    supplied.len() == 64
+    supplied.len() == SESSION_ID_HEX_LEN
         && supplied.bytes().all(|byte| byte.is_ascii_hexdigit())
         && constant_time_eq(expected.as_bytes(), supplied.as_bytes())
 }
@@ -126,7 +130,13 @@ fn load_at(path: &Path) -> Result<GuiSession, String> {
     })?;
     let session: GuiSession = serde_json::from_slice(&bytes)
         .map_err(|e| format!("invalid MCP GUI session manifest: {e}"))?;
-    if session.port == 0 || session.session_id.len() != 64 || !session.session_id.is_ascii() {
+    if session.port == 0
+        || session.session_id.len() != SESSION_ID_HEX_LEN
+        || !session
+            .session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err("invalid MCP GUI session manifest values".to_string());
     }
     Ok(session)
@@ -141,10 +151,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_session_ids_are_256_bit_hex_and_unique() {
+    fn generated_session_ids_are_48_bit_hex_and_unique() {
         let first = generate_session_id();
         let second = generate_session_id();
-        assert_eq!(first.len(), 64);
+        assert_eq!(first.len(), SESSION_ID_HEX_LEN);
         assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(first, second);
     }
@@ -217,6 +227,10 @@ mod tests {
                 "GUI session ID is invalid or expired"
             );
         }
+        assert!(!session_id_matches(
+            &session_id,
+            &(session_id.clone() + "0")
+        ));
         let _ = std::fs::remove_file(path);
     }
 }

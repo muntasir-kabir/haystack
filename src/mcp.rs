@@ -23,17 +23,17 @@
 //!   filters_get(log_id)                     → [{id, filter_text}]
 //!   filters_add(log_id, filter_text)        → updated [{id, filter_text}]
 //!   filters_remove(log_id, id)              → updated [{id, filter_text}]
-//!   find_occurrences(log_id, keyword, max_results?, offset?, format?,
-//!                    context?, after?, before?, with_filtered_log?)
-//!                                         → paginated hits + total_matches +
-//!                                            first_seen/last_seen (folds the old
-//!                                            get_occurrence_count/time_range)
+//!   find_occurrences(log_id, keyword, max_results?, offset?, case_sensitive?,
+//!                    after?, before?, with_filtered_log?)
+//!                                         → paginated [line, epoch_ms|null]
+//!                                            tuples + pagination metadata
 //!
 //! Tools (GUI — single active doc, no log_id):
 //!   filters_get() / filters_add(filter_text) / filters_remove(id)
-//!   find_occurrences(keyword, max_results?, offset?, format?, context?,
-//!                    after?, before?, with_filtered_log?)
+//!   find_occurrences(keyword, max_results?, offset?, case_sensitive?, after?,
+//!                    before?, with_filtered_log?)
 //!   trim(start?, end?)                      → focus the visible window
+//!   get_analysis() / add_analysis({text, lines?}) → Pin-tab analysis cards
 //!
 //! Analysis tools (both modes; headless takes log_id, GUI does not; each takes
 //! an optional trailing `with_filtered_log?`, default true = run on the
@@ -103,6 +103,15 @@ const MAX_LINE_TEXT: usize = 1000;
 const HARD_MAX_LINES: usize = 2000;
 /// Cap on the per-log filter keyword set (mirrors the GUI's MAX_FILTERS).
 const MAX_FILTERS: usize = 20;
+
+/// A user-visible analysis card in the GUI's Pin tab. `lines` uses zero-based
+/// document indices internally; MCP request/response payloads use one-based
+/// line numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinAnalysis {
+    pub text: String,
+    pub lines: Vec<usize>,
+}
 
 // ---------------------------------------------------------------------------
 // File logger — implements the `log::Log` trait to write to logotomy.log
@@ -254,8 +263,8 @@ static LOG_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 pub struct ServerState {
     pub logs: HashMap<String, Arc<LogDocument>>,
     pub next_id: u64,
-    /// (log_id, keyword) → sorted matching line indices.
-    pub match_cache: HashMap<(String, String), Arc<Vec<usize>>>,
+    /// (log_id, keyword, case_sensitive) → sorted matching line indices.
+    pub match_cache: HashMap<(String, String, bool), Arc<Vec<usize>>>,
     /// Single active document for GUI mode. When set, the server operates in
     /// simplified mode (no load_log/list_logs/close_log, no log_id parameter).
     pub active_doc: Option<Arc<LogDocument>>,
@@ -280,6 +289,12 @@ pub struct ServerState {
     /// served tab. GUI-originated filter edits flow the other way (see
     /// `LogotomyApp::sync_mcp_filters`) and clear this flag themselves.
     pub filters_dirty: Arc<AtomicBool>,
+    /// Analysis cards for the GUI's currently served Pin tab. This is GUI-only
+    /// state: standalone logs deliberately do not retain user annotations.
+    pub analyses: Vec<PinAnalysis>,
+    /// Set when MCP changes the GUI analysis cards. The GUI mirrors the same
+    /// bidirectional synchronization pattern used for filters.
+    pub analyses_dirty: Arc<AtomicBool>,
 }
 
 impl Default for ServerState {
@@ -293,6 +308,8 @@ impl Default for ServerState {
             active_doc_dirty: Arc::new(AtomicBool::new(false)),
             filters: HashMap::new(),
             filters_dirty: Arc::new(AtomicBool::new(false)),
+            analyses: Vec::new(),
+            analyses_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -305,8 +322,13 @@ impl ServerState {
             .ok_or_else(|| format!("unknown log_id '{log_id}' (see list_logs)"))
     }
 
-    pub fn matches_for(&mut self, log_id: &str, keyword: &str) -> Result<Arc<Vec<usize>>, String> {
-        let key = (log_id.to_string(), keyword.to_string());
+    pub fn matches_for(
+        &mut self,
+        log_id: &str,
+        keyword: &str,
+        case_sensitive: bool,
+    ) -> Result<Arc<Vec<usize>>, String> {
+        let key = (log_id.to_string(), keyword.to_string(), case_sensitive);
         if let Some(m) = self.match_cache.get(&key) {
             return Ok(Arc::clone(m));
         }
@@ -315,14 +337,13 @@ impl ServerState {
         } else {
             self.get_doc(log_id)?
         };
-        let matches = search::scan_document(
+        let matches = search::find_lines(
             doc.as_ref(),
-            &[keyword.to_string()],
+            None,
+            keyword,
+            !case_sensitive,
             &AtomicBool::new(false),
-        )
-        .into_iter()
-        .next()
-        .unwrap_or_default();
+        );
         let matches = Arc::new(matches);
         self.match_cache.insert(key, Arc::clone(&matches));
         Ok(matches)
@@ -364,15 +385,17 @@ impl ServerState {
     pub fn set_active_doc(&mut self, doc: Arc<LogDocument>) {
         self.gui_mode = true;
         self.active_doc = Some(doc);
-        self.match_cache.retain(|(id, _), _| id != "_active"); // drop stale matches
+        self.match_cache.retain(|(id, _, _), _| id != "_active"); // drop stale matches
         self.active_doc_dirty.store(true, Ordering::Relaxed);
     }
 
     /// Clear the active document while retaining the GUI tool surface.
     pub fn clear_active_doc(&mut self) {
         self.active_doc = None;
-        self.match_cache.retain(|(id, _), _| id != "_active");
+        self.match_cache.retain(|(id, _, _), _| id != "_active");
         self.filters.remove("_active");
+        self.analyses.clear();
+        self.analyses_dirty.store(false, Ordering::Relaxed);
     }
 
     /// Get the active document, or an error if none is set.
@@ -449,6 +472,20 @@ impl ServerState {
         Ok(list.clone())
     }
 
+    // ----------------------------------------------------------- analyses
+
+    /// Replace the analysis cards from the GUI's served Pin tab.
+    pub fn set_analyses(&mut self, analyses: Vec<PinAnalysis>) {
+        self.analyses = analyses;
+        self.analyses_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Add one analysis card originating from a GUI-attached MCP client.
+    pub fn add_analysis(&mut self, analysis: PinAnalysis) {
+        self.analyses.push(analysis);
+        self.analyses_dirty.store(true, Ordering::Relaxed);
+    }
+
     /// The filtered view for tools running with `with_filtered_log=true`:
     /// the sorted union of line indices matching every filter keyword.
     /// `Ok(None)` when no filters are set (the view is the whole log) — callers
@@ -461,7 +498,7 @@ impl ServerState {
         }
         let mut all: Vec<usize> = Vec::new();
         for kw in &filters {
-            let m = self.matches_for(log_id, kw)?;
+            let m = self.matches_for(log_id, kw, true)?;
             all.extend_from_slice(m.as_slice());
         }
         all.sort_unstable();
@@ -773,7 +810,7 @@ fn server_discover_result(state: &ServerState) -> Value {
 }
 
 fn mode_instructions(_state: &ServerState) -> &'static str {
-    "Call session_info first. Logotomy starts in standalone mode: call load_log with an absolute path and retain its log_id. To analyze the log selected in a running Logotomy GUI, call attach_gui_session with the temporary session ID copied from the GUI; while attached, do not call load_log or pass log_id. Start analysis with summarize_log using with_filtered_log=false unless GUI filters are intentionally relevant. Narrow ranges before requesting raw lines."
+    "Call session_info first. Logotomy starts in standalone mode: call load_log with an absolute path and retain its log_id. To analyze the log selected in a running Logotomy GUI, call attach_gui_session with the temporary session ID copied from the GUI. In GUI-attached mode, the GUI already supplies the open log: load_log, list_logs, and close_log are unavailable, and log_id is not needed. Suggested approach: understand the user's problem and Pin-tab findings with get_analysis; explore the log shape with summarize_log (with_filtered_log=false for full-log orientation) and targeted find_occurrences; then use filters (filters_add) and trim when a hypothesis merits a narrower scope. Request bounded raw_log only for exact evidence, and add useful evidence-backed root-cause conclusions with add_analysis."
 }
 
 fn session_info_payload(state: &ServerState) -> Value {
@@ -840,7 +877,7 @@ fn resource_read(params: &Value, state: &ServerState) -> Result<Value, String> {
         ),
         "logotomy://guide" => (
             "text/markdown",
-            "# Logotomy investigation workflow\n\n1. Call `session_info`. In `standalone` mode, call `load_log` first and pass its `log_id`. To use the log selected in the GUI, call `attach_gui_session` with the temporary ID copied from Logotomy.\n2. In `gui_attached` mode, do not call `load_log` or pass `log_id`; the selected tab may change while attached.\n3. Call `summarize_log` with `with_filtered_log=false` for full-log orientation, or inspect `filters_get` when GUI filters are relevant.\n4. Locate suspicious windows with `get_template_anomalies` and `get_timeline_histogram`.\n5. Resolve patterns with `get_template` and sample them with `get_template_samples`.\n6. Use `find_occurrences(format=\"refs\")` or `log_sequence` to narrow the range before requesting exact lines with `raw_log`. Avoid large raw ranges; honor `truncated` and pagination fields.\n".to_string(),
+            "# Logotomy investigation guide\n\nCall `session_info` first. In `standalone` mode, call `load_log` and retain its `log_id`. In `gui_attached` mode, the GUI already provides the open log: `load_log`, `list_logs`, and `close_log` are unavailable, and `log_id` is not needed.\n\nSuggested approach, not a required checklist: understand the user's question and Pin-tab findings with `get_analysis`; explore the log shape with `summarize_log` (`with_filtered_log=false` for full-log orientation) and targeted `find_occurrences`; then use filters (`filters_add`), anomalies, histograms, templates, sequences, and `trim` as they help test a hypothesis and narrow the scope. Request bounded `raw_log` only for exact evidence, honor pagination and `truncated`, and add useful evidence-backed root-cause conclusions with `add_analysis`.\n".to_string(),
         ),
         _ => return Err(format!("unknown resource uri '{uri}'")),
     };
@@ -960,6 +997,18 @@ fn dispatch(name: &str, args: &Value, state: &mut ServerState) -> Result<Value, 
                 .to_string(),
         );
     }
+    if matches!(name, "get_analysis" | "add_analysis") {
+        if !state.is_gui_mode() {
+            return Err(format!(
+                "{name} is available only while attached to a GUI session; call attach_gui_session first"
+            ));
+        }
+        return match name {
+            "get_analysis" => tool_get_analysis(state),
+            "add_analysis" => tool_add_analysis(args, state),
+            _ => unreachable!(),
+        };
+    }
     // Compression-first tools work identically in both modes; they resolve the
     // target document from the mode (log_id argument in headless mode, the
     // active document in GUI mode).
@@ -1022,6 +1071,14 @@ fn arg_usize(args: &Value, key: &str, default: usize) -> Result<usize, String> {
     }
 }
 
+fn arg_bool(args: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!("argument '{key}' must be a boolean")),
+    }
+}
+
 fn arg_time(args: &Value, key: &str) -> Result<Option<i64>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -1073,7 +1130,7 @@ fn tool_close_log(args: &Value, state: &mut ServerState) -> Result<Value, String
     if state.logs.remove(log_id).is_none() {
         return Err(format!("unknown log_id '{log_id}'"));
     }
-    state.match_cache.retain(|(id, _), _| id != log_id);
+    state.match_cache.retain(|(id, _, _), _| id != log_id);
     state.filters.remove(log_id);
     Ok(json!({ "closed": log_id }))
 }
@@ -1144,6 +1201,66 @@ fn tool_filters_remove(args: &Value, state: &mut ServerState) -> Result<Value, S
     Ok(filters_out(&log_id, &filters))
 }
 
+// ------------------------------------------------------------------- tools
+// GUI Pin-tab analysis tools
+// -------------------------------------------------------------------
+
+fn analyses_payload(analyses: &[PinAnalysis]) -> Value {
+    let analyses: Vec<Value> = analyses
+        .iter()
+        .map(|analysis| {
+            json!({
+                "text": analysis.text,
+                "lines": analysis.lines.iter().map(|line| line + 1).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({ "analyses": analyses })
+}
+
+/// Return the current GUI Pin-tab entries as agent-readable analyses.
+fn tool_get_analysis(state: &ServerState) -> Result<Value, String> {
+    state.get_active_doc()?; // Require an active tab, like every GUI tool.
+    Ok(analyses_payload(&state.analyses))
+}
+
+/// Add an analysis card to the active GUI Pin tab. Public MCP lines are
+/// one-based; zero is rejected so it cannot silently become the first line.
+fn tool_add_analysis(args: &Value, state: &mut ServerState) -> Result<Value, String> {
+    let doc = state.get_active_doc()?;
+    let text = arg_str(args, "text")?.trim();
+    if text.is_empty() {
+        return Err("text must not be empty".to_string());
+    }
+    let values: &[Value] = match args.get("lines") {
+        None | Some(Value::Null) => &[],
+        Some(Value::Array(values)) => values.as_slice(),
+        Some(_) => {
+            return Err("argument 'lines' must be an array of 1-based line numbers".to_string())
+        }
+    };
+    let mut lines = Vec::with_capacity(values.len());
+    for value in values {
+        let line = value.as_u64().ok_or_else(|| {
+            "argument 'lines' must contain only positive integer line numbers".to_string()
+        })?;
+        if line == 0 || line as usize > doc.total_lines() {
+            return Err(format!(
+                "line {line} is outside the active log (valid range: 1..={})",
+                doc.total_lines()
+            ));
+        }
+        lines.push(line as usize - 1);
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    state.add_analysis(PinAnalysis {
+        text: text.to_string(),
+        lines,
+    });
+    Ok(analyses_payload(&state.analyses))
+}
+
 fn tool_find_occurrences(args: &Value, state: &mut ServerState) -> Result<Value, String> {
     let log_id = arg_log_id(args)?.to_string();
     let doc = state.get_doc(&log_id)?;
@@ -1152,16 +1269,14 @@ fn tool_find_occurrences(args: &Value, state: &mut ServerState) -> Result<Value,
         Err(payload) => return Ok(payload),
     };
     let keyword = arg_str(args, "keyword")?.to_string();
-    let matches = state.matches_for(&log_id, &keyword)?;
-    let mut out = find_occurrences_payload(
+    let case_sensitive = arg_bool(args, "case_sensitive", true)?;
+    let matches = state.matches_for(&log_id, &keyword, case_sensitive)?;
+    find_occurrences_payload(
         doc.as_ref(),
         &matches,
         args,
         visible.as_deref().map(|v| v.as_slice()),
-    )?;
-    out["log_id"] = json!(log_id);
-    out["keyword"] = json!(keyword);
-    Ok(out)
+    )
 }
 
 // ------------------------------------------------------------------- tools
@@ -1176,15 +1291,14 @@ fn tool_find_occurrences_simple(args: &Value, state: &mut ServerState) -> Result
         Err(payload) => return Ok(payload),
     };
     let keyword = arg_str(args, "keyword")?.to_string();
-    let matches = state.matches_for(&log_id, &keyword)?;
-    let mut out = find_occurrences_payload(
+    let case_sensitive = arg_bool(args, "case_sensitive", true)?;
+    let matches = state.matches_for(&log_id, &keyword, case_sensitive)?;
+    find_occurrences_payload(
         doc.as_ref(),
         &matches,
         args,
         visible.as_deref().map(|v| v.as_slice()),
-    )?;
-    out["keyword"] = json!(keyword);
-    Ok(out)
+    )
 }
 
 fn line_payload(doc: &LogDocument, i: usize) -> Value {
@@ -1211,8 +1325,6 @@ fn line_payload(doc: &LogDocument, i: usize) -> Value {
 const MIN_COLLAPSE_RUN: usize = 3;
 /// Max chars of sample text embedded in collapsed runs and template entries.
 const SAMPLE_CHARS: usize = 200;
-/// Max context lines per side for find_occurrences `context`.
-const MAX_CONTEXT: usize = 20;
 /// Line-index buckets used for burst detection in get_template_anomalies.
 const ANOMALY_BUCKETS: usize = 50;
 /// Hard cap on dense `log_sequence` entries returned in a single call.
@@ -1572,36 +1684,10 @@ fn build_runs_of(doc: &LogDocument, lines: &[usize]) -> Vec<Run> {
     runs
 }
 
-/// Render runs as JSON items. Long runs collapse to anchors + pattern + one
-/// sample line; short runs (or collapse=false) emit verbatim line payloads.
-fn runs_to_items(doc: &LogDocument, runs: &[Run], collapse: bool) -> Vec<Value> {
-    let mut items = Vec::new();
-    for r in runs {
-        let len = r.count;
-        if collapse && len >= MIN_COLLAPSE_RUN {
-            items.push(json!({
-                "start_line": r.start + 1,
-                "end_line": r.end + 1,
-                "count": len,
-                "template_id": r.tpl,
-                "pattern": template_pattern(doc, r.tpl),
-                "time_start": fmt_ts(doc.ts_at(r.start)),
-                "time_end": fmt_ts(doc.ts_at(r.end)),
-                "sample": truncate(&doc.line(r.start), SAMPLE_CHARS),
-            }));
-        } else {
-            for i in r.start..=r.end {
-                items.push(line_payload(doc, i));
-            }
-        }
-    }
-    items
-}
-
-/// find_occurrences core: paginated matches with optional refs-only format
-/// and optional collapsed context around each hit. `visible` is the filtered
-/// view (from `ServerState::visible_lines_for`) when `with_filtered_log=true`
-/// and filters are set; `None` means no restriction.
+/// find_occurrences core: paginated `[line_number, epoch_ms|null]` tuples.
+/// `visible` is the filtered view (from `ServerState::visible_lines_for`)
+/// when `with_filtered_log=true` and filters are set; `None` means no
+/// restriction.
 fn find_occurrences_payload(
     doc: &LogDocument,
     matches: &[usize],
@@ -1612,11 +1698,12 @@ fn find_occurrences_payload(
     let before = arg_time(args, "before")?;
     let max_results = arg_usize(args, "max_results", 50)?.min(HARD_MAX_LINES);
     let offset = arg_usize(args, "offset", 0)?;
-    let format = args
-        .get("format")
-        .and_then(Value::as_str)
-        .unwrap_or("lines");
-    let context = arg_usize(args, "context", 0)?.min(MAX_CONTEXT);
+    if args.get("format").is_some() || args.get("context").is_some() {
+        return Err(
+            "find_occurrences now returns only [line_number, epoch_ms|null] tuples; remove 'format' and 'context'"
+                .to_string(),
+        );
+    }
     // Optional time-window filter (after/before) on forward-filled timestamps,
     // intersected with the filtered view when one is active.
     let windowed: Vec<usize> = matches
@@ -1635,67 +1722,27 @@ fn find_occurrences_payload(
         .take(max_results)
         .copied()
         .collect();
-    let lines: Vec<Value> = match format {
-        "refs" => page
-            .iter()
-            .map(|&i| {
-                json!({
-                    "line": i + 1,
-                    "time": fmt_ts(doc.ts_at(i)),
-                    "template_id": doc.template_at(i),
-                })
-            })
-            .collect(),
-        "lines" => page.iter().map(|&i| line_payload(doc, i)).collect(),
-        other => {
-            return Err(format!(
-                "unknown format '{other}' (expected 'lines' or 'refs')"
-            ))
-        }
-    };
-    let (first_seen, last_seen, first_epoch, last_epoch) =
-        match search::time_range_of(doc, &windowed) {
-            Some((lo, hi)) => (
-                Value::String(format_ms(lo)),
-                Value::String(format_ms(hi)),
-                Value::from(lo),
-                Value::from(hi),
-            ),
-            None => (Value::Null, Value::Null, Value::Null, Value::Null),
-        };
-    let mut out = json!({
+    let occurrences: Vec<Value> = page
+        .iter()
+        .map(|&i| {
+            let timestamp = doc.ts_at(i);
+            json!([
+                i + 1,
+                if timestamp >= 0 {
+                    Value::from(timestamp)
+                } else {
+                    Value::Null
+                }
+            ])
+        })
+        .collect();
+    Ok(json!({
         "total_matches": windowed.len(),
         "offset": offset,
-        "returned": lines.len(),
-        "format": format,
-        "first_seen": first_seen,
-        "last_seen": last_seen,
-        "first_seen_epoch_ms": first_epoch,
-        "last_seen_epoch_ms": last_epoch,
-        "after": after.map(format_ms),
-        "before": before.map(format_ms),
-        "lines": lines,
-    });
-    if context > 0 {
-        let ctx: Vec<Value> = page
-            .iter()
-            .map(|&i| {
-                let lo = i.saturating_sub(context);
-                let hi = (i + context + 1).min(doc.total_lines());
-                let runs = match visible {
-                    Some(v) => {
-                        let a = v.partition_point(|&x| x < lo);
-                        let b = v.partition_point(|&x| x < hi);
-                        build_runs_of(doc, &v[a..b])
-                    }
-                    None => build_runs(doc, lo, hi),
-                };
-                json!({ "hit_line": i + 1, "items": runs_to_items(doc, &runs, true) })
-            })
-            .collect();
-        out["context"] = json!(ctx);
-    }
-    Ok(out)
+        "returned": occurrences.len(),
+        "has_more": offset.saturating_add(occurrences.len()) < windowed.len(),
+        "occurrences": occurrences,
+    }))
 }
 
 /// summarize_log: one-call orientation — stats, top templates, error-ish
@@ -2161,7 +2208,7 @@ fn tool_timeline_histogram(args: &Value, state: &mut ServerState) -> Result<Valu
     };
 
     let matches = match keyword {
-        Some(kw) => Some(state.matches_for(&log_id, kw)?),
+        Some(kw) => Some(state.matches_for(&log_id, kw, true)?),
         None => None,
     };
     let mut counts = vec![0u64; nb];
@@ -2519,6 +2566,7 @@ fn tools(_state: &ServerState) -> Value {
                     | "close_log"
                     | "filters_add"
                     | "filters_remove"
+                    | "add_analysis"
                     | "trim"
                     | "attach_gui_session"
                     | "detach_gui_session"
@@ -2534,6 +2582,7 @@ fn tools(_state: &ServerState) -> Value {
                     | "log_sequence"
                     | "raw_log"
                     | "find_occurrences"
+                    | "get_analysis"
                     | "session_info"
                     | "attach_gui_session"
                     | "detach_gui_session"
@@ -2572,13 +2621,13 @@ fn unified_tools() -> Value {
         0,
         json!({
             "name": "attach_gui_session",
-            "description": "Attach this stdio MCP process to the log currently selected in the Logotomy GUI using the temporary 256-bit session ID copied from the GUI. The ID is never persisted. While attached, omit log_id and do not call load_log.",
+            "description": "Attach this stdio MCP process to the log currently selected in the Logotomy GUI using the temporary 12-character hexadecimal session ID copied from the GUI. The ID is never persisted. While attached, omit log_id and do not call load_log.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": {
                         "type": "string",
-                        "description": "Temporary 64-character hexadecimal GUI session ID copied from Logotomy"
+                        "description": "Temporary 12-character hexadecimal GUI session ID copied from Logotomy"
                     }
                 },
                 "required": ["session_id"]
@@ -2608,7 +2657,32 @@ fn unified_tools() -> Value {
         .cloned()
         .expect("GUI tool catalog must contain trim");
     list.push(trim);
+    list.extend(gui_analysis_tools());
     tools
+}
+
+/// GUI-attached-only annotation tools. They are part of the public catalog so
+/// clients that cache `tools/list` still discover them after attaching.
+fn gui_analysis_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "get_analysis",
+            "description": "Read the user-visible analysis cards from the active GUI Pin tab. Available only while attached to a GUI session. Call this before beginning GUI log analysis so existing user notes are considered.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "add_analysis",
+            "description": "Add a user-visible analysis card to the active GUI Pin tab. `lines` is an optional list of 1-based line numbers; omit it or pass [] for a text-only card shown first in the Pin tab. Available only while attached to a GUI session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "Analysis text shown to the user (required, non-empty)" },
+                    "lines": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "description": "Optional 1-based log line numbers; duplicates are normalized" }
+                },
+                "required": ["text"]
+            }
+        }),
+    ]
 }
 
 /// Schemas for the compression-first tools. `log_id_prop` is `Some` in
@@ -2736,8 +2810,7 @@ fn headless_tools() -> Value {
         })
     };
     let log_id_prop = json!({ "type": "string", "description": "ID returned by load_log" });
-    let keyword_prop =
-        json!({ "type": "string", "description": "Exact phrase to search for (case-sensitive)" });
+    let keyword_prop = json!({ "type": "string", "description": "Exact phrase to search for" });
     let filter_prop = json!({
         "type": "boolean",
         "description": "When true (default), operate on the filtered log — only lines matching the current filter set (the union of filters_get matches; the 'Everything Else' lane is never included). With zero filters the tool replies {comment: 'no log'} instead of scanning — set false for the full log or add a filter first (filters_add)."
@@ -2771,7 +2844,7 @@ fn headless_tools() -> Value {
         },
         {
             "name": "find_occurrences",
-            "description": "Find log lines containing this exact phrase (case-sensitive), returning total match count plus first/last-seen timestamps. Restrict to a time window with 'after'/'before'. Paginate with offset/max_results. Use format='refs' for tiny {line, time, template_id} anchors without raw text, and 'context' to see collapsed lines around each hit.",
+            "description": "Find log lines containing this exact phrase. Returns paginated [one_based_line_number, epoch_ms|null] tuples only. Set case_sensitive=false for ASCII case-insensitive matching; with_filtered_log restricts results to the active filter union.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2781,8 +2854,7 @@ fn headless_tools() -> Value {
                     "before": time_prop("Only include occurrences at or before this time"),
                     "max_results": { "type": "integer", "description": "Max results to return (default 50, max 2000)" },
                     "offset": { "type": "integer", "description": "Skip this many matches (default 0)" },
-                    "format": { "type": "string", "enum": ["lines", "refs"], "description": "'lines' (default) returns raw text; 'refs' returns only {line, time, template_id} anchors" },
-                    "context": { "type": "integer", "description": "Lines of context around each hit, template-collapsed (default 0, max 20)" },
+                    "case_sensitive": { "type": "boolean", "description": "Match ASCII letter case exactly (default true); false folds ASCII case" },
                     "with_filtered_log": filter_prop.clone()
                 },
                 "required": ["log_id", "keyword"]
@@ -2803,8 +2875,7 @@ fn gui_tools() -> Value {
             "description": format!("{desc} (RFC3339, 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD', or epoch millis)")
         })
     };
-    let keyword_prop =
-        json!({ "type": "string", "description": "Exact phrase to search for (case-sensitive)" });
+    let keyword_prop = json!({ "type": "string", "description": "Exact phrase to search for" });
     let filter_prop = json!({
         "type": "boolean",
         "description": "When true (default), operate on the filtered log — only lines matching the current filter set (the union of filters_get matches; the 'Everything Else' lane is never included). With zero filters the tool replies {comment: 'no log'} instead of scanning — set false for the full log or add a filter first (filters_add)."
@@ -2813,7 +2884,7 @@ fn gui_tools() -> Value {
     let base = json!([
         {
             "name": "find_occurrences",
-            "description": "Find log lines containing this exact phrase (case-sensitive) in the currently open log, returning total match count plus first/last-seen timestamps. Restrict to a time window with 'after'/'before'. Paginate with offset/max_results. Use format='refs' for tiny {line, time, template_id} anchors without raw text, and 'context' to see collapsed lines around each hit.",
+            "description": "Find log lines containing this exact phrase in the currently open log. Returns paginated [one_based_line_number, epoch_ms|null] tuples only. Set case_sensitive=false for ASCII case-insensitive matching; with_filtered_log restricts results to the active filter union.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2822,8 +2893,7 @@ fn gui_tools() -> Value {
                     "before": time_prop("Only include occurrences at or before this time"),
                     "max_results": { "type": "integer", "description": "Max results to return (default 50, max 2000)" },
                     "offset": { "type": "integer", "description": "Skip this many matches (default 0)" },
-                    "format": { "type": "string", "enum": ["lines", "refs"], "description": "'lines' (default) returns raw text; 'refs' returns only {line, time, template_id} anchors" },
-                    "context": { "type": "integer", "description": "Lines of context around each hit, template-collapsed (default 0, max 20)" },
+                    "case_sensitive": { "type": "boolean", "description": "Match ASCII letter case exactly (default true); false folds ASCII case" },
                     "with_filtered_log": filter_prop.clone()
                 },
                 "required": ["keyword"]
@@ -2868,8 +2938,12 @@ mod tests {
         let result = initialize_result(&json!({"protocolVersion": "2025-06-18"}), &gui);
         let gui_instructions = result["instructions"].as_str().unwrap();
         assert_eq!(headless_instructions, gui_instructions);
-        assert!(gui_instructions.contains("do not call load_log or pass log_id"));
-        assert!(gui_instructions.contains("summarize_log using with_filtered_log=false"));
+        assert!(gui_instructions.contains("list_logs, and close_log are unavailable"));
+        assert!(gui_instructions.contains("Suggested approach"));
+        assert!(gui_instructions.contains("with_filtered_log=false"));
+        assert!(gui_instructions.contains("targeted find_occurrences"));
+        assert!(gui_instructions.contains("filters (filters_add) and trim"));
+        assert!(gui_instructions.contains("root-cause"));
     }
 
     #[test]
@@ -2916,10 +2990,12 @@ mod tests {
         let text = session["contents"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"temporary\": true"));
         let guide = resource_read(&json!({"uri": "logotomy://guide"}), &gui).unwrap();
-        assert!(guide["contents"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("summarize_log"));
+        let guide = guide["contents"][0]["text"].as_str().unwrap();
+        assert!(guide.contains("get_analysis"));
+        assert!(guide.contains("not a required checklist"));
+        assert!(guide.contains("find_occurrences"));
+        assert!(guide.contains("trim"));
+        assert!(guide.contains("root-cause"));
     }
 
     #[test]
@@ -3190,7 +3266,7 @@ mod tests {
         state.set_active_doc(Arc::clone(&doc));
 
         // Populate the `_active` match cache as an MCP tool call would.
-        let matches = state.matches_for("_active", "ERROR").unwrap();
+        let matches = state.matches_for("_active", "ERROR", true).unwrap();
         assert_eq!(matches.len(), 2);
         assert!(!state.match_cache.is_empty());
 
@@ -3215,7 +3291,7 @@ mod tests {
         assert!(state.match_cache.is_empty());
 
         // …and a fresh scan reflects the trimmed content (1 ERROR, not 2).
-        let matches = state.matches_for("_active", "ERROR").unwrap();
+        let matches = state.matches_for("_active", "ERROR", true).unwrap();
         assert_eq!(matches.len(), 1);
 
         std::fs::remove_file(path).ok();
@@ -3388,7 +3464,7 @@ mod tests {
     fn trim_focuses_window_and_invalidates_cache() {
         let mut state = gui_state(&repetitive_log());
         // Prime the `_active` match cache as an MCP tool call would.
-        let m = state.matches_for("_active", "ERROR").unwrap();
+        let m = state.matches_for("_active", "ERROR", true).unwrap();
         assert_eq!(m.len(), 1);
         assert!(!state.match_cache.is_empty());
         // Trim to lines 1..=5.
@@ -3668,60 +3744,67 @@ mod tests {
     }
 
     #[test]
-    fn find_occurrences_refs_and_context() {
-        let mut state = gui_state(&repetitive_log());
-        // refs format: anchors only, no raw text.
+    fn find_occurrences_returns_paginated_tuples_and_rejects_legacy_output_modes() {
+        let mut state = gui_state(
+            "2026-07-19T10:00:00.000Z ERROR one\n\
+             2026-07-19T10:00:01.000Z error two\n\
+             2026-07-19T10:00:02.000Z ERROR three\n",
+        );
         let out = dispatch(
+            "find_occurrences",
+            &json!({ "keyword": "error", "case_sensitive": false, "offset": 1, "max_results": 1, "with_filtered_log": false }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(out["total_matches"], 3);
+        assert_eq!(out["offset"], 1);
+        assert_eq!(out["returned"], 1);
+        assert_eq!(out["has_more"], true);
+        assert_eq!(
+            out["occurrences"],
+            json!([[2, state.get_active_doc().unwrap().ts_at(1)]])
+        );
+        assert!(out.get("lines").is_none());
+        assert!(out.get("first_seen").is_none());
+
+        // Case-sensitive matching and cache entries stay independent.
+        let out = dispatch(
+            "find_occurrences",
+            &json!({ "keyword": "ERROR", "with_filtered_log": false }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(out["occurrences"].as_array().unwrap().len(), 2);
+
+        // The old rich-output switches cannot silently change the contract.
+        assert!(dispatch(
             "find_occurrences",
             &json!({ "keyword": "ERROR", "format": "refs", "with_filtered_log": false }),
             &mut state,
         )
-        .unwrap();
-        assert_eq!(out["format"], "refs");
-        assert_eq!(out["total_matches"], 1);
-        let hit = &out["lines"][0];
-        assert_eq!(hit["line"], 11);
-        assert!(hit.get("text").is_none());
-        assert!(hit.get("template_id").is_some());
-
-        // context: collapsed runs around the hit.
-        let out = dispatch(
-            "find_occurrences",
-            &json!({ "keyword": "ERROR", "context": 5, "with_filtered_log": false }),
-            &mut state,
-        )
-        .unwrap();
-        let ctx = out["context"].as_array().unwrap();
-        assert_eq!(ctx.len(), 1);
-        assert_eq!(ctx[0]["hit_line"], 11);
-        // 5 INFO before (collapsed), the ERROR, 5 INFO after (collapsed) = 3 items.
-        assert_eq!(ctx[0]["items"].as_array().unwrap().len(), 3);
-
-        // Unknown format errors.
+        .is_err());
         assert!(dispatch(
             "find_occurrences",
-            &json!({ "keyword": "ERROR", "format": "yaml", "with_filtered_log": false }),
+            &json!({ "keyword": "ERROR", "context": 1, "with_filtered_log": false }),
             &mut state,
         )
         .is_err());
     }
 
     #[test]
-    fn find_occurrences_reports_count_and_time_range() {
+    fn find_occurrences_applies_time_bounds_and_uses_null_for_missing_timestamps() {
         let mut state = gui_state(&repetitive_log());
         // Full: exactly one ERROR at line 11 (10:00:10).
         let out = dispatch(
             "find_occurrences",
-            &json!({ "keyword": "ERROR", "format": "refs", "with_filtered_log": false }),
+            &json!({ "keyword": "ERROR", "with_filtered_log": false }),
             &mut state,
         )
         .unwrap();
         assert_eq!(out["total_matches"], 1);
-        assert!(out["first_seen"].as_str().is_some());
-        assert!(out["last_seen"].as_str().is_some());
-        assert_eq!(out["first_seen"], out["last_seen"]);
-        assert_eq!(out["first_seen_epoch_ms"], out["last_seen_epoch_ms"]);
-        // A window that excludes the ERROR yields zero matches and null bounds.
+        assert_eq!(out["occurrences"][0][0], 11);
+        assert!(out["occurrences"][0][1].as_i64().is_some());
+        // A window that excludes the ERROR yields zero matches.
         let out = dispatch(
             "find_occurrences",
             &json!({ "keyword": "ERROR", "before": "2026-07-19T10:00:09.000Z", "with_filtered_log": false }),
@@ -3729,8 +3812,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["total_matches"], 0);
-        assert!(out["first_seen"].is_null());
-        assert!(out["last_seen"].is_null());
         // A window that includes it yields one match.
         let out = dispatch(
             "find_occurrences",
@@ -3739,6 +3820,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["total_matches"], 1);
+
+        let mut timeless = gui_state("INFO one\nERROR two\n");
+        let out = dispatch(
+            "find_occurrences",
+            &json!({ "keyword": "ERROR", "with_filtered_log": false }),
+            &mut timeless,
+        )
+        .unwrap();
+        assert_eq!(out["occurrences"], json!([[2, null]]));
+    }
+
+    #[test]
+    fn find_occurrences_uses_the_same_case_and_tuple_contract_in_standalone_mode() {
+        let path = write_temp("INFO Error first\nINFO error second\n");
+        let mut state = ServerState::default();
+        let log_id = state.add_doc(LogDocument::open(&path).unwrap());
+        std::fs::remove_file(path).ok();
+
+        let out = dispatch(
+            "find_occurrences",
+            &json!({ "log_id": log_id, "keyword": "error", "case_sensitive": false, "max_results": 1, "with_filtered_log": false }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(out["total_matches"], 2);
+        assert_eq!(out["occurrences"], json!([[1, null]]));
+        assert_eq!(out["has_more"], true);
+        assert!(out.get("log_id").is_none());
     }
 
     #[test]
@@ -3869,6 +3978,10 @@ mod tests {
         assert!(summary["outputSchema"].is_object());
         let session = list.iter().find(|t| t["name"] == "session_info").unwrap();
         assert_eq!(session["annotations"]["readOnlyHint"], true);
+        let get_analysis = list.iter().find(|t| t["name"] == "get_analysis").unwrap();
+        assert_eq!(get_analysis["annotations"]["readOnlyHint"], true);
+        let add_analysis = list.iter().find(|t| t["name"] == "add_analysis").unwrap();
+        assert_eq!(add_analysis["annotations"]["readOnlyHint"], false);
     }
 
     #[test]
@@ -3880,10 +3993,25 @@ mod tests {
 
         let catalog = tools(&headless);
         let list = catalog.as_array().unwrap();
-        assert!(list.iter().any(|tool| tool["name"] == "attach_gui_session"));
+        let attach = list
+            .iter()
+            .find(|tool| tool["name"] == "attach_gui_session")
+            .unwrap();
+        assert!(attach["description"]
+            .as_str()
+            .unwrap()
+            .contains("12-character hexadecimal"));
+        assert!(
+            attach["inputSchema"]["properties"]["session_id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("12-character hexadecimal")
+        );
         assert!(list.iter().any(|tool| tool["name"] == "detach_gui_session"));
         assert!(list.iter().any(|tool| tool["name"] == "load_log"));
         assert!(list.iter().any(|tool| tool["name"] == "trim"));
+        assert!(list.iter().any(|tool| tool["name"] == "get_analysis"));
+        assert!(list.iter().any(|tool| tool["name"] == "add_analysis"));
         for name in ["find_occurrences", "summarize_log", "filters_get"] {
             let tool = list.iter().find(|tool| tool["name"] == name).unwrap();
             let required = tool["inputSchema"]["required"]
@@ -3955,6 +4083,61 @@ mod tests {
     }
 
     #[test]
+    fn gui_pin_tab_analysis_add_get_and_validate_lines() {
+        let mut state = gui_state(
+            "2026-07-19T10:00:00.000Z INFO first\n\
+             2026-07-19T10:00:01.000Z ERROR second\n",
+        );
+        assert_eq!(tool_get_analysis(&state).unwrap()["analyses"], json!([]));
+
+        let out = dispatch(
+            "add_analysis",
+            &json!({ "text": "  Check the retry path.  ", "lines": [2, 1, 2] }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            out["analyses"][0],
+            json!({ "text": "Check the retry path.", "lines": [1, 2] })
+        );
+        assert!(state.analyses_dirty.load(Ordering::Relaxed));
+
+        let out = dispatch(
+            "add_analysis",
+            &json!({ "text": "User context without a line" }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            out["analyses"][1],
+            json!({ "text": "User context without a line", "lines": [] })
+        );
+        assert_eq!(tool_get_analysis(&state).unwrap(), out);
+
+        for args in [
+            json!({ "text": "" }),
+            json!({ "text": "bad", "lines": 2 }),
+            json!({ "text": "bad", "lines": [0] }),
+            json!({ "text": "bad", "lines": [3] }),
+            json!({ "text": "bad", "lines": [1.5] }),
+        ] {
+            assert!(
+                dispatch("add_analysis", &args, &mut state).is_err(),
+                "{args}"
+            );
+        }
+
+        let mut headless = ServerState::default();
+        assert!(dispatch("get_analysis", &json!({}), &mut headless).is_err());
+        assert!(dispatch(
+            "add_analysis",
+            &json!({ "text": "not attached" }),
+            &mut headless,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn filters_work_headless_with_log_id() {
         let mut state = ServerState::default();
         let path =
@@ -3989,7 +4172,7 @@ mod tests {
         // with the "no log" hint instead of scanning the whole file.
         let out = dispatch(
             "find_occurrences",
-            &json!({ "keyword": "ERROR", "format": "refs" }),
+            &json!({ "keyword": "ERROR" }),
             &mut state,
         )
         .unwrap();
@@ -4006,14 +4189,14 @@ mod tests {
         // the "Everything Else" lane is never part of MCP arithmetic.
         let out = dispatch(
             "find_occurrences",
-            &json!({ "keyword": "INFO", "format": "refs" }),
+            &json!({ "keyword": "INFO" }),
             &mut state,
         )
         .unwrap();
         assert_eq!(out["total_matches"], 0);
         let out = dispatch(
             "find_occurrences",
-            &json!({ "keyword": "DEBUG", "format": "refs" }),
+            &json!({ "keyword": "DEBUG" }),
             &mut state,
         )
         .unwrap();
@@ -4021,7 +4204,7 @@ mod tests {
         // Explicitly unfiltered restores the full log.
         let out = dispatch(
             "find_occurrences",
-            &json!({ "keyword": "INFO", "format": "refs", "with_filtered_log": false }),
+            &json!({ "keyword": "INFO", "with_filtered_log": false }),
             &mut state,
         )
         .unwrap();

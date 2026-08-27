@@ -19,7 +19,7 @@ Everything currently implemented, and what's deliberately not (yet).
 | Native Drain template mining | fixed-depth parse tree, `<*>` wildcards, per-line template ID, occurrence counts, example line — zero Python |
 | Robustness | CRLF, missing trailing newline, blank lines, invalid UTF-8 (lossy), multi-MB single lines, timeless files |
 | Filter engine | Aho-Corasick, case-sensitive, all filters in a single pass, background thread + cancellation |
-| Timeline bucketing | 2048-bucket density histogram; time domain or line-sequence fallback; per-filter lanes + match points |
+| Timeline bucketing | Exact screen-width viewport re-resolution over a 2048-bucket minimap overview; time domain or line-sequence fallback; sorted per-filter points, exact 2×7px singleton markers, and edge-to-edge full-bucket-width 7/10/13px collision tiers |
 | Timeline lane toggles | Per-filter eye (visible/invisible) toggles + "Everything Else" lane; log view filters to active lanes only; trash icon per lane removes filter with confirmation |
 | Smart axis labels | Shorthand: same hour → `MM:SS.ms`, same date → `HH:MM:SS.ms`, multi-day → full; duration label between ticks |
 | Time-window analytics | count-in-window, first/last occurrence helpers |
@@ -38,7 +38,7 @@ Everything currently implemented, and what's deliberately not (yet).
 | Log font size controls | A− / A+ buttons in both log view and context panel (8–24px range) |
 | Lane-filtered log view | toggling timeline checkboxes filters the log view to only active lanes |
 | Filter bookmarks | add/remove chips, per-filter color, live match count, background rescan |
-| Timeline view | density histogram + per-filter colored lanes, hover tooltip, selection marker |
+| Timeline view | adaptively resolved density histogram + per-filter colored lanes, exact singleton markers and continuous full-width collision buckets, exact hover counts, current occurrence derived from lane + Log View line |
 | Timeline lane toggles | per-filter eye (visible/invisible) toggle + "Everything Else" lane; grays out disabled lanes; trash icon removes filter with confirmation |
 | Timeline legend | 120px left column, 10.5pt monospace labels, 14-char truncation with full-name tooltip |
 | Smart axis labels | shorthand: same hour → `MM:SS.ms`, same date → `HH:MM:SS.ms`, multi-day → full; duration label between ticks |
@@ -54,7 +54,8 @@ Everything currently implemented, and what's deliberately not (yet).
 Embedded in the same binary and exposed to agents only through `logotomy --mcp` stdio.
 The same stable tool catalog supports standalone file loading and explicit attachment to a live
 GUI with `attach_gui_session`. Modern `server/discover` and initialization-era clients are
-supported across `2024-11-05` through `2026-07-28`. GUI sessions use a 256-bit temporary ID,
+supported across `2024-11-05` through `2026-07-28`. GUI sessions use a random 12-character
+hexadecimal temporary ID,
 authenticated private loopback IPC, a private atomic manifest, and automatic invalidation.
 The server exposes `logotomy://session` and
 `logotomy://guide`, a `session_info` tool, structured result content plus text fallback, output
@@ -67,7 +68,8 @@ schemas, and behavioral annotations.
 | `load_log` | index a file → `log_id` + stats |
 | `list_logs` | loaded documents + stats |
 | `close_log` | drop a document + invalidate its caches |
-| `find_occurrences` | keyword hits with offset/max_results pagination, `format="refs"` anchors-only mode, `context=N` collapsed context; returns total count + first/last-seen, optional `after`/`before` window |
+| `find_occurrences` | paginated `[one_based_line_number, epoch_ms\|null]` keyword-hit tuples; supports `offset`, `max_results`, optional `after`/`before` window, `with_filtered_log`, and ASCII `case_sensitive` mode |
+| `get_analysis` / `add_analysis` (GUI mode) | read the user's Pin-tab findings/hypotheses or add an evidenced root-cause analysis card; empty `lines` creates a text-only top card |
 | `summarize_log` | one-call orientation over an optional line/time range: stats, error-ish templates, time gaps, densest minute, plus byte-size budget estimates (`template_size_bytes`, `sequence_estimate_bytes`) |
 | `get_timeline_histogram` | tiny distribution histogram (whole log / keyword / template), optional range |
 | `get_template_anomalies` | rare / first-seen-late / bursty templates, optional range |
@@ -77,7 +79,7 @@ schemas, and behavioral annotations.
 | `raw_log` | raw lines over a line/time range, `max_lines` + `truncated` flag |
 | `trim` (GUI mode) | focus the active document's visible window to a line/time range |
 
-Match results are cached per (log, keyword); time params accept RFC3339 /
+Match results are cached per (log, keyword, case mode); time params accept RFC3339 /
 `YYYY-MM-DD[ HH:MM[:SS]]` / epoch s/ms. `start`/`end` range bounds accept a
 1-based line number (integer) or a time (string).
 
@@ -101,14 +103,13 @@ Match results are cached per (log, keyword); time params accept RFC3339 /
 
 ## ✅ Quality & verification
 
-- 350 unit and integration tests (core, MCP, GUI, embedded-data contracts) — `cargo test`
+- 357 unit and integration tests (core, MCP, GUI, embedded-data contracts) — `cargo test`
 - Release benchmark harness — `cargo run --release --example bench -- <file> [kws]`
   (generates a 64MB synthetic log when run without args)
 
 ## 🔮 Deliberate next steps (not implemented)
 
 - Filter view (show only matching lines) & regex filters
-- Timeline zoom/pan with bucket re-resolution
 - Export of filtered ranges / templates report
 - Persistent filter sets per file
 - Multi-file merged timeline

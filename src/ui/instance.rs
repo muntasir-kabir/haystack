@@ -336,7 +336,9 @@ mod tests {
 
     #[test]
     fn lock_contention_is_retryable() {
-        assert!(is_lock_contention(&io::Error::from(io::ErrorKind::WouldBlock)));
+        assert!(is_lock_contention(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
 
         #[cfg(windows)]
         assert!(is_lock_contention(&io::Error::from_raw_os_error(33)));

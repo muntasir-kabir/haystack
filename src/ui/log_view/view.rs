@@ -104,7 +104,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
     } else if let Some(anchor) = preserve_anchor {
-        // No pending scroll (diamond click etc.), so honor a filter-change
+        // No pending scroll (timeline occurrence click etc.), so honor a filter-change
         // anchor by top-aligning the preserved reference line.
         if let Some(offset) = compute_preserve_anchor_offset(tab, anchor, row_height, total_visible)
         {
@@ -154,7 +154,6 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                         Some(RowAction::Select) if !suppress_select => {
                             tab.set_keyword_highlight(None);
                             tab.context_line = Some(i);
-                            tab.sync_timeline_selection_to_line(i);
                             tab.ensure_visible();
                         }
                         Some(RowAction::Pin) => {
@@ -977,6 +976,7 @@ fn save_pin(tab: &mut LogTab, range: (usize, usize)) {
             p.start_ts = start_ts;
             p.end_ts = end_ts;
             p.comment = comment;
+            p.unanchored = false;
         }
     } else {
         tab.pins.push(PinEntry {
@@ -985,6 +985,7 @@ fn save_pin(tab: &mut LogTab, range: (usize, usize)) {
             start_ts,
             end_ts,
             comment,
+            unanchored: false,
         });
     }
     tab.pin_modal = None;
@@ -1629,6 +1630,7 @@ fn update_viewport_range(
     rendered_range: &Cell<Option<(usize, usize)>>,
     pending: Option<usize>,
 ) {
+    let previous_range = tab.viewport_range;
     let mut forced_range: Option<(usize, usize)> = None;
     if pending.is_some() {
         if let Some(line) = tab.context_line {
@@ -1663,10 +1665,12 @@ fn update_viewport_range(
         tab.viewport_range = Some(range);
     }
 
-    // If the visible range has scrolled fully out of the current timeline view,
-    // recenter the timeline zoom window on the shadow so the user never loses
-    // their position (timeline "zoom slider" stays in sync with log scroll).
-    tab.ensure_viewport_visible();
+    // Follow an actual Log View movement or an explicit navigation request.
+    // Calling this unconditionally made a manual timeline pan snap back on the
+    // next frame even though the log viewport itself had not moved.
+    if pending.is_some() || tab.viewport_range != previous_range {
+        tab.ensure_viewport_visible();
+    }
 }
 
 #[cfg(test)]
@@ -1702,6 +1706,7 @@ mod tests {
             start_ts: 0,
             end_ts: 1,
             comment: "old comment".into(),
+            unanchored: false,
         });
 
         // Simulate the pin-viewer edit flow: pre-fill the comment + flags, then save.

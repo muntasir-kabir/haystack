@@ -1,3 +1,15 @@
+# Make GUI-agent investigation guidance flexible
+
+Reworked the GUI MCP instruction from a rigid sequence into a concise suggested approach: use the GUI-bound document, understand the user's findings, explore log shape, narrow hypotheses only when useful, and publish evidence-backed conclusions.
+
+# Focus GUI-agent analysis workflow and shorten session IDs
+
+GUI-attached agents now immediately read the user's Pin-tab findings, focus investigation with filters and document trimming, and publish an evidenced root-cause analysis back to the Pin tab. Temporary GUI session IDs are now random 12-character hexadecimal values, with matching validation, MCP schemas, documentation, and tests.
+
+# Resolve timeline buckets at every zoom level
+
+Timeline zoom and pan now re-resolve the visible histogram and filter lanes from exact timestamp/line indexes instead of magnifying fixed whole-file buckets. Singleton occurrences render at their exact time/line as 2×7px markers. Multi-occurrence buckets join edge-to-edge across their full timeline width at 7px (small), 10px (medium), or 13px (dense) height. The current occurrence is derived from the selected lane and Log View line instead of stored as duplicate diamond state; corrected pan, brush, minimap, and log-viewport synchronization keep navigation stable.
+
 # Add case-sensitive Log View search
 
 Added an `Aa` toggle to Log View search for exact-case matching, while preserving case-insensitive search as the default. The search worker and highlight automaton now use the selected mode consistently.
@@ -511,3 +523,4 @@ Made timeline/log filter controls compact with a light yellow treatment and trai
 
 Filter lanes can now be selected by clicking their row or an occurrence diamond. Left/Right arrows navigate the selected lane's occurrences, while Up/Down arrows navigate multi-result Log View searches; contextual headers, SVG arrows, and shortcut toasts explain the controls.
 Added a modular embedded-data inspector: JSON is now joined by logfmt/key-value, colon fields, Foundation/Python/JVM debug values, HTTP, protobuf text, stack traces, and JWT/Base64/hex/PEM payloads. Each format has an isolated detector and Log View highlighter with dedicated detection and visualization coverage; stack traces render as frames and encoded data requires an explicit preview action.
+Timeline occurrence navigation now uses the requested larger, animated layout; timeline captions and buckets are resized, and clicking a filter name toggles its visibility.

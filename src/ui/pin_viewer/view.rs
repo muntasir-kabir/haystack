@@ -44,6 +44,54 @@ fn format_duration_ms(ms: i64) -> String {
     format!("{:.1} days", days)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::app::model::PinEntry;
+    use logotomy::core::document::LogDocument;
+
+    #[test]
+    fn text_only_analysis_is_first_in_pin_tab_and_copy_output() {
+        let path = std::env::temp_dir().join(format!(
+            "logotomy-pin-analysis-{}-{}.log",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(
+            &path,
+            "2026-07-19T10:00:00.000Z INFO one\n2026-07-19T10:00:01.000Z ERROR two\n",
+        )
+        .unwrap();
+        let mut tab = LogTab::new(LogDocument::open(&path).unwrap());
+        std::fs::remove_file(path).ok();
+        tab.pins = vec![
+            PinEntry {
+                start_line: 1,
+                line_numbers: vec![1],
+                start_ts: tab.doc.ts_at(1),
+                end_ts: tab.doc.ts_at(1),
+                comment: "Line-specific note".into(),
+                unanchored: false,
+            },
+            PinEntry {
+                start_line: 0,
+                line_numbers: vec![],
+                start_ts: -1,
+                end_ts: -1,
+                comment: "Read this first".into(),
+                unanchored: true,
+            },
+        ];
+
+        let sorted = sorted_pin_indices(&tab);
+        assert_eq!(sorted, vec![1, 0]);
+        assert_eq!(pin_header_text(&tab, 0, &sorted), "Analysis");
+        let copied = pinned_content_text(&tab);
+        assert!(copied.starts_with("Analysis\nRead this first"));
+        assert!(!copied.contains("line 1\nRead this first"));
+    }
+}
+
 /// Timestamp of the last Copy click (module-wide), drives the toast.
 static COPY_TOAST_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// How long the "Copied to clipboard" toast stays visible.
@@ -91,6 +139,15 @@ fn sorted_pin_indices(tab: &LogTab) -> Vec<usize> {
     indices.sort_by(|&a, &b| {
         let pa = &tab.pins[a];
         let pb = &tab.pins[b];
+        // Text-only analyses deliberately lead the Pin tab so the user's
+        // high-level guidance is visible before line-specific evidence.
+        if pa.unanchored != pb.unanchored {
+            return if pa.unanchored {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
         if pa.start_ts >= 0 && pb.start_ts >= 0 {
             pa.start_ts.cmp(&pb.start_ts)
         } else if pa.start_ts >= 0 {
@@ -111,6 +168,9 @@ fn sorted_pin_indices(tab: &LogTab) -> Vec<usize> {
 fn pin_header_text(tab: &LogTab, pos: usize, sorted_indices: &[usize]) -> String {
     let pi = sorted_indices[pos];
     let pin = &tab.pins[pi];
+    if pin.unanchored {
+        return "Analysis".to_string();
+    }
     let log_start = match tab.timeline.domain {
         TimelineDomain::Time { start_ms, .. } => start_ms,
         _ => -1,
@@ -319,22 +379,24 @@ fn render_content(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                                     {
                                         remove_pin = Some(pi);
                                     }
-                                    if icons::image_button(
-                                        ui,
-                                        Icon::Edit,
-                                        egui::vec2(16.0, 16.0),
-                                        theme.text,
-                                    )
-                                    .on_hover_text("Edit pin (reopens the pin window)")
-                                    .clicked()
-                                    {
-                                        edit_pin = Some(pi);
+                                    if !pin.unanchored {
+                                        if icons::image_button(
+                                            ui,
+                                            Icon::Edit,
+                                            egui::vec2(16.0, 16.0),
+                                            theme.text,
+                                        )
+                                        .on_hover_text("Edit pin (reopens the pin window)")
+                                        .clicked()
+                                        {
+                                            edit_pin = Some(pi);
+                                        }
                                     }
                                 },
                             );
                         });
 
-                        // Comment (if non-empty) in bold
+                        // Analysis text / optional pin comment.
                         if !pin.comment.is_empty() {
                             ui.add_space(2.0);
                             ui.label(

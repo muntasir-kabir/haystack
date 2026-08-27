@@ -19,6 +19,7 @@ use logotomy::core::search;
 use logotomy::core::settings::Settings;
 use logotomy::core::time::{CustomDateFormat, CustomTimeFormat};
 use logotomy::core::timeline::{Timeline, DEFAULT_BUCKETS};
+use logotomy::mcp::PinAnalysis;
 
 #[path = "tab_model.rs"]
 mod tab_model;
@@ -30,7 +31,8 @@ pub enum TrimAction {
     TrimLeft(usize),
 }
 
-/// A saved pin entry — a pinned range of log lines with optional user comment.
+/// A saved Pin-tab analysis entry. It may anchor a note to log lines, or be a
+/// text-only user/agent analysis (`line_numbers` empty) shown first in the tab.
 #[derive(Clone, Debug)]
 pub struct PinEntry {
     pub start_line: usize,
@@ -38,6 +40,42 @@ pub struct PinEntry {
     pub start_ts: i64,
     pub end_ts: i64,
     pub comment: String,
+    pub unanchored: bool,
+}
+
+fn pin_analyses(pins: &[PinEntry]) -> Vec<PinAnalysis> {
+    pins.iter()
+        .map(|pin| PinAnalysis {
+            text: pin.comment.clone(),
+            lines: pin.line_numbers.clone(),
+        })
+        .collect()
+}
+
+fn pins_from_analyses(doc: &LogDocument, analyses: Vec<PinAnalysis>) -> Vec<PinEntry> {
+    analyses
+        .into_iter()
+        .map(|analysis| {
+            let unanchored = analysis.lines.is_empty();
+            let start_line = analysis.lines.first().copied().unwrap_or(0);
+            PinEntry {
+                start_line,
+                start_ts: analysis
+                    .lines
+                    .first()
+                    .and_then(|line| doc.ts_at_opt(*line))
+                    .unwrap_or(-1),
+                end_ts: analysis
+                    .lines
+                    .last()
+                    .and_then(|line| doc.ts_at_opt(*line))
+                    .unwrap_or(-1),
+                comment: analysis.text,
+                line_numbers: analysis.lines,
+                unanchored,
+            }
+        })
+        .collect()
 }
 
 /// Maximum number of filters supported in the timeline (excluding
@@ -138,8 +176,10 @@ pub struct LogTab {
     /// Zoom window on the timeline: (start_x, end_x) in epoch ms or line index.
     /// None = auto (full range).
     pub timeline_zoom: Option<(i64, i64)>,
-    /// The filter lane + real line index of the currently selected diamond, if any.
-    pub selected_diamond: Option<(usize, usize)>,
+    /// Pointer x-coordinate where the active Shift-drag timeline brush began.
+    /// Stored explicitly because egui's current interact position is not the
+    /// drag origin once the pointer moves.
+    pub timeline_brush_start: Option<f32>,
     /// The filter lane currently selected for left/right occurrence navigation.
     pub selected_lane: Option<usize>,
     /// One-shot UI message queued by a tab view and drained by the app toast.
@@ -232,6 +272,9 @@ pub struct LogTab {
     /// Index of the most recently added filter + when it was added, driving the
     /// short "new filter" highlight animation on the timeline lane label.
     pub filter_highlight: Option<(usize, Instant)>,
+    /// Last occurrence-navigation text and the time it changed, driving the
+    /// short transition when moving between occurrences.
+    pub occurrence_navigation_animation: Option<(String, Instant)>,
 
     pub dock_state: DockState<ViewTab>,
     pub detached_views: HashSet<ViewTab>,
@@ -865,6 +908,28 @@ impl LogotomyApp {
         }
     }
 
+    /// Push GUI Pin-tab analysis changes (remove, clear, or user-edited pins)
+    /// into the GUI MCP state. PinEntry remains the single source model.
+    pub fn sync_mcp_analyses(&mut self) {
+        let Some(ref mcp_state) = self.mcp_state else {
+            return;
+        };
+        for tab in &self.tabs {
+            if !tab.mcp_serving {
+                continue;
+            }
+            let analyses = pin_analyses(&tab.pins);
+            let mut guard = mcp_state.lock().unwrap();
+            if guard.analyses != analyses {
+                guard.set_analyses(analyses);
+                // The GUI already owns the new value, so it must not pull the
+                // exact same state back in on the next frame.
+                guard.analyses_dirty.store(false, Ordering::Relaxed);
+                info!("MCP: synced GUI Pin-tab analyses into server state");
+            }
+        }
+    }
+
     /// Poll the MCP server's `filters_dirty` flag. When the filter set was
     /// modified by an MCP tool call (filters_add/filters_remove), re-apply it
     /// to the served tab so the GUI lanes match what the agent set.
@@ -896,6 +961,33 @@ impl LogotomyApp {
             }
             tab.rescan_filters();
             info!("MCP: re-applied filters from server state");
+        }
+    }
+
+    /// Apply analysis cards added by an MCP client to the served Pin tab.
+    pub fn poll_mcp_analyses(&mut self) {
+        let Some(ref mcp_state) = self.mcp_state else {
+            return;
+        };
+        let dirty = mcp_state
+            .lock()
+            .unwrap()
+            .analyses_dirty
+            .load(Ordering::Relaxed);
+        if !dirty {
+            return;
+        }
+        let analyses = {
+            let guard = mcp_state.lock().unwrap();
+            guard.analyses_dirty.store(false, Ordering::Relaxed);
+            guard.analyses.clone()
+        };
+        if let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) {
+            tab.pins = pins_from_analyses(&tab.doc, analyses);
+            if !tab.pins.is_empty() {
+                tab.bottom_panel_open = true;
+            }
+            info!("MCP: applied analyses to GUI Pin tab");
         }
     }
 
@@ -942,6 +1034,8 @@ impl LogotomyApp {
                             .collect();
                         guard.set_filters("_active", texts);
                         guard.filters_dirty.store(false, Ordering::Relaxed);
+                        guard.set_analyses(pin_analyses(&self.tabs[new_idx].pins));
+                        guard.analyses_dirty.store(false, Ordering::Relaxed);
                         info!("MCP: switched active doc to another tab");
                     }
                     None => {
@@ -985,21 +1079,31 @@ impl LogotomyApp {
     /// GUI session. GUI mode already serves the active document, so the agent
     /// must not call `load_log` or pass `log_id`.
     fn build_mcp_instruction(session_id: &str, log_path: &str) -> String {
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "logotomy".to_string());
         format!(
-            "Use the already-configured Logotomy MCP server (`logotomy --mcp`) for this task.\n\n\
-If Logotomy MCP is not configured or its tools are unavailable, do not attempt a different \
-transport. Ask the user to configure it first using: Logotomy → Settings → Integrate with AI \
-Assistant → follow the guide. Continue only after the configured server exposes \
-`attach_gui_session`.\n\n\
-Call `attach_gui_session` once with this temporary GUI session ID:\n{session_id}\n\n\
-Then call `session_info` and confirm that `mode` is `gui_attached`. The currently selected \
-log is already available from the GUI:\n{log_path}\n\n\
-In `gui_attached` mode, do not call `load_log` and do not pass `log_id`. Start with \
-`summarize_log` using `with_filtered_log=false` unless the existing GUI filters are \
-intentionally relevant. Read `logotomy://guide` if MCP resources are supported.\n\n\
-The session ID expires when MCP is stopped or Logotomy exits. Treat it as a local secret: \
-do not save it in MCP configuration, write it to files, print it, or expose it in your response. \
-If attachment fails, ask the user to start MCP in Logotomy and provide a new session ID."
+            "The user has invited you to an interactive Logotomy debugging session.\n\n\
+Shared log: {log_path}\n\
+Temporary session ID: {session_id}\n\n\
+Keep the session ID secret. Do not save it, write it to files, or include it in your response.\n\n\
+If Logotomy MCP (`{executable} --mcp`) is not configured or its tools are unavailable, \
+do not use another transport or workaround. Ask the user to configure it in Logotomy App → \
+Settings → Integrate with AI Assistant, following the guide there. Help with that setup first, \
+then continue only after `attach_gui_session` is available.\n\n\
+Connect by calling `attach_gui_session` with the temporary session ID, then call \
+`session_info` and confirm `mode` is `gui_attached`. Use `detach_gui_session` when you need \
+to leave the session. While attached, the GUI supplies the shared log: `load_log`, \
+`list_logs`, and `close_log` are unavailable, and no `log_id` is required. The connection ends \
+when the user stops MCP or closes the shared log.\n\n\
+Suggested investigation approach: begin with the user's question, Pin-tab analysis \
+(`get_analysis`), and active filters (`filters_get`). Get orientation from `summarize_log` \
+(`with_filtered_log=false` for the full log) and targeted `find_occurrences`. Use \
+`filters_add`, `filters_remove`, and `trim` when they help test a hypothesis or focus the \
+search. Prefer `log_sequence` and `get_template` to investigate many lines efficiently; use \
+bounded `raw_log` only for exact evidence. Add useful, evidence-backed findings or root-cause \
+conclusions to the Pin tab with `add_analysis`.\n\n\
+Read `logotomy://guide` for additional tool guidance when MCP resources are supported."
         )
     }
 
@@ -1022,7 +1126,7 @@ If attachment fails, ask the user to start MCP in Logotomy and provide a new ses
         // publishing this GUI-owned session.
         logotomy::mcp::session::clear();
         self.status = "Starting MCP server…".to_string();
-        // Dynamic port (OS-assigned) + a fresh 256-bit credential per session.
+        // Dynamic port (OS-assigned) + a fresh short random credential per session.
         let session_id = logotomy::mcp::session::generate_session_id();
         info!("starting authenticated private MCP GUI socket");
 
@@ -1044,6 +1148,8 @@ If attachment fails, ask the user to start MCP in Logotomy and provide a new ses
                     .collect();
                 guard.set_filters("_active", texts);
                 guard.filters_dirty.store(false, Ordering::Relaxed);
+                guard.set_analyses(pin_analyses(&self.tabs[active_idx].pins));
+                guard.analyses_dirty.store(false, Ordering::Relaxed);
                 self.tabs[active_idx].mcp_serving = true;
                 info!("MCP: set active doc from tab {}", active_idx);
             }
@@ -1194,6 +1300,8 @@ If attachment fails, ask the user to start MCP in Logotomy and provide a new ses
                     .collect();
                 guard.set_filters("_active", texts);
                 guard.filters_dirty.store(false, Ordering::Relaxed);
+                guard.set_analyses(pin_analyses(&self.tabs[new_idx].pins));
+                guard.analyses_dirty.store(false, Ordering::Relaxed);
                 info!(
                     "MCP: switched active doc to tab {} ({})",
                     new_idx, self.tabs[new_idx].doc.file_name
@@ -1281,22 +1389,63 @@ mod tests {
     #[test]
     fn gui_mcp_instruction_is_actionable_and_safe() {
         let prompt = LogotomyApp::build_mcp_instruction("123456", "/tmp/example.log");
+        let executable = std::env::current_exe().unwrap().display().to_string();
         assert!(prompt.contains("attach_gui_session"));
         assert!(prompt.contains("123456"));
-        assert!(prompt.contains("/tmp/example.log"));
+        assert!(prompt.contains("Shared log: /tmp/example.log"));
+        assert!(prompt.contains("Temporary session ID: 123456"));
+        assert!(prompt.contains("interactive Logotomy debugging session"));
         assert!(prompt.contains("gui_attached"));
-        assert!(prompt.contains("do not call `load_log`"));
-        assert!(prompt.contains("do not pass `log_id`"));
+        assert!(prompt.contains("`load_log`, `list_logs`, and `close_log` are unavailable"));
+        assert!(prompt.contains("no `log_id` is required"));
+        assert!(prompt.contains("Suggested investigation approach"));
         assert!(prompt.contains("with_filtered_log=false"));
-        assert!(prompt.contains("do not save it in MCP configuration"));
-        assert!(prompt.contains("logotomy --mcp"));
+        assert!(prompt.contains("get_analysis"));
+        assert!(prompt.contains("filters_get"));
+        assert!(prompt.contains("find_occurrences"));
+        assert!(prompt.contains("`filters_add`, `filters_remove`, and `trim`"));
+        assert!(prompt.contains("log_sequence"));
+        assert!(prompt.contains("get_template"));
+        assert!(prompt.contains("bounded `raw_log`"));
+        assert!(prompt.contains("add_analysis"));
+        assert!(prompt.contains("root-cause conclusions"));
+        assert!(
+            prompt.contains("Do not save it, write it to files, or include it in your response")
+        );
+        assert!(prompt.contains(&format!("`{executable} --mcp`")));
         assert!(prompt.contains("session_info"));
-        assert!(prompt.contains("If Logotomy MCP is not configured"));
-        assert!(prompt.contains("Logotomy → Settings → Integrate with AI Assistant"));
-        assert!(prompt.contains("Continue only after"));
+        assert!(prompt.contains("Logotomy App → Settings → Integrate with AI Assistant"));
+        assert!(prompt.contains("Help with that setup first"));
+        assert!(prompt.contains("detach_gui_session"));
         assert!(!prompt.contains("http://"));
         assert!(!prompt.contains("Authorization"));
         assert!(!prompt.contains("--mcp-gui"));
+    }
+
+    #[test]
+    fn pin_analysis_conversion_preserves_empty_line_cards() {
+        let path = write_temp(
+            "2026-07-19T10:00:00.000Z INFO first\n2026-07-19T10:00:01.000Z ERROR second\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        std::fs::remove_file(path).ok();
+        let pins = pins_from_analyses(
+            &doc,
+            vec![
+                PinAnalysis {
+                    text: "Unanchored user context".into(),
+                    lines: vec![],
+                },
+                PinAnalysis {
+                    text: "Error evidence".into(),
+                    lines: vec![1],
+                },
+            ],
+        );
+        assert!(pins[0].unanchored);
+        assert_eq!(pins[0].start_ts, -1);
+        assert!(!pins[1].unanchored);
+        assert_eq!(pin_analyses(&pins)[1].lines, vec![1]);
     }
 
     fn write_temp(content: &str) -> PathBuf {
@@ -1901,7 +2050,7 @@ mod tests {
 
         tab.select_lane_next();
         assert_eq!(tab.context_line, Some(1));
-        assert_eq!(tab.selected_diamond, Some((0, 1)));
+        assert_eq!(tab.selected_occurrence(), Some((0, 1)));
         assert_eq!(tab.find_pos, Some(0));
         tab.select_lane_next();
         assert_eq!(tab.context_line, Some(3));
@@ -1912,34 +2061,34 @@ mod tests {
         assert_eq!(tab.context_line, Some(3));
         assert_eq!(tab.pending_scroll, Some(3));
 
-        // Search navigation moves the selected lane cursor to its nearest
-        // filter occurrence as well.
+        // Search navigation can land on a line outside the selected lane; the
+        // derived occurrence then becomes empty without clearing the lane.
         tab.find_pos = Some(0);
         tab.find_next();
         assert_eq!(tab.context_line, Some(2));
-        assert_eq!(tab.selected_diamond, None);
+        assert_eq!(tab.selected_occurrence(), None);
 
-        // A selected log line updates only the already selected lane; it never
-        // changes the lane just because another filter matches the line.
+        // Occurrence state derives from the selected lane and current log
+        // line; another lane matching the line never changes the selection.
         tab.matches = Arc::new(vec![vec![1, 3], vec![1, 4]]);
         tab.selected_lane = Some(1);
-        tab.sync_timeline_selection_to_line(1);
-        assert_eq!(tab.selected_diamond, Some((1, 1)));
-        tab.sync_timeline_selection_to_line(3);
+        tab.context_line = Some(1);
+        assert_eq!(tab.selected_occurrence(), Some((1, 1)));
+        tab.context_line = Some(3);
         assert_eq!(tab.selected_lane, Some(1));
-        assert_eq!(tab.selected_diamond, None);
-        tab.sync_timeline_selection_to_line(2);
+        assert_eq!(tab.selected_occurrence(), None);
+        tab.context_line = Some(2);
         assert_eq!(tab.selected_lane, Some(1));
-        assert_eq!(tab.selected_diamond, None);
+        assert_eq!(tab.selected_occurrence(), None);
 
         // An arbitrary timeline click keeps the clicked lane, even when the
         // line matches a different lane.
         tab.select_timeline_line(3, Some(1));
         assert_eq!(tab.context_line, Some(3));
         assert_eq!(tab.selected_lane, Some(1));
-        assert_eq!(tab.selected_diamond, None);
+        assert_eq!(tab.selected_occurrence(), None);
         tab.select_timeline_line(4, Some(1));
-        assert_eq!(tab.selected_diamond, Some((1, 4)));
+        assert_eq!(tab.selected_occurrence(), Some((1, 4)));
 
         std::fs::remove_file(path).ok();
     }

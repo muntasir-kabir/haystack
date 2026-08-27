@@ -93,7 +93,7 @@ cargo build --release --no-default-features
 │ ┌──────┬────────────────────────────┬────┐              │
 │ │ 👁 EE │ ▁▂█▆▅▃ density (full-hgt) │ ↕  │              │  timeline
 │ │ 👁 kw1│ ───────────── 1px line    │ ↔  │              │  (eye markers,
-│ │ 👁 kw2│ ── ◆ ◆ ── ◆ filter match│ 🗑 │              │   trash = remove)
+│ │ 👁 kw2│ ── ▌ ███ ── ▌ occurrences│ 🗑 │              │   trash = remove)
 │ │      │ 10:00      Δ3.3s  10:01   │    │              │   (inter-tick dur)
 │ │      │ [══════minimap══════]       │    │              │
 │ └──────┴────────────────────────────┴────┘              │
@@ -132,7 +132,7 @@ logotomy auto-detects the timestamp family (shown as `format: … · date: …` 
 - Virtualized: a 5-million-line file scrolls as smoothly as a 50-line one.
 - Gutter shows the **line number** and the line's **template ID** (`T12`).
 - Click any line to select it (white selection bar on the timeline).
-- **Right-click** any line for a context menu with **📌 Pin log** and **📝 Add analysis**.
+- **Right-click** any line for a context menu with **📌 Pin**.
 - The right edge has a **black scroll-position indicator bar** showing where you are in the file.
 - Log lines render in the embedded **Space Mono** monospace font (SIL OFL 1.1 — see the README thanks section); the **A− / A+** toolbar buttons change the size from 8 to 24 px.
 - Very long log rows are kept to one visual row and safely display a 2,000-byte Unicode-aware prefix, so an unusually large message cannot interrupt scrolling.
@@ -152,34 +152,33 @@ logotomy auto-detects the timestamp family (shown as `format: … · date: …` 
 
 ### The timeline
 - The timeline is a **fixed-height panel** at the top — it always shows the full histogram, all filter lanes, axis labels, and the zoom/minimap strip, and can never be shrunk to hide lanes. Its height grows/shrinks with the number of filters.
-- Shows the whole file as a full-height density histogram, with one **colored lane per filter**. Each lane has a **straight 1px line** in the filter's color across the full lane width, plus clickable ◆ diamonds for individual matches.
+- Shows the whole file as a full-height density histogram, with one **colored lane per filter**. Each lane has a **straight 1px line** in the filter's color across the full lane width. A bucket containing one visible match shows a **2px × 7px marker at the occurrence's exact time/line position**. Multi-occurrence buckets are edge-to-edge rectangles spanning the bucket's full timeline width: small is **7px** high, medium **10px**, and dense **13px**. Adjacent non-empty buckets therefore read as a continuous density strip. Exact counts remain available on hover, and zooming re-resolves the buckets until distinguishable occurrences become exact markers.
 - **Left column** shows filter names (up to 14 chars) with **👁 eye markers** (👁 = lane enabled, bold label; 🚫 = disabled, normal weight label). Click to toggle. The first lane is "Everything Else" — it has the eye toggle but **cannot be removed**.
 - **Hover a filter's name/eye** to see a tooltip with the **full filter text** and its **total match count**, e.g. `Some Filter (334 occurrences)`.
 - Each filter lane has a **🗑 trash icon** on the right of its label. Clicking it always asks for confirmation before removing the filter — unless you tick **"Do not ask me again"** in the popup (or enable *Settings → Do not ask before deleting a filter*).
-- Click a filter lane or one of its ◆ diamonds to select the lane. The Timeline header then shows previous/next navigation using Left/Right arrows; those keys select earlier/later occurrences and jump the Log View to that line.
+- Click a filter lane, exact occurrence marker, or density bucket to select the lane. The Timeline header shows previous/next navigation with Left/Right arrows whenever the current Log View line is an occurrence in that lane. The current occurrence is derived from the selected lane and current line; no separate occurrence-selection marker is stored.
 - **Bottom toolbar** (shown while filters exist, left-aligned):
   - **🚫 Disable All / 👁 Enable All** — toggles every filter lane at once; the **Everything Else** lane is never touched.
   - **🗑 Delete All** — removes every filter (behind a confirmation popup, following the same "do not ask again" preference).
 - **Right column** has ↕ (zoom) and ↔ (pan) hint icons with hover tooltips.
-- **Zoom** — scroll anywhere over the timeline. Zoom is continuous and works on both trackpads and mouse wheels.
-- **Pan** — drag left/right (without shift). Snaps at the file boundaries.
+- **Zoom** — scroll anywhere over the timeline. Zoom is continuous, pointer-anchored, works on both trackpads and mouse wheels, and can reach millisecond/individual-line detail.
+- **Pan** — drag left/right (without shift). The visible span is preserved and snaps at the file boundaries.
 - **Brush select** — shift+drag to draw a rectangle; on release, zooms to that range.
 - **Reset zoom** — double-click anywhere on the timeline, or click the ↺ button.
 - **Minimap** — click anywhere on the minimap to jump to that position.
-- **Hover** the timeline for per-bucket details (time, line count, per-filter counts).
-- **Click** the timeline → jumps to the nearest filter match (or approximate position).
+- **Hover** the timeline for re-resolved visible-column details (time/line position, line count, and per-filter counts). Density buckets also show their exact occurrence count and boundary lines.
+- **Click** the timeline background → jumps to the nearest real log line; clicking a filter marker/bucket jumps to the nearest occurrence in that lane.
   A white marker shows your current position.
 - **Axis labels** are smart: if all ticks share the same hour, only `MM:SS.ms` is shown.
 - **Inter-tick duration labels** (e.g. `Δ 3.3s`, `Δ 1m 34s`) appear between each pair of tick labels.
 
 ### Bottom panel (pinned lines + analyses)
 - **Right-click** any log line → context menu:
-  - **📌 Pin log** — saves the line to the bottom panel for quick revisiting.
-  - **📝 Add analysis** — opens a text input to write a free-text note about that line.
+  - **📌 Pin** — saves the line to the bottom panel for quick revisiting; its optional comment is an analysis note.
 - Expand/collapse the panel with the **▼/▶** header. When collapsed, shows counts.
-- When empty, shows a brief hint: "Right-click a log line to pin it or add an analysis."
+- When empty, shows a brief hint to right-click a log line and pin it.
 - Pinned lines show **line number + text snippet**; click the **✏️ edit** button to reopen the pin window and edit its comment/lines, or **×** to unpin.
-- Analyses show **line number, snippet, and your note**; click **×** to delete.
+- GUI-attached AI agents can read existing entries with `get_analysis()` and add user-visible entries with `add_analysis({text, lines})`. An empty `lines` array creates a text-only analysis card at the top of this panel.
 - **"Clear all"** empties everything and collapses the panel.
 
 ### Templates panel (right, 🧩)
@@ -236,6 +235,14 @@ the GUI session instruction, and paste it into the agent conversation. The agent
 `attach_gui_session`, then `session_info`; while `mode` is `gui_attached`, it must not call
 `load_log` or pass `log_id`. Stop MCP when finished to invalidate the temporary session ID.
 
+In GUI-attached mode, the GUI already provides the open log: `load_log`, `list_logs`, and
+`close_log` are unavailable, and `log_id` is not needed. A useful approach is to understand the
+user's question and Pin-tab findings with `get_analysis()`, explore log shape with
+`summarize_log(with_filtered_log: false)` and targeted `find_occurrences`, then apply filters
+with `filters_add` or
+`trim` when they help test a hypothesis. Request bounded `raw_log` only when exact evidence is
+needed, and use `add_analysis({text, lines})` to post useful evidence-backed root-cause findings.
+
 Logotomy exposes MCP only through stdio. Private authenticated local IPC routes attached calls
 to the GUI, so no URL, port, or temporary MCP server belongs in the agent configuration.
 
@@ -261,7 +268,8 @@ to the GUI, so no URL, port, or temporary MCP server belongs in the agent config
 | `load_log` | `path` → indexes the file, returns `log_id` + stats (lines, time range, top templates) |
 | `list_logs` | All loaded documents with stats |
 | `close_log` | Unload a `log_id` and free memory |
-| `find_occurrences` | Lines containing `keyword`, paginated (`offset`, `max_results`); returns total count + first/last-seen, optional `after`/`before` window; `format="refs"` for anchors-only, `context=N` for collapsed surroundings |
+| `find_occurrences` | Paginated `[line_number, epoch_ms\|null]` matches for `keyword`; supports `offset`, `max_results`, `after`/`before`, `with_filtered_log`, and ASCII `case_sensitive` mode |
+| `get_analysis` / `add_analysis` | (GUI-attached) Read or add the current Pin-tab analysis cards; `add_analysis({text, lines:[]})` adds a text-only card at the top |
 | `summarize_log` | One-call orientation (optional `start`/`end` range): stats, top/error-ish templates, biggest time gaps, densest minute, plus byte-size budget estimates |
 | `get_timeline_histogram` | Tiny `{x, counts}` distribution for whole log / keyword / template, optional range — find the spike first |
 | `get_template_anomalies` | Rare, first-seen-late, and bursty templates ("what's unusual here"), optional range |
@@ -327,7 +335,7 @@ printf '%s\n' \
 | Double-click timeline | Reset zoom to full range |
 | Click minimap | Pan view to that position |
 | Click log line | Select line (white line on timeline) |
-| Right-click log line | Context menu: 📌 Pin log / 📝 Add analysis |
+| Right-click log line | Context menu: 📌 Pin |
 | Click 👁/🚫 lane marker | Toggle filter lane on/off (filters log view) |
 | Hover filter name/eye | Tooltip with full filter text + match count |
 | Click 🗑 on a filter lane | Remove that filter (with confirmation) |

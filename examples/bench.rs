@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use logotomy::core::document::LogDocument;
 use logotomy::core::search::scan_document;
-use logotomy::core::timeline::{Timeline, DEFAULT_BUCKETS};
+use logotomy::core::timeline::{Timeline, TimelineDomain, DEFAULT_BUCKETS};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -40,8 +40,32 @@ fn main() {
     let scan_t = t1.elapsed();
 
     let t2 = Instant::now();
-    let _tl = Timeline::build(&doc, &matches, DEFAULT_BUCKETS);
+    let tl = Timeline::build(&doc, &matches, DEFAULT_BUCKETS);
     let tl_t = t2.elapsed();
+
+    let (full_start, full_end) = match tl.domain {
+        TimelineDomain::Time { start_ms, end_ms } => (start_ms, end_ms),
+        TimelineDomain::Sequence => (0, doc.total_lines().saturating_sub(1) as i64),
+    };
+    let t3 = Instant::now();
+    let resolved_density = tl.resolve_density_bins(&doc, full_start, full_end, 1_000);
+    let resolved_lanes: Vec<_> = (0..matches.len())
+        .map(|lane| tl.resolve_filter_bins(lane, full_start, full_end, 125))
+        .collect();
+    let resolve_t = t3.elapsed();
+    assert_eq!(
+        resolved_density
+            .iter()
+            .map(|&count| count as u64)
+            .sum::<u64>(),
+        tl.density.iter().map(|&count| count as u64).sum::<u64>()
+    );
+    for (expected, bins) in tl.filter_points.iter().zip(&resolved_lanes) {
+        assert_eq!(
+            bins.iter().map(|bin| bin.count as u64).sum::<u64>(),
+            expected.len() as u64
+        );
+    }
 
     let mb = doc.file_size as f64 / (1024.0 * 1024.0);
 
@@ -92,6 +116,10 @@ fn main() {
         println!("│   {k:<12} hits = {}", m.len());
     }
     println!("│ timeline build        : {:>8.1?}", tl_t);
+    println!(
+        "│ timeline resolve      : {:>8.1?}  (1000px + lanes)",
+        resolve_t
+    );
     println!("└───────────────────────────────────────────────");
 
     if generated {

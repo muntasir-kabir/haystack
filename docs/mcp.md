@@ -88,6 +88,8 @@ While attached:
 - do not call `load_log` and do not pass `log_id`;
 - changing tabs changes the target available to the agent;
 - `trim` and filter changes synchronize with the GUI;
+- the GUI already supplies the open log, so `load_log`, `list_logs`, and `close_log` are unavailable and `log_id` is not needed;
+- use the suggested exploration approach below rather than treating the available analysis tools as a fixed checklist;
 - call `detach_gui_session` to return the same MCP process to standalone mode.
 
 The copied instruction includes the selected log path for orientation, but the session ID is the only attachment capability. It must not be saved in an MCP config, file, skill, shell history, or agent response. If attachment fails, start MCP again and copy a new instruction.
@@ -111,14 +113,13 @@ Logotomy exposes a stable tool catalog in both modes, so clients may safely cach
 - `logotomy://session` — the same state for clients that consume MCP resources;
 - `logotomy://guide` — compact investigation guidance.
 
-Recommended investigation sequence:
+Suggested investigation approach:
 
 1. `session_info`
-2. `summarize_log(with_filtered_log=false)` for full-log orientation
-3. `get_template_anomalies` and `get_timeline_histogram` to find suspicious windows
-4. `get_template` and `get_template_samples` to resolve patterns
-5. `find_occurrences(format="refs")` or `log_sequence` to narrow a range
-6. `raw_log` only for the small exact range needed
+2. In GUI-attached mode, understand the user's question and Pin-tab findings with `get_analysis`
+3. Explore the log shape with `summarize_log(with_filtered_log=false)` and targeted `find_occurrences`
+4. Use filters (`filters_add`), anomalies, histograms, templates, sequences, and `trim` when they help test a hypothesis and narrow the scope
+5. Request only bounded `raw_log` ranges when exact evidence is needed; add useful evidence-backed root-cause conclusions with `add_analysis`
 
 All tool results include `structuredContent` plus JSON text fallback. Tool errors set `isError: true` and return `{error, message, retryable}`. An expired attachment is retryable and automatically restores standalone routing.
 
@@ -131,23 +132,24 @@ All tool results include `structuredContent` plus JSON text fallback. Tool error
 | `load_log` | standalone | Index an absolute file path and return `log_id` plus stats |
 | `list_logs` / `close_log` | standalone | Inspect or unload standalone documents |
 | `filters_get` / `filters_add` / `filters_remove` | both | Read or change the case-sensitive keyword filter set (maximum 20) |
+| `get_analysis` / `add_analysis` | GUI-attached | Read or add user-visible Pin-tab analysis cards (`{text, lines}`); empty `lines` creates a text-only top card |
 | `summarize_log` | both | Compact orientation, templates, errors, gaps, densest minute, and budget estimates |
 | `get_timeline_histogram` | both | Small time/line distribution for a log, keyword, or template |
 | `get_template_anomalies` | both | Rare, late-first-seen, and bursty templates |
 | `get_template` / `get_template_samples` | both | Resolve template IDs and fetch representative examples |
-| `find_occurrences` | both | Paginated keyword matches, anchors, time bounds, and optional collapsed context |
+| `find_occurrences` | both | Paginated `[one_based_line_number, epoch_ms\|null]` matches; supports time bounds, filter scope, and ASCII case mode |
 | `log_sequence` | both | Dense or collapsed template sequence over a line/time range |
 | `raw_log` | both | Exact bounded raw lines with truncation metadata |
 | `trim` | GUI-attached | Focus or reset the GUI document window |
 
 Analysis tools accept `with_filtered_log`, which defaults to `true`. This means the union of keyword filters; the GUI's **Everything Else** lane is excluded. With no filters, pass `with_filtered_log: false` or add one with `filters_add`.
 
-Line bounds are 1-based. Time inputs accept RFC 3339, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD`, or epoch seconds/milliseconds. Respect `returned`, `total`, and `truncated`; narrow the range instead of requesting large raw dumps.
+Line bounds are 1-based. `find_occurrences` accepts `offset`, `max_results`, `with_filtered_log`, and `case_sensitive` (default `true`; `false` folds ASCII case), returning `{occurrences, offset, returned, total_matches, has_more}` where every occurrence is `[line, epoch_ms|null]`. Time inputs accept RFC 3339, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD`, or epoch seconds/milliseconds. Respect `returned`, `total_matches`, and `truncated`; narrow the range instead of requesting large raw dumps.
 
 ## Security and lifecycle
 
 - MCP clients launch only the configured stdio command.
-- Each GUI start creates a cryptographically random 256-bit session ID.
+- Each GUI start creates a cryptographically random 12-character hexadecimal (48-bit) session ID.
 - The GUI publishes a private, atomic local session manifest; Unix permissions are user-only.
 - The internal IPC socket binds only to loopback and rejects requests without the matching ID.
 - The ID and manifest expire when MCP stops or Logotomy exits.
