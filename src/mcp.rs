@@ -701,6 +701,13 @@ fn handle_gui_ipc_client(
     state: Arc<Mutex<ServerState>>,
     expected_session_id: &str,
 ) {
+    // Accepted sockets inherit the listener's nonblocking mode on macOS.
+    // Request framing relies on EOF, so make the per-client stream blocking
+    // before reading it; otherwise an early EAGAIN is treated as a rejected
+    // GUI request.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     let mut bytes = Vec::new();

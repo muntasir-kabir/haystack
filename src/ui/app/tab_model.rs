@@ -80,6 +80,7 @@ impl LogTab {
             embedded_inspector: None,
             embedded_inspector_anchor: None,
             embedded_inspector_mode,
+            annotation_hover: None,
             search_focus_requested: false,
             search_focus_anim: None,
             filter_highlight: None,
@@ -260,6 +261,7 @@ impl LogTab {
         self.embedded_detections = Arc::new(Vec::new());
         self.embedded_inspector = None;
         self.embedded_inspector_anchor = None;
+        self.annotation_hover = None;
         self.embedded_epoch = self.embedded_epoch.wrapping_add(1);
     }
 

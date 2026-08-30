@@ -4,10 +4,11 @@
 
 Logotomy detects structured payloads embedded in the physical records
 intersecting the Log View viewport. Built-in profiles cover valid JSON,
-logfmt/key-value pairs, colon fields, Foundation descriptions, Python literals,
-JVM/Android debug values, HTTP structures, protobuf text, stack traces, and
-encoded JWT/base64/hex/PEM values. Every candidate is bounded, cancellable, and
-has exact original source coordinates.
+logfmt/key-value pairs, colon fields, Swift/Foundation descriptions, Python
+literals, JVM/Android debug values, XML and labeled OpenStep property lists,
+HTTP structures, protobuf text, stack traces, binary plist representations,
+and encoded JWT/base64/hex/PEM values. Every candidate is bounded, cancellable,
+and has exact original source coordinates.
 
 Detection is separate from document-format recognition:
 
@@ -28,6 +29,11 @@ All formats return the common model:
 - normalized `DataNode` tree;
 - source line count and summary.
 
+Detections may also carry multiple exact source fragments inside their overall
+span. Loose field groups use one fragment per field so Log View can leave prose
+and spacing between fields undecorated while preserving one logical inspector
+object.
+
 Implement `DataDetector` in `detectors/<format>.rs`, register it in
 `EmbeddedDataEngine`, add fixture cases, and add its matching Log View
 presentation in `ui/log_view/embedded/highlighters/<format>.rs`. Candidate
@@ -43,7 +49,10 @@ explicit Decode preview action.
 ## Source and record behavior
 
 `LogDocument` exposes exact raw line bytes so source offsets never depend on
-lossy UTF-8 display. Explicit timestamp lines are retained in a compact bitset.
+lossy UTF-8 display. Explicit timestamp lines are retained in a compact bitset,
+with a packed four-byte exact source span per physical line for allocation-free
+timestamp decoration and hover lookup. Continuation lines retain only their
+forward-filled timeline value and therefore receive no source annotation.
 For timestamped logs, viewport scans use the complete containing record; for
 timeless or pre-timestamp text, they use bounded look-behind/look-ahead windows.
 
@@ -61,22 +70,40 @@ an explicit incomplete-candidate cue and an opt-in larger analysis action.
 
 ### Key/value and logfmt
 
-Support whitespace/comma/semicolon separated pairs, quoted values, escapes, and
-`key=value`, `key = "value"`, or conservative `key: value`. Require multiple
-pairs, enclosure, indentation, or a payload-like prefix to avoid highlighting
-timestamps, URLs, IPv6 addresses, and normal prose.
+Support single or grouped whitespace/comma/semicolon separated fields, quoted
+values, escapes, and `key=value`, `key = "value"`, or conservative
+`key: value`. Double-, single-, and backtick-quoted values may contain spaces;
+balanced and quoted values may span physical lines. URL schemes and filesystem
+paths stay intact as scalar values. Single colon fields use stronger structural
+confidence checks to avoid highlighting timestamps, URL schemes, source
+locations, IPv6 addresses, and normal prose.
 
 ### Platform debug literals
 
 Build one bounded collection parser with syntax profiles:
 
 - Python: single quotes, `True`, `False`, `None`, tuples and `pprint` layout;
-- Apple/Foundation: `{ key = value; }` and `(item, item)` descriptions;
+- Apple/Swift/Foundation: synthesized `Type(field: value)` descriptions,
+  nested `Optional(...)`, enum associated values, labeled tuples, Swift
+  dictionaries/arrays, multiline `dump`/Mirror trees, classic
+  `{ key = value; }` collections, and `<NSObject: address; property = value>`;
 - Java/Kotlin/Android: `{key=value}`, `Bundle[{...}]`, Intent extras, and
   constructor/data-class forms such as `User(id=1, name=Ada)`.
 
 These formats are debug representations, not stable platform serialization
 standards, so confidence and strict structural checks are essential.
+
+### Property lists
+
+XML `<plist>` values parse dictionaries, arrays, strings, integers, real
+numbers, booleans, dates, data, UIDs, entities, comments, and CDATA into the
+shared tree. OpenStep/ASCII `{ key = value; }` and `(item, item)` payloads use
+the dedicated plist profile only when the surrounding field is explicitly
+named `plist`, `propertyList`, or a recognized spelling; otherwise the same
+ambiguous syntax remains a Foundation description. Literal, hex, and Base64
+representations carrying the `bplist00` magic receive a metadata-only binary
+profile. Transport decoding requires the explicit inspector action and does
+not automatically interpret the binary object table.
 
 ### HTTP and protobuf text
 

@@ -50,6 +50,23 @@ impl Default for ParsingConfig {
 /// Report progress at most every 4 MiB so the channel stays quiet.
 const PROGRESS_STRIDE: u64 = 4 * 1024 * 1024;
 
+fn pack_timestamp_span(span: std::ops::Range<usize>) -> u32 {
+    let len = span.end.saturating_sub(span.start);
+    if len == 0 || span.start > u16::MAX as usize || len > u16::MAX as usize {
+        return 0;
+    }
+    ((span.start as u32) << 16) | len as u32
+}
+
+fn unpack_timestamp_span(packed: u32) -> Option<std::ops::Range<usize>> {
+    if packed == 0 {
+        return None;
+    }
+    let start = (packed >> 16) as usize;
+    let len = (packed & u16::MAX as u32) as usize;
+    Some(start..start + len)
+}
+
 /// Flattened, export-friendly view of one mined template.
 #[derive(Clone, Debug)]
 pub struct TemplateInfo {
@@ -113,6 +130,12 @@ pub struct LogDocument {
     /// It lets viewport analyzers recover the start/end of multiline records
     /// without retaining a second timestamp array (one bit per source line).
     record_starts: Vec<u64>,
+    /// Packed exact timestamp source spans, indexed by original line. The high
+    /// 16 bits store the byte start and the low 16 bits store the byte length;
+    /// zero means the line has no representable explicit timestamp. This keeps
+    /// annotation lookup allocation-free without rerunning parsers while the
+    /// UI paints.
+    timestamp_spans: Vec<u32>,
     /// Per-line Drain template cluster ID.
     /// Indexed by *original* (untrimmed) line index. Use `template_at` for
     /// trim-relative access.
@@ -162,6 +185,7 @@ impl Clone for LogDocument {
             line_offsets: self.line_offsets.clone(),
             ts_ff: self.ts_ff.clone(),
             record_starts: self.record_starts.clone(),
+            timestamp_spans: self.timestamp_spans.clone(),
             template_ids: self.template_ids.clone(),
             drain: Arc::new(Mutex::new(self.drain.lock().unwrap().clone())),
             masker: self.masker.clone(),
@@ -214,6 +238,18 @@ impl LogDocument {
     pub fn ts_at_opt(&self, rel: usize) -> Option<i64> {
         let real = self.trim_start.checked_add(rel)?;
         self.ts_ff.get(real).copied()
+    }
+
+    /// Explicit timestamp value and exact byte span for a trim-relative line.
+    /// Continuation lines intentionally return `None` even though `ts_at`
+    /// exposes their forward-filled record time.
+    pub fn explicit_timestamp_at(&self, rel: usize) -> Option<(i64, std::ops::Range<usize>)> {
+        let real = self.trim_start.checked_add(rel)?;
+        if real >= self.trim_end {
+            return None;
+        }
+        let span = unpack_timestamp_span(*self.timestamp_spans.get(real)?)?;
+        Some((*self.ts_ff.get(real)?, span))
     }
 
     /// Original-file bounds of the timestamp-delimited record containing
@@ -603,7 +639,7 @@ impl LogDocument {
                 }
             }
 
-            let (line_len, ts, template_id) = {
+            let (line_len, ts, timestamp_span, template_id) = {
                 let line = self.line_untrimmed(i);
                 let line_len = line.len();
                 let ts_hint = time_format.as_ref().and_then(|e| e.extract(&line));
@@ -617,8 +653,11 @@ impl LogDocument {
                 };
                 let normalized = log_format.normalize(&line, ts_hint, &mut ctx);
                 let template_id = drain.add_line(&normalized.content, i);
-                let ts = normalized.ts.map(|(timestamp, _)| timestamp);
-                (line_len, ts, template_id)
+                let (ts, timestamp_span) =
+                    normalized.ts.map_or((None, None), |(timestamp, span)| {
+                        (Some(timestamp), Some(span))
+                    });
+                (line_len, ts, timestamp_span, template_id)
             };
 
             self.max_line_width = self.max_line_width.max(line_len);
@@ -634,6 +673,8 @@ impl LogDocument {
             } else {
                 self.record_starts[record_word] &= !record_mask;
             }
+            self.timestamp_spans
+                .push(timestamp_span.map_or(0, pack_timestamp_span));
             self.ts_ff.push(last_ts);
             self.template_ids.push(template_id);
         }
@@ -768,6 +809,7 @@ impl LogDocument {
             line_offsets: offsets,
             ts_ff: Vec::with_capacity(n_lines),
             record_starts: Vec::with_capacity(n_lines.div_ceil(64)),
+            timestamp_spans: Vec::with_capacity(n_lines),
             template_ids: Vec::with_capacity(n_lines),
             drain: Arc::new(Mutex::new(Drain::new(
                 config.drain_depth,
@@ -897,6 +939,23 @@ mod tests {
         assert_eq!(doc.ts_at(1), doc.ts_at(0));
         assert_eq!(doc.ts_ff[1], doc.ts_ff[0]); // inherits previous
         assert!(doc.ts_ff[2] > doc.ts_ff[1]);
+        let (_, first_span) = doc.explicit_timestamp_at(0).unwrap();
+        assert_eq!(&doc.line(0)[first_span], "2026-07-19T10:00:00.000Z");
+        assert!(doc.explicit_timestamp_at(1).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn retains_exact_json_timestamp_field_span() {
+        let path =
+            write_temp("{\"msg\":\"2026-08-15T19:40:01Z\",\"time\":\"2026-08-15T19:40:01Z\"}\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let (_, span) = doc.explicit_timestamp_at(0).unwrap();
+        assert_eq!(&doc.line(0)[span.clone()], "2026-08-15T19:40:01Z");
+        assert_eq!(
+            span.start,
+            doc.line(0).rfind("2026-08-15T19:40:01Z").unwrap()
+        );
         std::fs::remove_file(path).ok();
     }
 

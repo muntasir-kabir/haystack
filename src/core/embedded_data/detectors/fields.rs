@@ -1,4 +1,5 @@
-use super::{detection, line_ranges};
+use super::kv::{groups, Separator};
+use super::{detection, detection_with_ranges, line_ranges};
 use crate::core::embedded_data::parse::{nested, scalar, split_top_level};
 use crate::core::embedded_data::{AnalysisLimits, DataDetector, DataNode, Detection, ScanWindow};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +18,25 @@ impl DataDetector for FieldsDetector {
         cancel: &AtomicBool,
     ) -> Vec<Detection> {
         let ranges = line_ranges(&window.bytes).collect::<Vec<_>>();
-        let mut out = Vec::new();
+        let mut out = groups(
+            &window.bytes,
+            Separator::Colon,
+            limits.max_depth,
+            limits.max_results,
+            cancel,
+        )
+        .into_iter()
+        .filter_map(|group| {
+            detection_with_ranges(
+                window,
+                self.id(),
+                group.start,
+                group.end,
+                group.source_ranges,
+                DataNode::Object(group.fields),
+            )
+        })
+        .collect::<Vec<_>>();
         let mut i = 0;
         while i < ranges.len() && out.len() < limits.max_results {
             if cancel.load(Ordering::Relaxed) {

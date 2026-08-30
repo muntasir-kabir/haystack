@@ -57,7 +57,7 @@ Rust, eframe/egui (GUI), memmap2 (mmap I/O), memchr (SIMD line indexing), aho-co
 | AI assistant integration popup | `src/ui/settings/`, `src/ui/app/` |
 
 ## Tests
-357 tests across `src/core/` (including embedded-data detection), `src/mcp.rs`, UI models/views, and integration fixture contracts. Run with `cargo test`.
+402 tests across `src/core/` (including embedded-data and timestamp-source detection), `src/mcp.rs`, UI models/views, and integration fixture contracts. Run with `cargo test`.
 
 ## Benchmark
 `cargo run --release --example bench -- [logfile] [filters...]` — with no args, generates a 64MB/787k-line synthetic log (load ~3.3s, 3-filter scan ~0.7s, timeline build ~13ms). Pass a path to bench a real file, e.g. `cargo run --release --example bench -- examples/iOS-100K.log ERROR user_id`.

@@ -19,7 +19,7 @@ pub(crate) fn balanced_end(bytes: &[u8], start: usize, max_depth: usize) -> Opti
             continue;
         }
         match byte {
-            b'\'' | b'\"' => quote = Some(byte),
+            b'\'' | b'\"' | b'`' => quote = Some(byte),
             b'{' => stack.push(b'}'),
             b'[' => stack.push(b']'),
             b'(' => stack.push(b')'),
@@ -59,7 +59,7 @@ pub(crate) fn split_top_level<'a>(input: &'a str, delimiters: &[char]) -> Vec<&'
             continue;
         }
         match ch {
-            '\'' | '\"' => quote = Some(ch),
+            '\'' | '\"' | '`' => quote = Some(ch),
             '{' => stack.push('}'),
             '[' => stack.push(']'),
             '(' => stack.push(')'),
@@ -96,7 +96,7 @@ pub(crate) fn find_top_level(input: &str, separators: &[char]) -> Option<(usize,
             continue;
         }
         match ch {
-            '\'' | '\"' => quote = Some(ch),
+            '\'' | '\"' | '`' => quote = Some(ch),
             '{' => stack.push('}'),
             '[' => stack.push(']'),
             '(' => stack.push(')'),
@@ -202,7 +202,7 @@ pub(crate) fn nested(
 pub(crate) fn unquote(value: &str) -> Option<String> {
     let value = value.trim();
     let quote = value.chars().next()?;
-    if !matches!(quote, '\'' | '\"') || !value.ends_with(quote) || value.len() < 2 {
+    if !matches!(quote, '\'' | '\"' | '`') || !value.ends_with(quote) || value.len() < 2 {
         return None;
     }
     let body = &value[1..value.len() - 1];

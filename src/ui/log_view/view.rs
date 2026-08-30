@@ -13,11 +13,14 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, RichText, Stroke, StrokeKind};
 
 use logotomy::core::document::LogDocument;
-use logotomy::core::embedded_data::{DataNode, Detection};
+use logotomy::core::embedded_data::{DataNode, Detection, SourcePos, SourceSpan};
 use logotomy::core::time::format_ms;
 
 use super::embedded::presentation;
-use crate::ui::app::model::{EmbeddedInspectorMode, LogTab, PinEntry, TrimAction, MAX_FILTERS};
+use crate::ui::app::model::{
+    AnnotationHoverKey, AnnotationHoverState, EmbeddedInspectorMode, LogTab, PinEntry, TrimAction,
+    MAX_FILTERS,
+};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::Theme;
 
@@ -33,6 +36,11 @@ const GUTTER_PADDING: f32 = 12.0;
 const GUTTER_VERTICAL_OFFSET: f32 = 1.0;
 /// Minimum pointer displacement (px) to distinguish a drag from a click.
 const DRAG_THRESHOLD: f32 = 3.0;
+/// Pointer dwell before source actions appear.
+const ANNOTATION_HOVER_DELAY: Duration = Duration::from_millis(800);
+/// Keeps the callout alive while the pointer crosses the source-to-bubble gap.
+const ANNOTATION_HOVER_GRACE: Duration = Duration::from_millis(220);
+const ANNOTATION_HOVER_MOVE_RESET: f32 = 3.0;
 
 /// Action returned from a single row render, to be applied after the
 /// scroll-area closure so we avoid borrow conflicts with `tab`.
@@ -43,6 +51,18 @@ enum RowAction {
     TrimLeft,
     Keyword(String),
     OpenData(Detection, Pos2),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AnnotationHoverCandidate {
+    key: AnnotationHoverKey,
+    source_rect: Rect,
+}
+
+#[derive(Default)]
+struct RowRenderResult {
+    action: Option<RowAction>,
+    hovered: Option<AnnotationHoverCandidate>,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +96,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let mut context_pin: Option<usize> = None;
     let mut context_trim: Option<TrimAction> = None;
     let mut open_data: Option<Detection> = None;
+    let mut hovered_annotation: Option<AnnotationHoverCandidate> = None;
     let mut suppress_select: bool = false;
 
     let total_visible = match &tab.visible_lines {
@@ -135,7 +156,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     };
                     let selected = tab.context_line == Some(i);
 
-                    let action = render_row(
+                    let rendered = render_row(
                         ui,
                         &tab.doc,
                         &Highlights::from_tab(tab),
@@ -149,8 +170,11 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                         gutter_width,
                     );
 
-                    let is_select = matches!(action, Some(RowAction::Select));
-                    match action {
+                    if hovered_annotation.is_none() {
+                        hovered_annotation = rendered.hovered;
+                    }
+                    let is_select = matches!(rendered.action, Some(RowAction::Select));
+                    match rendered.action {
                         Some(RowAction::Select) if !suppress_select => {
                             tab.set_keyword_highlight(None);
                             tab.context_line = Some(i);
@@ -202,6 +226,19 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         );
         tab.embedded_inspector = Some(detection);
     }
+
+    let suppress_annotation_hover = tab.drag_selecting
+        || tab.pending_selection.is_some()
+        || ui
+            .input(|input| input.pointer.any_down() || input.smooth_scroll_delta.length_sq() > 0.0);
+    update_annotation_hover(
+        tab,
+        hovered_annotation,
+        suppress_annotation_hover,
+        ui.ctx(),
+        Instant::now(),
+    );
+    show_annotation_hover_bubble(ui, tab, theme);
 
     // ---- compute viewport_range for timeline shadow ----
     update_viewport_range(tab, &rendered_range, pending);
@@ -427,6 +464,266 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
     // (The pin modal moved to `pin_modal_ui`, drawn at the app level so it
     // works even when the Log view isn't the focused dock tab.)
+}
+
+fn update_annotation_hover(
+    tab: &mut LogTab,
+    candidate: Option<AnnotationHoverCandidate>,
+    suppress: bool,
+    ctx: &egui::Context,
+    now: Instant,
+) {
+    let (pointer_pos, pointer_delta) = ctx.input(|input| {
+        (
+            input.pointer.latest_pos(),
+            input
+                .pointer
+                .motion()
+                .unwrap_or_else(|| input.pointer.delta()),
+        )
+    });
+    let pointer_over_bubble = tab.annotation_hover.as_ref().is_some_and(|state| {
+        pointer_pos.is_some_and(|pointer| {
+            state
+                .bubble_rect
+                .is_some_and(|bubble| bubble.expand(3.0).contains(pointer))
+        })
+    });
+    if suppress && !pointer_over_bubble {
+        tab.annotation_hover = None;
+        return;
+    }
+
+    match candidate {
+        Some(candidate) => match tab.annotation_hover.as_mut() {
+            Some(state) if state.key == candidate.key => {
+                if state.bubble_rect.is_none()
+                    && pointer_delta.length() > ANNOTATION_HOVER_MOVE_RESET
+                {
+                    state.started_at = now;
+                }
+                state.source_rect = candidate.source_rect;
+                state.last_seen_at = now;
+            }
+            _ => {
+                tab.annotation_hover = Some(AnnotationHoverState {
+                    key: candidate.key,
+                    source_rect: candidate.source_rect,
+                    started_at: now,
+                    last_seen_at: now,
+                    bubble_rect: None,
+                });
+            }
+        },
+        None => {
+            if pointer_over_bubble {
+                if let Some(state) = tab.annotation_hover.as_mut() {
+                    state.last_seen_at = now;
+                }
+            } else if tab.annotation_hover.as_ref().is_some_and(|state| {
+                now.duration_since(state.last_seen_at) > ANNOTATION_HOVER_GRACE
+            }) {
+                tab.annotation_hover = None;
+            }
+        }
+    }
+
+    if let Some(state) = &tab.annotation_hover {
+        if now.duration_since(state.started_at) < ANNOTATION_HOVER_DELAY {
+            ctx.request_repaint_after(
+                ANNOTATION_HOVER_DELAY.saturating_sub(now.duration_since(state.started_at)),
+            );
+        } else {
+            ctx.request_repaint_after(ANNOTATION_HOVER_GRACE);
+        }
+    }
+}
+
+fn show_annotation_hover_bubble(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
+    let Some(state) = tab.annotation_hover.as_ref() else {
+        return;
+    };
+    if state.started_at.elapsed() < ANNOTATION_HOVER_DELAY {
+        return;
+    }
+    let key = state.key;
+    let source_rect = state.source_rect;
+    let (badge, title, summary, preview, source, accent, detection, secondary_label, normalized) =
+        match key {
+            AnnotationHoverKey::Embedded { .. } => {
+                let Some(detection) = tab
+                    .embedded_detections
+                    .iter()
+                    .find(|detection| AnnotationHoverKey::for_detection(detection) == key)
+                    .cloned()
+                else {
+                    tab.annotation_hover = None;
+                    return;
+                };
+                let presentation = presentation(detection.detector_id);
+                (
+                    presentation.badge,
+                    presentation.title,
+                    detection.summary(),
+                    compact_source_preview(&detection.raw, 180),
+                    detection.raw.clone(),
+                    theme.embedded_data,
+                    Some(detection),
+                    "Open inspector",
+                    None,
+                )
+            }
+            AnnotationHoverKey::Timestamp { span } => {
+                let Some(relative_line) = span.start.line.checked_sub(tab.doc.trim_start) else {
+                    tab.annotation_hover = None;
+                    return;
+                };
+                let Some((epoch_ms, range)) = tab.doc.explicit_timestamp_at(relative_line) else {
+                    tab.annotation_hover = None;
+                    return;
+                };
+                if range.start != span.start.byte || range.end != span.end.byte {
+                    tab.annotation_hover = None;
+                    return;
+                }
+                let line = tab.doc.line(relative_line);
+                let Some(raw) = line.get(range) else {
+                    tab.annotation_hover = None;
+                    return;
+                };
+                let family = tab.doc.time_format_name().unwrap_or_else(|| {
+                    if tab.doc.format_name() == "json" {
+                        "JSON field".to_owned()
+                    } else {
+                        "field-based".to_owned()
+                    }
+                });
+                let normalized = format!("{} UTC", format_ms(epoch_ms));
+                (
+                    "TIME",
+                    "Timestamp",
+                    format!("{family} · normalized to UTC"),
+                    raw.to_owned(),
+                    raw.to_owned(),
+                    theme.timestamp,
+                    None,
+                    "Copy UTC",
+                    Some(normalized),
+                )
+            }
+        };
+
+    let screen = ui.ctx().content_rect();
+    let bubble_width = 340.0_f32.min((screen.width() - 16.0).max(180.0));
+    let estimated_height = 112.0;
+    let above = source_rect.top() - screen.top() > estimated_height + 12.0;
+    let inset = 8.0;
+    let min_x = screen.left() + inset;
+    let max_x = (screen.right() - bubble_width - inset).max(min_x);
+    let x = (source_rect.center().x - bubble_width * 0.5).clamp(min_x, max_x);
+    let preferred_y = if above {
+        source_rect.top() - estimated_height - 7.0
+    } else {
+        source_rect.bottom() + 7.0
+    };
+    let min_y = screen.top() + inset;
+    let max_y = (screen.bottom() - estimated_height - inset).max(min_y);
+    let y = preferred_y.clamp(min_y, max_y);
+
+    let mut copy_source = false;
+    let mut secondary_action = false;
+    let area = egui::Area::new(egui::Id::new(("annotation_hover_bubble", key)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::new(x, y))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::NONE
+                .fill(scaled_alpha(theme.surface, 0.94))
+                .stroke(Stroke::new(1.0, scaled_alpha(accent, 0.72)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(bubble_width - 20.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(badge).strong().color(accent));
+                        ui.label(RichText::new(title).strong().color(theme.text));
+                    });
+                    ui.label(RichText::new(summary).small().color(theme.text_muted));
+                    ui.label(RichText::new(preview).monospace().color(theme.text));
+                    ui.horizontal(|ui| {
+                        copy_source = ui.button("Copy source").clicked();
+                        secondary_action = ui.button(secondary_label).clicked();
+                    });
+                });
+        });
+
+    let bubble_rect = area.response.rect;
+    if let Some(state) = tab.annotation_hover.as_mut() {
+        state.bubble_rect = Some(bubble_rect);
+        if area.response.hovered() {
+            state.last_seen_at = Instant::now();
+        }
+    }
+
+    let arrow_x = source_rect
+        .center()
+        .x
+        .clamp(bubble_rect.left() + 10.0, bubble_rect.right() - 10.0);
+    let arrow = if above {
+        vec![
+            Pos2::new(arrow_x - 5.0, bubble_rect.bottom() - 1.0),
+            Pos2::new(arrow_x + 5.0, bubble_rect.bottom() - 1.0),
+            Pos2::new(source_rect.center().x, source_rect.top()),
+        ]
+    } else {
+        vec![
+            Pos2::new(arrow_x - 5.0, bubble_rect.top() + 1.0),
+            Pos2::new(arrow_x + 5.0, bubble_rect.top() + 1.0),
+            Pos2::new(source_rect.center().x, source_rect.bottom()),
+        ]
+    };
+    ui.ctx()
+        .layer_painter(area.response.layer_id)
+        .add(egui::Shape::convex_polygon(
+            arrow,
+            scaled_alpha(theme.surface, 0.94),
+            Stroke::new(1.0, scaled_alpha(accent, 0.72)),
+        ));
+
+    if copy_source {
+        ui.ctx().copy_text(source);
+        tab.pending_toast = Some("Copied source annotation".to_owned());
+        if let Some(state) = tab.annotation_hover.as_mut() {
+            state.last_seen_at = Instant::now();
+        }
+    }
+    if secondary_action {
+        if let Some(detection) = detection {
+            tab.embedded_inspector_mode = inspector_mode_for_open(
+                tab.embedded_inspector_mode,
+                inspector_mode_for(detection.detector_id),
+            );
+            tab.embedded_inspector_anchor = Some(source_rect.left_center());
+            tab.embedded_inspector = Some(detection);
+            tab.annotation_hover = None;
+        } else if let Some(normalized) = normalized {
+            ui.ctx().copy_text(normalized);
+            tab.pending_toast = Some("Copied normalized timestamp".to_owned());
+            if let Some(state) = tab.annotation_hover.as_mut() {
+                state.last_seen_at = Instant::now();
+            }
+        }
+    }
+}
+
+fn compact_source_preview(raw: &str, max_chars: usize) -> String {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 /// Render the pin creation/editing modal (comment + log preview). Called from
@@ -702,7 +999,7 @@ pub fn embedded_data_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &T
                         );
                     }
                     EmbeddedInspectorMode::Decoded => {
-                        render_decoded_preview(ui, &detection.raw, theme);
+                        render_decoded_preview(ui, detection.detector_id, &detection.raw, theme);
                     }
                 });
         });
@@ -755,16 +1052,19 @@ fn inspector_mode_for_open(
 /// Decoding is deliberately only reachable from an explicit inspector action.
 /// It is byte-bounded by the detector's own candidate limit and never verifies
 /// JWT signatures or interprets binary code.
-fn render_decoded_preview(ui: &mut egui::Ui, raw: &str, theme: &Theme) {
-    let decoded = decode_embedded_preview(raw)
+fn render_decoded_preview(ui: &mut egui::Ui, detector_id: &str, raw: &str, theme: &Theme) {
+    let decoded = decode_embedded_preview(detector_id, raw)
         .unwrap_or_else(|message| format!("Unable to decode preview: {message}"));
     ui.add(
         egui::Label::new(RichText::new(decoded).monospace().color(theme.log_text)).selectable(true),
     );
 }
 
-fn decode_embedded_preview(raw: &str) -> Result<String, &'static str> {
+fn decode_embedded_preview(detector_id: &str, raw: &str) -> Result<String, &'static str> {
     let token = raw.trim();
+    if detector_id == "binary-plist" {
+        return decode_binary_plist_preview(token);
+    }
     if token.starts_with("-----BEGIN ") {
         return Ok("PEM envelope detected. Certificate decoding is intentionally metadata-only in this build.".to_owned());
     }
@@ -777,16 +1077,45 @@ fn decode_embedded_preview(raw: &str) -> Result<String, &'static str> {
             && value.len() % 2 == 0
             && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     }) {
-        let bytes = (0..hex.len())
-            .step_by(2)
-            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).map_err(|_| "invalid hex"))
-            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = decode_hex(hex)?;
         return Ok(String::from_utf8_lossy(&bytes).into_owned());
     }
     decode_base64(token, false)
 }
 
+fn decode_binary_plist_preview(token: &str) -> Result<String, &'static str> {
+    let (transport, bytes) = if token.starts_with("bplist00") {
+        ("literal", token.as_bytes().to_vec())
+    } else if let Some(hex) = token.strip_prefix("0x").or(Some(token)).filter(|value| {
+        value.len() >= 16
+            && value.len() % 2 == 0
+            && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        ("hex", decode_hex(hex)?)
+    } else {
+        ("base64", decode_base64_bytes(token, false)?)
+    };
+    if !bytes.starts_with(b"bplist00") {
+        return Err("binary plist magic is missing");
+    }
+    Ok(format!(
+        "Binary property list\nMagic: bplist00\nVersion: 00\nTransport: {transport}\nDecoded bytes: {}\n\nTransport decoded safely. Binary object-table parsing is intentionally not automatic.",
+        bytes.len()
+    ))
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, &'static str> {
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| "invalid hex"))
+        .collect()
+}
+
 fn decode_base64(value: &str, url: bool) -> Result<String, &'static str> {
+    String::from_utf8(decode_base64_bytes(value, url)?).map_err(|_| "decoded data is binary")
+}
+
+fn decode_base64_bytes(value: &str, url: bool) -> Result<Vec<u8>, &'static str> {
     let mut out = Vec::new();
     let mut buffer = 0u32;
     let mut bits = 0u8;
@@ -808,7 +1137,7 @@ fn decode_base64(value: &str, url: bool) -> Result<String, &'static str> {
             out.push((buffer >> bits) as u8);
         }
     }
-    String::from_utf8(out).map_err(|_| "decoded data is binary")
+    Ok(out)
 }
 
 /// Keep the first presentation useful without forcing every payload into the
@@ -1359,8 +1688,9 @@ fn render_row(
     selection_range: Option<(usize, usize)>,
     char_width: f32,
     gutter_width: f32,
-) -> Option<RowAction> {
+) -> RowRenderResult {
     let mut action: Option<RowAction> = None;
+    let mut hovered: Option<AnnotationHoverCandidate> = None;
 
     let in_selection = selection_range.is_some_and(|(lo, hi)| idx >= lo && idx <= hi);
     let bg = if selected {
@@ -1420,11 +1750,7 @@ fn render_row(
             );
 
             let original_line = doc.trim_start + idx;
-            let row_detection = highlights.embedded.and_then(|detections| {
-                detections
-                    .iter()
-                    .find(|detection| detection.span.start.line == original_line)
-            });
+            let detections = highlights.embedded.unwrap_or_default();
 
             // Log content label — selectable and clickable for row actions. `line_job` already
             // bakes the correct per-section background (selection tint on
@@ -1433,9 +1759,89 @@ fn render_row(
             let content_job = job;
             let content_resp = ui.add(log_content_label(content_job));
 
-            // Paint a tiny overlay at the exact opening token. It consumes no
-            // layout width, so embedded-data results never move log text.
-            if let Some(detection) = row_detection {
+            let visible_source_len = highlight::display_source_len(&doc.line(idx));
+            if let Some((_, range)) = doc.explicit_timestamp_at(idx) {
+                let displayed_range =
+                    range.start.min(visible_source_len)..range.end.min(visible_source_len);
+                if displayed_range.start < displayed_range.end {
+                    if let Some(source_rect) = source_range_rect(
+                        ui,
+                        doc.line_bytes(idx),
+                        displayed_range,
+                        content_resp.rect,
+                        &font_id,
+                        theme.log_text,
+                    ) {
+                        let span = SourceSpan {
+                            start: SourcePos {
+                                line: original_line,
+                                byte: range.start,
+                            },
+                            end: SourcePos {
+                                line: original_line,
+                                byte: range.end,
+                            },
+                        };
+                        let response = ui.interact(
+                            source_rect.expand2(egui::vec2(1.0, 2.0)),
+                            ui.make_persistent_id((
+                                "timestamp_source_hover",
+                                original_line,
+                                range.start,
+                            )),
+                            egui::Sense::hover(),
+                        );
+                        if response.hovered() {
+                            hovered = Some(AnnotationHoverCandidate {
+                                key: AnnotationHoverKey::Timestamp { span },
+                                source_rect,
+                            });
+                        }
+                    }
+                }
+            }
+
+            let mut source_rects = Vec::<(AnnotationHoverKey, Rect)>::new();
+            for detection in detections {
+                let key = AnnotationHoverKey::for_detection(detection);
+                for (range_index, range) in
+                    highlight::source_ranges_for_line(detection, original_line, visible_source_len)
+                        .into_iter()
+                        .enumerate()
+                {
+                    let Some(source_rect) = source_range_rect(
+                        ui,
+                        doc.line_bytes(idx),
+                        range,
+                        content_resp.rect,
+                        &font_id,
+                        theme.log_text,
+                    ) else {
+                        continue;
+                    };
+                    let hover_id = ui.make_persistent_id((
+                        "embedded_source_hover",
+                        detection.detector_id,
+                        detection.span.start.line,
+                        detection.span.start.byte,
+                        range_index,
+                    ));
+                    let response = ui.interact(
+                        source_rect.expand2(egui::vec2(1.0, 2.0)),
+                        hover_id,
+                        egui::Sense::hover(),
+                    );
+                    if response.hovered() && hovered.is_none() {
+                        hovered = Some(AnnotationHoverCandidate { key, source_rect });
+                    }
+                    source_rects.push((key, source_rect));
+                }
+            }
+
+            // Paint every opening cue on this row. Cues consume no layout
+            // width, so multiple results never move or reflow log text.
+            let mut painted_badges = Vec::<Rect>::new();
+            for detection in detections_starting_on_line(detections, original_line) {
                 let presentation = presentation(detection.detector_id);
                 if let Some(prefix) =
                     source_prefix_at(doc.line_bytes(idx), detection.span.start.byte)
@@ -1461,35 +1867,31 @@ fn render_row(
                     let (badge_size, vertical_lift) =
                         embedded_badge_geometry(font_id.size, label_width);
                     let anchor_x = content_resp.rect.left() + prefix_width;
-                    let badge_y =
-                        (content_resp.rect.top() - vertical_lift).max(ui.clip_rect().top());
-                    let badge_rect = Rect::from_min_size(Pos2::new(anchor_x, badge_y), badge_size);
+                    let mut badge_y = content_resp.rect.top() - vertical_lift;
+                    let mut badge_rect =
+                        Rect::from_min_size(Pos2::new(anchor_x, badge_y), badge_size);
+                    while painted_badges
+                        .iter()
+                        .any(|painted| painted.intersects(badge_rect.expand(1.0)))
+                    {
+                        badge_y -= badge_size.y + 1.0;
+                        badge_rect = Rect::from_min_size(Pos2::new(anchor_x, badge_y), badge_size);
+                    }
+                    if badge_rect.top() < ui.clip_rect().top() {
+                        badge_rect = badge_rect.translate(egui::vec2(
+                            painted_badges.len() as f32 * (badge_size.x + 2.0),
+                            ui.clip_rect().top() - badge_rect.top(),
+                        ));
+                    }
+                    painted_badges.push(badge_rect);
                     let badge_id = ui.make_persistent_id((
                         "embedded_data_overlay",
                         detection.detector_id,
                         detection.span.start.line,
                         detection.span.start.byte,
                     ));
-                    let response = ui
-                        .interact(badge_rect.expand(2.0), badge_id, egui::Sense::click())
-                        .on_hover_ui(|ui| {
-                            ui.label(
-                                RichText::new(presentation.title)
-                                    .strong()
-                                    .color(theme.embedded_data),
-                            );
-                            ui.label(detection.summary());
-                            ui.label(format!(
-                                "Lines {}–{}",
-                                detection.span.start.line + 1,
-                                detection.span.end.line + 1
-                            ));
-                            ui.label(
-                                RichText::new("Click to inspect and copy")
-                                    .small()
-                                    .color(theme.text_muted),
-                            );
-                        });
+                    let response =
+                        ui.interact(badge_rect.expand(2.0), badge_id, egui::Sense::click());
                     let painter = ui.painter();
                     let fill = scaled_alpha(theme.embedded_data_bg, 0.62);
                     let stroke_color = scaled_alpha(theme.embedded_data, 0.52);
@@ -1509,6 +1911,15 @@ fn render_row(
                         badge_font,
                         text_color,
                     );
+                    if response.hovered() && hovered.is_none() {
+                        let key = AnnotationHoverKey::for_detection(detection);
+                        let source_rect = source_rects
+                            .iter()
+                            .find(|(candidate, _)| *candidate == key)
+                            .map(|(_, rect)| *rect)
+                            .unwrap_or(content_resp.rect);
+                        hovered = Some(AnnotationHoverCandidate { key, source_rect });
+                    }
                     if response.clicked() {
                         // Keep the inspector tied to the line-number gutter,
                         // so it opens beside it or flips above/below it when
@@ -1568,7 +1979,7 @@ fn render_row(
     )
     .inner;
 
-    action
+    RowRenderResult { action, hovered }
 }
 
 /// Keep native egui text selection enabled for log content. Whole-line drag
@@ -1581,6 +1992,48 @@ fn log_content_label(job: egui::text::LayoutJob) -> egui::Label {
 
 fn source_prefix_at(bytes: &[u8], byte_offset: usize) -> Option<&str> {
     std::str::from_utf8(bytes.get(..byte_offset)?).ok()
+}
+
+fn detections_starting_on_line<'a>(
+    detections: &'a [Detection],
+    original_line: usize,
+) -> impl Iterator<Item = &'a Detection> {
+    detections
+        .iter()
+        .filter(move |detection| detection.span.start.line == original_line)
+}
+
+fn source_range_rect(
+    ui: &egui::Ui,
+    bytes: &[u8],
+    range: std::ops::Range<usize>,
+    content_rect: Rect,
+    font_id: &FontId,
+    color: Color32,
+) -> Option<Rect> {
+    let start = source_prefix_at(bytes, range.start)?;
+    let end = source_prefix_at(bytes, range.end)?;
+    let (start_width, end_width) = ui.ctx().fonts_mut(|fonts| {
+        (
+            fonts
+                .layout_no_wrap(start.to_owned(), font_id.clone(), color)
+                .size()
+                .x,
+            fonts
+                .layout_no_wrap(end.to_owned(), font_id.clone(), color)
+                .size()
+                .x,
+        )
+    });
+    if end_width <= start_width {
+        return None;
+    }
+    let rect = Rect::from_min_max(
+        Pos2::new(content_rect.left() + start_width, content_rect.top()),
+        Pos2::new(content_rect.left() + end_width, content_rect.bottom()),
+    )
+    .intersect(ui.clip_rect());
+    (rect.width() > 0.0 && rect.height() > 0.0).then_some(rect)
 }
 
 fn line_gutter_width(char_width: f32) -> f32 {
@@ -1876,6 +2329,14 @@ mod tests {
     }
 
     #[test]
+    fn binary_plist_preview_decodes_transport_only_after_explicit_action() {
+        let preview = decode_embedded_preview("binary-plist", "62706c6973743030deadbeef").unwrap();
+        assert!(preview.contains("Magic: bplist00"));
+        assert!(preview.contains("Transport: hex"));
+        assert!(preview.contains("Decoded bytes: 12"));
+    }
+
+    #[test]
     fn inspector_dismisses_on_escape_or_outside_click() {
         let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), egui::vec2(100.0, 80.0));
         assert!(should_dismiss_inspector(true, None, Some(rect)));
@@ -2027,5 +2488,142 @@ mod tests {
         }));
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn explicit_timestamp_has_its_own_quiet_underline() {
+        let path = write_temp("2026-08-15T19:40:01.123Z INFO ready\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let theme = Theme::dark();
+        let job = line_job(
+            &doc,
+            &Highlights {
+                filters: &[],
+                filter_ac: None,
+                search_ac: None,
+                keyword_ac: None,
+                embedded: None,
+            },
+            0,
+            false,
+            crate::ui::fonts::log_font(12.0),
+            &theme,
+        );
+        let timestamp = job
+            .sections
+            .iter()
+            .find(|section| section.byte_range.start.0 == 0)
+            .expect("timestamp section");
+        assert_eq!(timestamp.format.underline.color, theme.timestamp);
+        assert!(timestamp.format.underline.width > 0.0);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn exact_kv_source_spans_leave_field_gaps_unstyled() {
+        use logotomy::core::embedded_data::{AnalysisLimits, EmbeddedDataEngine};
+        use std::sync::atomic::AtomicBool;
+
+        let path = write_temp("INFO first=1 second=2\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let detections = EmbeddedDataEngine::default().analyze_original_lines(
+            &doc,
+            0..1,
+            AnalysisLimits::default(),
+            &AtomicBool::new(false),
+        );
+        let highlights = Highlights {
+            filters: &[],
+            filter_ac: None,
+            search_ac: None,
+            keyword_ac: None,
+            embedded: Some(&detections),
+        };
+        let theme = Theme::dark();
+        let job = line_job(
+            &doc,
+            &highlights,
+            0,
+            false,
+            crate::ui::fonts::log_font(12.0),
+            &theme,
+        );
+        let gap = job.text.find("1 second").unwrap() + 1;
+        let gap_section = job
+            .sections
+            .iter()
+            .find(|section| section.byte_range.start.0 <= gap && section.byte_range.end.0 > gap)
+            .expect("section containing the gap between fields");
+        assert_eq!(gap_section.format.underline.width, 0.0);
+        assert_eq!(detections[0].source_spans.len(), 2);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn every_detection_starting_on_a_row_gets_a_cue_candidate() {
+        use logotomy::core::embedded_data::{DataNode, SourcePos, SourceSpan};
+
+        let make = |byte| {
+            let span = SourceSpan {
+                start: SourcePos { line: 4, byte },
+                end: SourcePos {
+                    line: 4,
+                    byte: byte + 3,
+                },
+            };
+            Detection::structured("test", span, "a=1", DataNode::Object(vec![]))
+        };
+        let detections = vec![make(2), make(20), {
+            let span = SourceSpan {
+                start: SourcePos { line: 5, byte: 0 },
+                end: SourcePos { line: 5, byte: 3 },
+            };
+            Detection::structured("test", span, "b=2", DataNode::Object(vec![]))
+        }];
+        assert_eq!(detections_starting_on_line(&detections, 4).count(), 2);
+    }
+
+    #[test]
+    fn annotation_hover_waits_and_then_expires_after_grace() {
+        let path = write_temp("INFO value=one\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let span = logotomy::core::embedded_data::SourceSpan {
+            start: logotomy::core::embedded_data::SourcePos { line: 0, byte: 5 },
+            end: logotomy::core::embedded_data::SourcePos { line: 0, byte: 14 },
+        };
+        let candidate = AnnotationHoverCandidate {
+            key: AnnotationHoverKey::Embedded {
+                detector_id: "logfmt",
+                span,
+            },
+            source_rect: Rect::from_min_max(Pos2::ZERO, Pos2::new(80.0, 16.0)),
+        };
+        egui::__run_test_ui(|ui| {
+            let now = Instant::now();
+            update_annotation_hover(&mut tab, Some(candidate), false, ui.ctx(), now);
+            let state = tab.annotation_hover.as_ref().expect("hover state");
+            assert_eq!(state.key, candidate.key);
+            assert_eq!(state.started_at, now);
+
+            update_annotation_hover(
+                &mut tab,
+                None,
+                false,
+                ui.ctx(),
+                now + ANNOTATION_HOVER_GRACE + Duration::from_millis(1),
+            );
+            assert!(tab.annotation_hover.is_none());
+        });
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn compact_hover_preview_is_single_line_and_bounded() {
+        assert_eq!(
+            compact_source_preview("first\n  second", 20),
+            "first second"
+        );
+        assert_eq!(compact_source_preview("abcdefgh", 4), "abcd…");
     }
 }

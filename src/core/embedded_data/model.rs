@@ -60,6 +60,10 @@ impl DataNode {
 pub struct Detection {
     pub detector_id: &'static str,
     pub span: SourceSpan,
+    /// Exact source fragments that belong to this detection. Most formats use
+    /// one containing span; loose field groups keep one span per field so UI
+    /// decoration never underlines intervening prose or separators.
+    pub source_spans: Vec<SourceSpan>,
     pub root_kind: RootKind,
     pub raw: String,
     pub pretty: String,
@@ -80,12 +84,20 @@ impl Detection {
         Self {
             detector_id,
             span,
+            source_spans: vec![span],
             root_kind,
             raw,
             pretty,
             data,
             source_lines: span.end.line.saturating_sub(span.start.line) + 1,
         }
+    }
+
+    pub(crate) fn with_source_spans(mut self, source_spans: Vec<SourceSpan>) -> Self {
+        if !source_spans.is_empty() {
+            self.source_spans = source_spans;
+        }
+        self
     }
     pub fn summary(&self) -> String {
         format!(

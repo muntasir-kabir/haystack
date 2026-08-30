@@ -76,6 +76,14 @@ pub fn line_job(
     } else {
         Vec::new()
     };
+    let timestamp_range = source_is_valid_utf8
+        .then(|| doc.explicit_timestamp_at(idx).map(|(_, range)| range))
+        .flatten()
+        .and_then(|range| {
+            let start = range.start.min(visible_source_len);
+            let end = range.end.min(visible_source_len);
+            (start < end).then_some(start..end)
+        });
 
     let base = theme.log_text;
     match (
@@ -83,13 +91,15 @@ pub fn line_job(
         highlights.search_ac,
         highlights.keyword_ac,
     ) {
-        (None, None, None) => append_segment_with_embedded(
+        (None, None, None) => append_segment_with_annotations(
             &mut job,
             &text,
             0..text.len(),
             fmt(base),
             &embedded_ranges,
+            timestamp_range.as_ref(),
             theme.embedded_data,
+            theme.timestamp,
         ),
         (filter_ac, search_ac, keyword_ac) => append_highlighted(
             &mut job,
@@ -102,6 +112,7 @@ pub fn line_job(
             font_id,
             theme,
             &embedded_ranges,
+            timestamp_range.as_ref(),
         ),
     }
     job
@@ -124,7 +135,7 @@ pub fn display_text(line: &str) -> Cow<'_, str> {
     ))
 }
 
-fn display_source_len(line: &str) -> usize {
+pub(super) fn display_source_len(line: &str) -> usize {
     if line.len() <= MAX_DISPLAY_BYTES {
         return line.len();
     }
@@ -144,16 +155,32 @@ fn embedded_ranges_for_line(
     let original_line = doc.trim_start + idx;
     let mut ranges = Vec::new();
     for detection in highlights.embedded.into_iter().flatten() {
-        if !detection.span.includes_line(original_line) {
+        ranges.extend(source_ranges_for_line(
+            detection,
+            original_line,
+            visible_source_len,
+        ));
+    }
+    ranges
+}
+
+pub(super) fn source_ranges_for_line(
+    detection: &Detection,
+    original_line: usize,
+    visible_source_len: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    for span in &detection.source_spans {
+        if !span.includes_line(original_line) {
             continue;
         }
-        let start = if detection.span.start.line == original_line {
-            detection.span.start.byte
+        let start = if span.start.line == original_line {
+            span.start.byte
         } else {
             0
         };
-        let end = if detection.span.end.line == original_line {
-            detection.span.end.byte
+        let end = if span.end.line == original_line {
+            span.end.byte
         } else {
             visible_source_len
         };
@@ -185,6 +212,7 @@ fn append_highlighted(
     font_id: FontId,
     theme: &Theme,
     embedded_ranges: &[std::ops::Range<usize>],
+    timestamp_range: Option<&std::ops::Range<usize>>,
 ) {
     let mut spans: Vec<(std::ops::Range<usize>, HighlightKind)> = Vec::new();
     let mut covered: Vec<std::ops::Range<usize>> = Vec::new();
@@ -222,13 +250,15 @@ fn append_highlighted(
     }
 
     if spans.is_empty() {
-        append_segment_with_embedded(
+        append_segment_with_annotations(
             job,
             text,
             0..text.len(),
             base_fmt,
             embedded_ranges,
+            timestamp_range,
             theme.embedded_data,
+            theme.timestamp,
         );
         return;
     }
@@ -237,13 +267,15 @@ fn append_highlighted(
     let mut pos = 0;
     for (range, highlight) in spans {
         if pos < range.start {
-            append_segment_with_embedded(
+            append_segment_with_annotations(
                 job,
                 text,
                 pos..range.start,
                 base_fmt.clone(),
                 embedded_ranges,
+                timestamp_range,
                 theme.embedded_data,
+                theme.timestamp,
             );
         }
         let highlight_fmt = match highlight {
@@ -274,35 +306,41 @@ fn append_highlighted(
                 ..Default::default()
             },
         };
-        append_segment_with_embedded(
+        append_segment_with_annotations(
             job,
             text,
             range.clone(),
             highlight_fmt,
             embedded_ranges,
+            timestamp_range,
             theme.embedded_data,
+            theme.timestamp,
         );
         pos = range.end;
     }
     if pos < text.len() {
-        append_segment_with_embedded(
+        append_segment_with_annotations(
             job,
             text,
             pos..text.len(),
             base_fmt,
             embedded_ranges,
+            timestamp_range,
             theme.embedded_data,
+            theme.timestamp,
         );
     }
 }
 
-fn append_segment_with_embedded(
+fn append_segment_with_annotations(
     job: &mut egui::text::LayoutJob,
     text: &str,
     range: std::ops::Range<usize>,
     format: egui::text::TextFormat,
     embedded_ranges: &[std::ops::Range<usize>],
-    underline_color: Color32,
+    timestamp_range: Option<&std::ops::Range<usize>>,
+    embedded_color: Color32,
+    timestamp_color: Color32,
 ) {
     if range.is_empty() {
         return;
@@ -314,6 +352,12 @@ fn append_segment_with_embedded(
             boundaries.push(embedded.end.min(range.end));
         }
     }
+    if let Some(timestamp) = timestamp_range {
+        if timestamp.end > range.start && timestamp.start < range.end {
+            boundaries.push(timestamp.start.max(range.start));
+            boundaries.push(timestamp.end.min(range.end));
+        }
+    }
     boundaries.sort_unstable();
     boundaries.dedup();
     for pair in boundaries.windows(2) {
@@ -322,11 +366,16 @@ fn append_segment_with_embedded(
             continue;
         }
         let mut segment_format = format.clone();
-        if embedded_ranges
+        let is_timestamp = timestamp_range.is_some_and(|timestamp| {
+            timestamp.start < segment.end && timestamp.end > segment.start
+        });
+        if is_timestamp {
+            segment_format.underline = Stroke::new(1.0, timestamp_color);
+        } else if embedded_ranges
             .iter()
             .any(|embedded| embedded.start < segment.end && embedded.end > segment.start)
         {
-            segment_format.underline = Stroke::new(1.0, underline_color);
+            segment_format.underline = Stroke::new(1.0, embedded_color);
         }
         job.append(&text[segment], 0.0, segment_format);
     }

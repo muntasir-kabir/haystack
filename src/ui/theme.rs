@@ -123,6 +123,8 @@ pub struct Theme {
     pub embedded_data: Color32,
     /// Background for compact structured-data badges.
     pub embedded_data_bg: Color32,
+    /// Quiet underline used for explicit source timestamps.
+    pub timestamp: Color32,
 }
 
 impl Theme {
@@ -161,6 +163,7 @@ impl Theme {
             keyword_highlight_bg: Color32::from_rgba_unmultiplied(35, 210, 220, 70),
             embedded_data: Color32::from_rgb(166, 227, 161),
             embedded_data_bg: Color32::from_rgba_unmultiplied(70, 140, 90, 80),
+            timestamp: Color32::from_rgb(137, 180, 250),
         }
     }
 
@@ -199,6 +202,7 @@ impl Theme {
             keyword_highlight_bg: Color32::from_rgba_unmultiplied(15, 155, 175, 60),
             embedded_data: Color32::from_rgb(25, 125, 55),
             embedded_data_bg: Color32::from_rgba_unmultiplied(80, 170, 100, 55),
+            timestamp: Color32::from_rgb(55, 95, 170),
         }
     }
 }

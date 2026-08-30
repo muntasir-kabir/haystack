@@ -1,3 +1,27 @@
+# Fix intermittent GUI MCP bridge requests
+
+Explicitly restore blocking mode on accepted GUI IPC sockets before reading request envelopes. On macOS, inherited nonblocking mode could return `EAGAIN` before the request arrived, causing the bridge test and real GUI requests to be rejected intermittently.
+
+# Detect XML, OpenStep, and binary property lists
+
+Log View now parses XML plists and explicitly labeled OpenStep/ASCII property lists into bounded trees while preserving exact multiline source spans. Ordinary Foundation descriptions keep their Apple classification. Binary plist magic is recognized in literal, hex, and Base64 transports as a separate safe summary; its transport is decoded only after the explicit inspector action, without automatic binary object-table interpretation.
+
+# Expand Swift and Foundation value detection
+
+The Apple embedded-data profile now parses synthesized Swift structs/classes, nested `Optional(...)` values, enum associated values, labeled tuples, Swift dictionaries/arrays, multiline `dump`/Mirror output, classic Foundation collections, and `<NSObject: address; property = value>` descriptions. Stricter confidence rejects ordinary parenthetical prose and bracketed log tags, node limits remain enforced, and overlap arbitration preserves Swift containers with JSON-compatible children without letting loose field or protobuf-like wrappers hide strict nested values.
+
+# Annotate exact log timestamps
+
+Explicit source timestamps now receive a quiet format-specific underline and the same delayed source callout behavior without noisy per-line gutter badges. The load pass retains compact exact timestamp spans for allocation-free rendering; hover can copy the raw source or normalized UTC value, continuation lines remain unmarked, and JSON field spans resolve the actual timestamp key even when another field repeats the same value.
+
+# Add source-aware structured-data interactions
+
+Structured detections now retain exact source fragments, underline only real fields, and render every opening cue on a row. A stable 800 ms hover over either underlined source or its cue opens a semi-transparent callout with Copy source and Open inspector actions; movement, scrolling, selection, and a short source-to-callout grace period keep it unobtrusive.
+
+# Detect single key/value log events
+
+Log View embedded-data analysis now recognizes single `key=value` and conservative `key: value` events, spaces around separators, double/single/backtick quoted text, multiline values, and intact URL/path values. Shared bounded parsing adds the requested coverage without turning timestamps, URL schemes, source locations, or ordinary colon prose into fields.
+
 # Fix v0.1.1 packager metadata
 
 Aligned the cargo-packager installer version with the `0.1.1` crate and release tag so the GitHub release workflow validates successfully.

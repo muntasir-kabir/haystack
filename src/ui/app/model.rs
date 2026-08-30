@@ -127,6 +127,35 @@ struct EmbeddedScanResult {
     detections: Arc<Vec<Detection>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AnnotationHoverKey {
+    Embedded {
+        detector_id: &'static str,
+        span: SourceSpan,
+    },
+    Timestamp {
+        span: SourceSpan,
+    },
+}
+
+impl AnnotationHoverKey {
+    pub(crate) fn for_detection(detection: &Detection) -> Self {
+        Self::Embedded {
+            detector_id: detection.detector_id,
+            span: detection.span,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AnnotationHoverState {
+    pub key: AnnotationHoverKey,
+    pub source_rect: egui::Rect,
+    pub started_at: Instant,
+    pub last_seen_at: Instant,
+    pub bubble_rect: Option<egui::Rect>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EmbeddedInspectorMode {
     #[default]
@@ -261,6 +290,8 @@ pub struct LogTab {
     /// Screen-space anchor of the JSON cue that opened the inspector.
     pub embedded_inspector_anchor: Option<egui::Pos2>,
     pub embedded_inspector_mode: EmbeddedInspectorMode,
+    /// Delayed source-hover interaction for the active timestamp or payload.
+    pub(crate) annotation_hover: Option<AnnotationHoverState>,
 
     /// One-shot flag set by Cmd/Ctrl+F, consumed by `show_search_ui` to focus
     /// the log search box (and select existing text). Persists until the Log

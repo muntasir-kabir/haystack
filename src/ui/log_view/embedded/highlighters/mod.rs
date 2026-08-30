@@ -8,6 +8,7 @@ mod jvm_debug;
 mod jwt;
 mod logfmt;
 mod pem;
+mod plist;
 mod protobuf;
 mod python;
 mod stacktrace;
@@ -21,6 +22,8 @@ pub(super) fn for_detector(detector_id: &str) -> Presentation {
         "base64" => base64::PRESENTATION,
         "hex" => hex::PRESENTATION,
         "pem" => pem::PRESENTATION,
+        "plist" => plist::PRESENTATION,
+        "binary-plist" => plist::BINARY_PRESENTATION,
         "logfmt" => logfmt::PRESENTATION,
         "fields" => fields::PRESENTATION,
         "foundation" => foundation::PRESENTATION,

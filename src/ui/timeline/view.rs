@@ -925,7 +925,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             egui::Label::new(
                 RichText::new(&labels[i])
                     .monospace()
-                    .size(12.0)
+                    .size(9.0)
                     .strong()
                     .color(theme.axis),
             ),
@@ -933,7 +933,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     }
 
     // ---- duration labels BETWEEN each pair of adjacent tick labels ----
-    let dur_font = egui::FontId::monospace(9.5);
+    let dur_font = egui::FontId::monospace(8.5);
     for i in 1..n_ticks {
         let mid_x = (tick_xs[i - 1] + tick_xs[i]) / 2.0;
         let delta = tick_vs[i] - tick_vs[i - 1];

@@ -7,17 +7,21 @@ mod foundation;
 mod http;
 mod json;
 mod jvm_debug;
+mod kv;
 mod logfmt;
+mod plist;
 mod protobuf;
 mod python;
 mod stacktrace;
 
 use super::DataDetector;
 use super::{DataNode, Detection, ScanWindow, SourceSpan};
+use std::ops::Range;
 
 pub(super) fn builtins() -> Vec<Box<dyn DataDetector>> {
     vec![
         Box::new(json::JsonDetector),
+        Box::new(plist::PlistDetector),
         Box::new(encoded::EncodedDetector),
         Box::new(http::HttpDetector),
         Box::new(stacktrace::StacktraceDetector),
@@ -43,6 +47,26 @@ fn detection(
         end: window.source_pos(end),
     };
     Some(Detection::structured(id, span, raw, data))
+}
+
+fn detection_with_ranges(
+    window: &ScanWindow,
+    id: &'static str,
+    start: usize,
+    end: usize,
+    ranges: Vec<Range<usize>>,
+    data: DataNode,
+) -> Option<Detection> {
+    let detection = detection(window, id, start, end, data)?;
+    let source_spans = ranges
+        .into_iter()
+        .filter(|range| range.start < range.end)
+        .map(|range| SourceSpan {
+            start: window.source_pos(range.start),
+            end: window.source_pos(range.end),
+        })
+        .collect();
+    Some(detection.with_source_spans(source_spans))
 }
 
 fn line_ranges(bytes: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {

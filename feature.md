@@ -11,11 +11,11 @@ Everything currently implemented, and what's deliberately not (yet).
 | SIMD line index | one `memchr` pass builds the line-offset table |
 | Real progress reporting | 2 stages (Indexing / Analyzing), byte-accurate %, cancellable |
 | Log format detection | Pluggable recognizer: JSON, CEF, RFC 5424, Apple Unified Logging (`log show`), logcat brief, iOS OSLog console — one file per format (`src/core/format/`), registry-extensible, `plain` fallback |
-| Timestamp detection | Built-in families (ISO-8601, YYYY/MM/DD, BSD syslog, Apache CLF, epoch, logcat threadtime, glog, ISO-8601 12h AM/PM) + user-defined custom recognizers (regex with named groups, live-verified, saved to `~/.logotomy/custom_date_format_list.json`) (`src/core/time/`, `src/ui/custom_date/`) |
+| Timestamp detection | Built-in families (ISO-8601, YYYY/MM/DD, BSD syslog, Apache CLF, epoch, logcat threadtime, glog, ISO-8601 12h AM/PM) + user-defined custom recognizers (regex with named groups, live-verified, saved to `~/.logotomy/custom_date_format_list.json`); exact source spans retained compactly for annotation (`src/core/time/`, `src/ui/custom_date/`) |
 | Timestamp auto-detection | Pluggable: ISO-8601 (`Z`, offsets, comma/dot millis, space/`T` separator), `YYYY/MM/DD`, syslog `Jan  5`, Apache `10/Oct/2024:13:55:36 -0700`, epoch s/ms, logcat threadtime, glog — one file per family (`src/core/time/`) |
 | Forward-filled timestamps | stack traces & continuation lines inherit previous timestamp |
 | Compact record boundaries | one bit per physical line records explicit timestamp starts, allowing bounded recovery of large multiline records |
-| Embedded data detection | Registry-based, viewport-scoped detectors for JSON, logfmt/key-value, colon fields, Foundation/Python/JVM debug values, HTTP, protobuf text, stack traces, and encoded JWT/Base64/hex/PEM; exact source spans, cancellation, and safety limits |
+| Embedded data detection | Registry-based, viewport-scoped detectors for JSON, logfmt/key-value, colon fields, Swift/Foundation/Python/JVM debug values, XML and labeled OpenStep plists, binary plist magic, HTTP, protobuf text, stack traces, and encoded JWT/Base64/hex/PEM; exact source spans, cancellation, and safety limits |
 | Native Drain template mining | fixed-depth parse tree, `<*>` wildcards, per-line template ID, occurrence counts, example line — zero Python |
 | Robustness | CRLF, missing trailing newline, blank lines, invalid UTF-8 (lossy), multi-MB single lines, timeless files |
 | Filter engine | Aho-Corasick, case-sensitive, all filters in a single pass, background thread + cancellation |
@@ -33,7 +33,7 @@ Everything currently implemented, and what's deliberately not (yet).
 | Progress bar | per-loading-file card with stage label + % + cancel |
 | Multi-tab | open/close/switch many files; re-dropping an open file focuses its tab |
 | Virtualized log view | renders only visible rows; line # + template ID gutter; filter highlight; color marker per line |
-| Embedded data helpers | background viewport analysis; font-scaled zero-layout per-format cue, inline underline, hover summary, Tree/Pretty/Raw inspector, frame-oriented trace view, and explicit encoded preview |
+| Source annotations | quiet exact timestamp underlines with raw/normalized-UTC hover actions; background structured-data analysis with font-scaled zero-layout cues, exact underlines, delayed source actions, Tree/Pretty/Raw inspector, frame-oriented trace view, and explicit encoded preview |
 | Log font | embedded Space Mono monospace (SIL OFL 1.1) — log text only, rest of UI stays on default fonts |
 | Log font size controls | A− / A+ buttons in both log view and context panel (8–24px range) |
 | Lane-filtered log view | toggling timeline checkboxes filters the log view to only active lanes |
@@ -103,7 +103,7 @@ Match results are cached per (log, keyword, case mode); time params accept RFC33
 
 ## ✅ Quality & verification
 
-- 357 unit and integration tests (core, MCP, GUI, embedded-data contracts) — `cargo test`
+- 402 unit and integration tests (core, MCP, GUI, embedded-data contracts) — `cargo test`
 - Release benchmark harness — `cargo run --release --example bench -- <file> [kws]`
   (generates a 64MB synthetic log when run without args)
 
@@ -114,7 +114,7 @@ Match results are cached per (log, keyword, case mode); time params accept RFC33
 - Persistent filter sets per file
 - Multi-file merged timeline
 - MCP prompts (resources are implemented)
-- Embedded data detectors for YAML, TOML, XML/plist, and delimited records
+- Embedded data detectors for YAML, TOML, generic XML, and delimited records
 - Structured-data field/path search, schema grouping, comparison, similarity search, and MCP extraction tools
 
 ## 🗑 Removed

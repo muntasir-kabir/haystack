@@ -62,7 +62,11 @@ fn embedded_json_detector_satisfies_fixture_contract() {
                 other => panic!("unsupported fixture root kind: {other}"),
             };
             assert_eq!(detection.root_kind, expected_kind, "{}", case.id);
-            assert!(serde_json::from_str::<serde_json::Value>(&detection.raw).is_ok());
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&detection.raw).is_ok(),
+                "{} returned non-JSON first: {detection:?}",
+                case.id
+            );
         }
     }
 }

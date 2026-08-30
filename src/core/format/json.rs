@@ -63,14 +63,13 @@ fn extract_ts(value: &Value, line: &str) -> Option<(i64, Range<usize>)> {
             match val {
                 Value::String(s) => {
                     if let Some(ms) = parse_time_param(s) {
-                        let span = line.find(s).map(|i| i..i + s.len())?;
+                        let span = json_field_value_span(line, key)?;
                         return Some((ms, span));
                     }
                 }
                 Value::Number(n) => {
                     if let Some(ms) = number_to_ms(n) {
-                        let repr = n.to_string();
-                        let span = line.find(&repr).map(|i| i..i + repr.len())?;
+                        let span = json_field_value_span(line, key)?;
                         return Some((ms, span));
                     }
                 }
@@ -79,6 +78,118 @@ fn extract_ts(value: &Value, line: &str) -> Option<(i64, Range<usize>)> {
         }
     }
     None
+}
+
+/// Locate a top-level JSON field value without confusing a repeated timestamp
+/// string in another field for the timestamp source. String spans exclude the
+/// surrounding quotes; numeric spans cover the complete literal.
+fn json_field_value_span(line: &str, wanted: &str) -> Option<Range<usize>> {
+    let bytes = line.as_bytes();
+    let mut cursor = skip_json_ws(bytes, 0);
+    if bytes.get(cursor) != Some(&b'{') {
+        return None;
+    }
+    cursor += 1;
+    loop {
+        cursor = skip_json_ws(bytes, cursor);
+        if bytes.get(cursor) == Some(&b'}') {
+            return None;
+        }
+        if bytes.get(cursor) == Some(&b',') {
+            cursor = skip_json_ws(bytes, cursor + 1);
+        }
+        let key_start = cursor;
+        let key_end = json_string_end(bytes, key_start)?;
+        let key = serde_json::from_str::<String>(&line[key_start..key_end]).ok()?;
+        cursor = skip_json_ws(bytes, key_end);
+        if bytes.get(cursor) != Some(&b':') {
+            return None;
+        }
+        let value_start = skip_json_ws(bytes, cursor + 1);
+        let value_end = json_value_end(bytes, value_start)?;
+        if key == wanted {
+            return if bytes.get(value_start) == Some(&b'"') {
+                Some(value_start + 1..value_end.saturating_sub(1))
+            } else {
+                Some(value_start..value_end)
+            };
+        }
+        cursor = value_end;
+    }
+}
+
+fn skip_json_ws(bytes: &[u8], mut cursor: usize) -> usize {
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = cursor.checked_add(2)?,
+            b'"' => return Some(cursor + 1),
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start)? {
+        b'"' => json_string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut stack = vec![bytes[start]];
+            let mut cursor = start + 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'"' => cursor = json_string_end(bytes, cursor)?,
+                    b'{' | b'[' => {
+                        stack.push(bytes[cursor]);
+                        cursor += 1;
+                    }
+                    b'}' => {
+                        if stack.pop()? != b'{' {
+                            return None;
+                        }
+                        cursor += 1;
+                        if stack.is_empty() {
+                            return Some(cursor);
+                        }
+                    }
+                    b']' => {
+                        if stack.pop()? != b'[' {
+                            return None;
+                        }
+                        cursor += 1;
+                        if stack.is_empty() {
+                            return Some(cursor);
+                        }
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut cursor = start;
+            while bytes
+                .get(cursor)
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b',' | b'}'))
+            {
+                cursor += 1;
+            }
+            (cursor > start).then_some(cursor)
+        }
+    }
 }
 
 fn number_to_ms(n: &serde_json::Number) -> Option<i64> {
@@ -191,6 +302,15 @@ mod tests {
         let v: Value = serde_json::from_str("{\"timestamp\": 1784158530123}").unwrap();
         let (ms, _) = extract_ts(&v, "{\"timestamp\": 1784158530123}").unwrap();
         assert_eq!(ms, 1784158530123);
+    }
+
+    #[test]
+    fn timestamp_span_uses_the_timestamp_field_not_a_repeated_value() {
+        let line = r#"{"msg":"2026-08-15T19:40:01Z", "time":"2026-08-15T19:40:01Z"}"#;
+        let value: Value = serde_json::from_str(line).unwrap();
+        let (_, span) = extract_ts(&value, line).unwrap();
+        assert_eq!(&line[span.clone()], "2026-08-15T19:40:01Z");
+        assert_eq!(span.start, line.rfind("2026-08-15T19:40:01Z").unwrap());
     }
 
     #[test]

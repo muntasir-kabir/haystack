@@ -38,7 +38,7 @@ High-performance Rust log analyzer & visualizer (GUI + MCP server for AI assista
 - `src/mcp.rs` + `src/mcp/` — stdio MCP server, secure GUI-session manifest, and authenticated private IPC routing · `src/main.rs` — CLI dispatcher (`--mcp`, deprecated `--mcp-gui`, else GUI)
 
 ## Commands
-- `cargo test` — 357 tests
+- `cargo test` — 402 tests
 - `cargo run --release` — GUI
 - `cargo run --release --example bench -- [logfile] [filters...]` — benchmark (no args → 64MB/787k-line synthetic log; pass a path to bench a real file, e.g. an iOS log)
 - `cargo run --release --example gen_ios_logs -- [SIZES...] [--all] [--seed N]` — generate deterministic iOS test logs (seeded PCG64; iOS-1K/10K/100K/1M; `--all` for all, `--seed N` to override the fixed RNG)
