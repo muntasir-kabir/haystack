@@ -11,6 +11,58 @@ use crate::core::time::CustomDateFormat;
 
 /// Maximum number of recent files to remember.
 const MAX_RECENT: usize = 20;
+/// Maximum number of recent search or filter inputs to remember.
+pub const MAX_RECENT_QUERIES: usize = 20;
+
+/// How Log View presents long lines by default.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLineDisplayMode {
+    /// Paint a bounded, UTF-8-safe preview so every virtual row has one height.
+    #[default]
+    Truncate,
+    /// Paint complete source text on a single row inside a horizontal scroll area.
+    HorizontalScroll,
+    /// Paint complete source text across multiple visual rows.
+    Wrap,
+}
+
+impl LogLineDisplayMode {
+    pub const ALL: [Self; 3] = [Self::Truncate, Self::HorizontalScroll, Self::Wrap];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Truncate => "Truncate long lines",
+            Self::HorizontalScroll => "Horizontal scroll",
+            Self::Wrap => "Wrap long lines",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Truncate => "Fast 2,000-byte preview; open a line to inspect all text.",
+            Self::HorizontalScroll => {
+                "Show complete lines without wrapping; use the bottom scrollbar."
+            }
+            Self::Wrap => "Show complete lines wrapped to the Log View width.",
+        }
+    }
+}
+
+/// A reusable timeline-filter input, including the matching mode needed to
+/// execute it directly from a recent-entry suggestion.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RecentFilter {
+    pub text: String,
+    #[serde(default = "default_true")]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub regex: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
 
 /// Application settings persisted to disk.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -18,6 +70,21 @@ pub struct Settings {
     /// Most-recently opened files, most recent first.
     #[serde(default)]
     pub recent_files: Vec<PathBuf>,
+    /// Most-recently executed Log View search terms, most recent first.
+    #[serde(default)]
+    pub recent_searches: Vec<String>,
+    /// Most-recently added Timeline filters, including their match mode.
+    #[serde(default)]
+    pub recent_filters: Vec<RecentFilter>,
+    /// Default long-line presentation for newly opened logs.
+    #[serde(default)]
+    pub log_line_display_mode: LogLineDisplayMode,
+    /// Files that were open in the previous GUI session, in tab order.
+    #[serde(default)]
+    pub open_files: Vec<PathBuf>,
+    /// Canonical path of the active tab from the previous GUI session.
+    #[serde(default)]
+    pub active_file: Option<PathBuf>,
     /// Whether dark mode is enabled (default: true).
     #[serde(default = "default_dark")]
     pub dark_mode: bool,
@@ -63,6 +130,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             recent_files: Vec::new(),
+            recent_searches: Vec::new(),
+            recent_filters: Vec::new(),
+            log_line_display_mode: LogLineDisplayMode::default(),
+            open_files: Vec::new(),
+            active_file: None,
             dark_mode: true,
             default_filter: None,
             sim_threshold: default_sim_threshold(),
@@ -203,6 +275,34 @@ impl Settings {
     pub fn recent_files(&self) -> &[PathBuf] {
         &self.recent_files
     }
+
+    /// Remember an executed search, preserving a most-recent-first unique list.
+    pub fn add_recent_search(&mut self, query: impl AsRef<str>) {
+        let query = query.as_ref().trim();
+        if query.is_empty() {
+            return;
+        }
+        self.recent_searches.retain(|entry| entry != query);
+        self.recent_searches.insert(0, query.to_owned());
+        self.recent_searches.truncate(MAX_RECENT_QUERIES);
+    }
+
+    /// Remember an added filter, including the mode necessary to replay it.
+    pub fn add_recent_filter(&mut self, filter: RecentFilter) {
+        let text = filter.text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.recent_filters.retain(|entry| entry.text != text);
+        self.recent_filters.insert(
+            0,
+            RecentFilter {
+                text: text.to_owned(),
+                ..filter
+            },
+        );
+        self.recent_filters.truncate(MAX_RECENT_QUERIES);
+    }
 }
 
 #[cfg(test)]
@@ -239,5 +339,40 @@ mod tests {
         let settings: Settings =
             serde_json::from_str(r#"{"embedded_inspector_mode":"raw"}"#).unwrap();
         assert_eq!(settings.embedded_inspector_mode, "raw");
+    }
+
+    #[test]
+    fn workspace_fields_default_for_older_settings_and_round_trip() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.open_files.is_empty());
+        assert!(settings.active_file.is_none());
+
+        let settings: Settings =
+            serde_json::from_str(r#"{"open_files":["/tmp/one.log"],"active_file":"/tmp/one.log"}"#)
+                .unwrap();
+        assert_eq!(settings.open_files, vec![PathBuf::from("/tmp/one.log")]);
+        assert_eq!(settings.active_file, Some(PathBuf::from("/tmp/one.log")));
+    }
+
+    #[test]
+    fn long_line_preferences_and_recent_queries_round_trip() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.log_line_display_mode, LogLineDisplayMode::Truncate);
+        settings.log_line_display_mode = LogLineDisplayMode::Wrap;
+        settings.add_recent_search(" error ");
+        settings.add_recent_search("warning");
+        settings.add_recent_search("error");
+        settings.add_recent_filter(RecentFilter {
+            text: "panic".to_owned(),
+            case_sensitive: false,
+            regex: false,
+        });
+        assert_eq!(settings.recent_searches, ["error", "warning"]);
+        assert_eq!(settings.recent_filters[0].text, "panic");
+
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.log_line_display_mode, LogLineDisplayMode::Wrap);
+        assert_eq!(restored.recent_searches, ["error", "warning"]);
     }
 }

@@ -1,3 +1,107 @@
+# Prepare v0.1.4 release
+
+Set the application and native installer metadata to `0.1.4` so the release workflow can validate and package the consolidated feature set under the `v0.1.4` tag.
+
+# Simplify closing and the empty-state entry point
+
+Copy actions now dismiss the multi-line selection bubble, tab closes save investigation sidecars without a confirmation prompt, and the default opening page uses centered Open/Recent actions with shorter drag-and-drop copy and no ZIP explanation line.
+
+# Fine-tune Timeline and Log View interactions
+
+Removed the Timeline gesture hint to reclaim vertical space and moved the minimap up with it, removed embedded-data badge overlays while retaining source underlines and annotations, and made Enter advance an already-started Log View search even while the search field remains focused.
+
+# Refresh the complete desktop UX
+
+Standardized the app on recognizable theme-colored SVG actions, rebuilt the responsive `LOGotomy` shell and AI Assistant controls, clarified tabs/empty states, compacted and aligned workspace controls around the data, and reduced every dock leaf to one External Window action. Settings, dialogs, hints, deletion wording, transient-surface dismissal, and both themes now follow consistent grouping, copy, contrast, and interaction rules without changing analysis or persisted schemas.
+
+# Keep selection visible during analysis entry
+
+Drag-selection action bubbles now open near the release cursor, then move the analysis editor beside the selected lines while preserving the selected highlight for the editor lifetime.
+
+# Fix analysis bubble positional awareness
+
+Drag-selected analysis bubbles now open at the release endpoint, and their arrows point to that visible endpoint instead of a hidden position inside the bubble. The selected range remains active until the user takes an action or cancels.
+
+# Replace Log View pin surfaces with anchored analysis bubbles
+
+Right-click Pin and drag-selected row actions now use movable, resizable bubbles anchored to the source text. The selection remains visible until save/cancel, and the editor accepts optional analysis with `Add analysis/info or enter to save` guidance.
+
+# Tune annotation popup transparency and dismissal
+
+Made the annotation callout transparency adjustable through one top-level constant and added immediate Escape/outside-click dismissal, establishing the same interaction rule for future transient popups.
+
+# Improve embedded annotation hover popups
+
+Moved annotation callouts into a focused module with one key/value per line, viewport-aware dynamic sizing, bounded/truncated previews, and a sticky handoff lifecycle that remains usable across dense highlights.
+
+# Fix Rust formatting
+
+Applied the repository’s current rustfmt output so Cargo formatting checks pass consistently.
+
+# Improve MCP integration prompts and guide readability
+
+Shortened the agent-setup and GUI-session prompts while preserving the required stdio transport, attachment, security, and investigation guidance. The integration window now groups recommended setup, manual client configuration, and usage into consistent, easier-to-scan sections.
+
+# Add ZIP drag-and-drop support
+
+Drop or open a `.zip` to extract it in the background into a uniquely named folder beside the archive, then choose logs from that folder in the file picker. Updated drop hints, progress/cancel controls, and extraction error handling make archives discoverable and preserve existing files.
+
+# Fix annotation hover callout handoff and field layout
+
+Structured annotation callouts now stay open along the direct path from the highlighted source to the popup, including near viewport edges, and constrain their size to the screen. Structured values render their detected fields on separate lines with scrolling for large payloads.
+
+# Fix: preserve selected lines through every filter update
+
+Filter additions, removals, lane visibility changes, undo, and clear operations now retain a still-visible selection, otherwise choose the nearest visible line before revealing it. Centralized filter-lane mutations and regression coverage protect this selection-and-viewport ordering.
+
+# Fix: keep selection stable across filter lane changes
+
+Filter lane changes now keep the selected log line and move the viewport only when needed; if that line is filtered out, the nearest remaining line is selected before the viewport is adjusted.
+
+# Fix: preserve disabled timeline lane navigation
+
+Disabled filter lanes now retain a muted baseline line without occurrence markers or buckets, and clicking one navigates to the nearest log line without selecting the disabled filter.
+
+# Fix: preserve Log View position while changing selection
+
+Log View navigation now leaves the viewport unchanged when the selected line is already fully visible, minimally reveals nearby targets within five rows with a two-row safety margin, and centers distant targets. Manual scrolling also moves an off-screen selection to the nearest visible row across Truncate, Horizontal Scroll, and Wrap modes.
+
+# Performance: make live tailing incremental across tabs
+
+Every open tab now checks for appended data. Staged documents share completed 65,536-entry per-line index chunks, existing filters scan only appended lines, and chronological/sequence timelines extend from their prior density summary; results still install atomically while the visible document remains responsive.
+
+# Performance: scan only changed filter lanes
+
+Timeline filter edits now retain shared match vectors for unchanged matchers and scan only newly added or materially edited lanes. Include/exclude and removal changes reuse existing hits plus the document-wide timeline density, while document trims, replacements, and range-scope changes invalidate reuse safely.
+
+# Performance: compact timeline match indexes
+
+Timeline filter lanes and the out-of-order timestamp fallback now retain only x-sorted 32-bit line IDs. Rendering and navigation resolve timestamps through the document index, eliminating the padded `(u32, i64)` copy previously held for every timeline hit.
+
+# Add log sharing and export actions
+
+# Make long lines and recent queries first-class
+
+Log View can now truncate, wrap, or horizontally scroll complete long lines; truncated rows flag hidden search hits and open a full-line inspector with an untruncated copy action. Wrap mode uses cached variable-height virtualization so scrolling, selection, Timeline viewport tracking, and keyboard navigation remain responsive. Export scopes are consolidated in a right-aligned menu, while empty focused Find and Timeline filter fields offer immediately executable recent entries (excluding filters already added).
+
+Log rows and selected ranges can now be copied in the common formats, while visible rows and timeline ranges export to text. Template counts export as CSV/JSON and the Pin panel saves pins plus analysis notes as Markdown for incident sharing.
+
+# Preserve investigation work while narrowing logs
+
+Trimming now retains pins and active investigation state, with out-of-range pin anchors hidden until they return to view. Trim and pin clearing support one-level undo, and closing a tab with investigation work now asks for confirmation after saving its sidecar.
+
+# Refine top-panel dropdown navigation
+
+Reordered the top-panel actions to Open File, Recent, Saved Filter, and Views; grouped Commands and Templates under the Views dropdown and made settings actions dismiss the settings menu after use.
+
+# Remove unsupported binary file associations
+
+Release installers no longer associate `.evt`, `.evtx`, or `.sys` files because logotomy accepts text input rather than Windows Event Log binaries. Updated release validation and packaging documentation to match.
+
+# Persist per-file investigation state
+
+Persist per-file investigation state in versioned adjacent sidecars, including filters, anchors, notes, layout, and scroll position; restore changed-file notes safely, autosaving silently on changes, at least once per minute, on tab close, and on application exit.
+
 # Fix intermittent GUI MCP bridge requests
 
 Explicitly restore blocking mode on accepted GUI IPC sockets before reading request envelopes. On macOS, inherited nonblocking mode could return `EAGAIN` before the request arrived, causing the bridge test and real GUI requests to be rejected intermittently.
@@ -298,6 +402,10 @@ The Release workflow (`.github/workflows/release.yml`) failed in the "Smoke-test
 
 Releases now publish **native installers** instead of raw binary tarballs/zips. `.github/workflows/release.yml` builds `logotomy-<version>-setup.exe` (NSIS) on Windows, `.deb` + `.AppImage` on Ubuntu, and `.dmg` (Apple Silicon + Intel) on macOS, uploading them plus `checksums.sha256` to the GitHub Release. The packaging config lives in `Cargo.toml` under `[package.metadata.packager]` (identifier, icons, NSIS/macOS/Linux options). New committed icon assets in `assets/icons/` (128×128 app icon as requested, plus 256/512 PNGs and `logotomy.ico`); on Windows the `.exe` itself embeds the icon + version info via `build.rs`/`winres`, and the NSIS installer uses the same 128-px icon. Manual "binary → installer" steps are documented in `docs/release.md`; `scripts/package-release.sh` wraps build+package for one command.
 
+# Fix cross-platform keyboard shortcut startup deadlock
+
+Moved the platform check outside egui's input lock so the Backspace/Delete shortcut alias cannot re-enter the context lock and deadlock the GUI on Windows or macOS. Added regression tests covering the public consumer and macOS shortcut path.
+
 # Embed Space Mono font for log text
 
 Log text (the central log view, the pin preview modal, and the pinned-lines panel) is now rendered with the embedded **Space Mono** monospace font instead of egui's default mono. The four Space Mono faces (Regular/Bold/Italic/BoldItalic, ~410 KB) are baked into the binary via `include_bytes!` and registered under a dedicated `space_mono` egui font family in `src/ui/fonts/` — so **only log text** uses Space Mono, while the rest of the UI (timeline axis labels, settings, template panel) keeps its default fonts. Space Mono is SIL OFL 1.1 licensed (`OFL.txt` ships next to the TTFs; credited in the README). The A−/A+ font size controls still drive the log text size. Tests: font embedding/registration unit tests.
@@ -552,3 +660,16 @@ Made timeline/log filter controls compact with a light yellow treatment and trai
 Filter lanes can now be selected by clicking their row or an occurrence diamond. Left/Right arrows navigate the selected lane's occurrences, while Up/Down arrows navigate multi-result Log View searches; contextual headers, SVG arrows, and shortcut toasts explain the controls.
 Added a modular embedded-data inspector: JSON is now joined by logfmt/key-value, colon fields, Foundation/Python/JVM debug values, HTTP, protobuf text, stack traces, and JWT/Base64/hex/PEM payloads. Each format has an isolated detector and Log View highlighter with dedicated detection and visualization coverage; stack traces render as frames and encoded data requires an explicit preview action.
 Timeline occurrence navigation now uses the requested larger, animated layout; timeline captions and buckets are resized, and clicking a filter name toggles its visibility.
+Templates are now a dockable, pop-out-capable view with cached sorting/search, midpoint-aware occurrence navigation, and rare/late/bursty cues. Selected rows expose an inline SVG action strip, while template filter labels remain regular text filters pending template-aware filter support.
+# Make Template ID timeline filters functional
+
+Timeline filters now include a **Template ID** type that accepts `42`, `T42`, or `T{42}` and matches Drain template IDs directly. The Templates-tab action now creates that typed filter instead of an ineffective text phrase; matching state persists in investigation sidecars and is covered by core and UI-path tests. Template occurrence navigation also safely handles targets before the first occurrence.
+# Performance: bound and reuse derived search caches
+
+MCP keyword matches now use a 128-entry/64 MiB LRU and filtered unions are reused until their document or filter set changes. The Templates view also reuses its filtered ordering allocation while the query and document stay unchanged.
+# Performance: compact visible and Find indexes
+
+Filtered visible-line and Log View Find results now retain 32-bit line IDs, and lane recombination merges the already-sorted hit lists instead of allocating one byte per line per filter. Large lane toggles therefore avoid the previous multi-million-line temporary arrays while preserving include/exclude and Everything Else semantics.
+# Add compatible advanced Log View search
+
+Log View search now has a native SVG search icon and the same Text (Aa), Text (Ab), Regex, and Template ID matchers as Timeline filters, with live validation, typed filter promotion, and close/Escape cancellation. Selected Templates rows now start a Template ID Log search instead of exposing first/previous/next/last buttons.

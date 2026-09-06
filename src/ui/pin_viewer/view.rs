@@ -261,6 +261,7 @@ fn pinned_content_text(tab: &LogTab) -> String {
         let lines: Vec<String> = pin
             .line_numbers
             .iter()
+            .filter(|&&ln| ln < tab.doc.total_lines())
             .map(|&ln| format!("{:>7}: {}", ln + 1, tab.doc.line(ln)))
             .collect();
         if !lines.is_empty() {
@@ -273,40 +274,79 @@ fn pinned_content_text(tab: &LogTab) -> String {
 }
 
 pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
-    let has_content = !tab.pins.is_empty();
     let is_open = tab.bottom_panel_open;
 
     // ---- header bar ----
     ui.horizontal(|ui| {
+        ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
         let ctx = ui.ctx().clone();
         let header_icon = if is_open {
             Icon::Collapse
         } else {
             Icon::Expand
         };
-        ui.add(icons::icon_image(&ctx, header_icon, 12.0, theme.text));
+        if icons::icon_action_button(
+            ui,
+            header_icon,
+            theme.text,
+            if is_open {
+                "Collapse pinned evidence"
+            } else {
+                "Expand pinned evidence"
+            },
+        )
+        .clicked()
+        {
+            tab.bottom_panel_open = !is_open;
+        }
         ui.add(icons::icon_image(&ctx, Icon::Pin, 12.0, theme.text));
-        let header_resp = ui.selectable_label(is_open, format!("{} pinned", tab.pins.len()));
+        let header_resp = ui.add(
+            egui::Label::new(
+                RichText::new(format!("{} pinned", tab.pins.len())).color(theme.text_muted),
+            )
+            .sense(egui::Sense::click()),
+        );
         if header_resp.clicked() {
             tab.bottom_panel_open = !is_open;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if is_open && !tab.pins.is_empty() && ui.small_button("Clear all").clicked() {
-                tab.pins.clear();
-                tab.bottom_panel_open = false;
+            if is_open
+                && !tab.pins.is_empty()
+                && icons::action_button(
+                    ui,
+                    Icon::Remove,
+                    "Clear",
+                    theme.text,
+                    "Remove all pinned evidence and analyses",
+                )
+                .clicked()
+            {
+                tab.clear_pins_with_undo();
+            }
+            if is_open
+                && !tab.pins.is_empty()
+                && icons::action_button(
+                    ui,
+                    Icon::Save,
+                    "Save Markdown",
+                    theme.text,
+                    "Save pinned evidence and analyses as Markdown",
+                )
+                .clicked()
+            {
+                save_markdown(tab);
             }
             // Copy button — to the left of "Clear all". Copies the full pinned
             // view content (headers, user comments, numbered log lines).
             if is_open && !tab.pins.is_empty() {
-                let ctx = ui.ctx().clone();
-                let btn = egui::Button::image_and_text(
-                    icons::icon_image(&ctx, Icon::Copy, 14.0, theme.text),
-                    RichText::new("Copy text").small(),
-                );
-                if ui
-                    .add(btn)
-                    .on_hover_text("Copy pinned view content to clipboard")
-                    .clicked()
+                if icons::action_button(
+                    ui,
+                    Icon::Copy,
+                    "Copy text",
+                    theme.text,
+                    "Copy pinned evidence and analyses to the clipboard",
+                )
+                .clicked()
                 {
                     ui.ctx().copy_text(pinned_content_text(tab));
                     trigger_copy_toast();
@@ -315,7 +355,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         });
     });
 
-    if is_open && has_content {
+    if is_open {
         ui.separator();
         render_content(ui, tab, theme);
     }
@@ -324,10 +364,52 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     toast_ui(ui.ctx(), theme);
 }
 
+fn save_markdown(tab: &mut LogTab) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_file_name("investigation.md")
+        .save_file()
+    else {
+        return;
+    };
+    let mut markdown = format!("# Investigation: {}\n\n", tab.doc.file_name);
+    for (pos, &index) in sorted_pin_indices(tab).iter().enumerate() {
+        let pin = &tab.pins[index];
+        markdown.push_str(&format!(
+            "## {}\n\n",
+            pin_header_text(tab, pos, &sorted_pin_indices(tab))
+        ));
+        if !pin.comment.is_empty() {
+            markdown.push_str(&pin.comment);
+            markdown.push_str("\n\n");
+        }
+        let visible: Vec<_> = pin
+            .line_numbers
+            .iter()
+            .copied()
+            .filter(|&line| line < tab.doc.total_lines())
+            .collect();
+        if !visible.is_empty() {
+            markdown.push_str("```text\n");
+            for line in visible {
+                markdown.push_str(&format!(
+                    "{}: {}\n",
+                    tab.doc.trim_start + line + 1,
+                    tab.doc.line(line)
+                ));
+            }
+            markdown.push_str("```\n\n");
+        }
+    }
+    match std::fs::write(path, markdown) {
+        Ok(()) => tab.pending_toast = Some("Pins and analysis saved as Markdown".into()),
+        Err(error) => tab.pending_toast = Some(format!("Export failed: {error}")),
+    }
+}
+
 fn render_content(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     if tab.pins.is_empty() {
         ui.label(
-            RichText::new("No pinned lines yet.")
+            RichText::new("No pinned evidence yet. Right-click a log line, or drag across rows, to pin useful context.")
                 .small()
                 .color(theme.text_muted),
         );
@@ -342,19 +424,22 @@ fn render_content(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
     let mut remove_pin: Option<usize> = None;
     let mut edit_pin: Option<usize> = None;
+    let requested_pin = tab.pending_pin_scroll;
+    let mut revealed_pin = None;
     let scroll_height = ui.available_height().max(60.0);
 
     egui::ScrollArea::vertical()
+        .id_salt("pinned_cards")
         .auto_shrink([false, false])
         .max_height(scroll_height)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = PIN_SPACING;
 
             for (pos, &pi) in sorted_indices.iter().enumerate() {
-                let pin = &tab.pins[pi];
+                let pin = tab.pins[pi].clone();
 
                 // ---- pin card frame ----
-                egui::Frame::default()
+                let card = egui::Frame::default()
                     .fill(theme.surface)
                     .corner_radius(4.0)
                     .inner_margin(egui::Margin::symmetric(6, 4))
@@ -364,29 +449,36 @@ fn render_content(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                             let title = pin_header_text(tab, pos, &sorted_indices);
                             let ctx = ui.ctx().clone();
                             ui.add(icons::icon_image(&ctx, Icon::Date, 12.0, theme.text));
-                            ui.label(RichText::new(title).strong().size(12.0));
+                            if ui
+                                .selectable_label(
+                                    tab.selected_pin == Some(pi),
+                                    RichText::new(title).strong().size(12.0),
+                                )
+                                .on_hover_text("Select pin (Delete removes it)")
+                                .clicked()
+                            {
+                                tab.selected_pin = Some(pi);
+                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if icons::image_button(
+                                    if icons::icon_action_button(
                                         ui,
-                                        Icon::Close,
-                                        egui::vec2(16.0, 16.0),
+                                        Icon::Remove,
                                         theme.text,
+                                        "Remove this pinned evidence",
                                     )
-                                    .on_hover_text("Remove pin")
                                     .clicked()
                                     {
                                         remove_pin = Some(pi);
                                     }
                                     if !pin.unanchored {
-                                        if icons::image_button(
+                                        if icons::icon_action_button(
                                             ui,
                                             Icon::Edit,
-                                            egui::vec2(16.0, 16.0),
                                             theme.text,
+                                            "Edit this pin and its analysis",
                                         )
-                                        .on_hover_text("Edit pin (reopens the pin window)")
                                         .clicked()
                                         {
                                             edit_pin = Some(pi);
@@ -410,7 +502,13 @@ fn render_content(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                         // Log lines in slightly smaller font (embedded Space Mono)
                         let small_font =
                             crate::ui::fonts::log_font((tab.log_font_size * 0.85).max(8.0));
-                        let total = pin.line_numbers.len();
+                        let visible_lines: Vec<usize> = pin
+                            .line_numbers
+                            .iter()
+                            .copied()
+                            .filter(|&line| line < tab.doc.total_lines())
+                            .collect();
+                        let total = visible_lines.len();
                         const SHOW_FIRST: usize = 10;
                         const SHOW_LAST: usize = 2;
 
@@ -419,16 +517,16 @@ fn render_content(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
                         if total <= SHOW_FIRST + SHOW_LAST {
                             // Show all lines with gap markers
-                            for (i, &ln) in pin.line_numbers.iter().enumerate() {
-                                if i > 0 && pin.line_numbers[i - 1] + 1 != ln {
+                            for (i, &ln) in visible_lines.iter().enumerate() {
+                                if i > 0 && visible_lines[i - 1] + 1 != ln {
                                     pin_gap(ui, theme, &small_font, "…");
                                 }
                                 pin_line(ui, tab, theme, &small_font, ln);
                             }
                         } else {
                             // Show first SHOW_FIRST lines
-                            for (i, &ln) in pin.line_numbers.iter().enumerate().take(SHOW_FIRST) {
-                                if i > 0 && pin.line_numbers[i - 1] + 1 != ln {
+                            for (i, &ln) in visible_lines.iter().enumerate().take(SHOW_FIRST) {
+                                if i > 0 && visible_lines[i - 1] + 1 != ln {
                                     pin_gap(ui, theme, &small_font, "…");
                                 }
                                 pin_line(ui, tab, theme, &small_font, ln);
@@ -443,22 +541,28 @@ fn render_content(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                             );
                             // Show last SHOW_LAST lines
                             let start_last = total - SHOW_LAST;
-                            for (i, &ln) in pin.line_numbers.iter().enumerate().skip(start_last) {
-                                if i > start_last && pin.line_numbers[i - 1] + 1 != ln {
+                            for (i, &ln) in visible_lines.iter().enumerate().skip(start_last) {
+                                if i > start_last && visible_lines[i - 1] + 1 != ln {
                                     pin_gap(ui, theme, &small_font, "…");
                                 }
                                 pin_line(ui, tab, theme, &small_font, ln);
                             }
                         }
                     });
+                if requested_pin == Some(pi) {
+                    ui.scroll_to_rect(card.response.rect, Some(egui::Align::Center));
+                    revealed_pin = Some(pi);
+                }
             }
         });
 
+    if revealed_pin == requested_pin {
+        tab.pending_pin_scroll = None;
+    }
+
     if let Some(pi) = remove_pin {
-        tab.pins.remove(pi);
-        if tab.pins.is_empty() {
-            tab.bottom_panel_open = false;
-        }
+        tab.selected_pin = Some(pi);
+        tab.remove_selected_pin_with_undo();
     }
 
     // Edit: reopen the pin creation window pre-filled for this pin. save_pin

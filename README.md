@@ -172,7 +172,7 @@ Configure one stdio server for standalone and GUI-assisted work:
 ```
 
 For standalone analysis, the agent calls `load_log` with an absolute path. For the live GUI,
-open a log, click **Start MCP**, copy the GUI session instruction, and give it to the agent. It
+open a log, open **AI Assistant**, start the connection, copy the session instruction, and give it to the agent. It
 calls `attach_gui_session` with the temporary ID; no MCP configuration changes. The GUI already
 provides the log, so no `log_id` is needed. A useful approach is to read user findings with
 `get_analysis`, explore log shape with summaries and targeted searches, narrow a hypothesis with

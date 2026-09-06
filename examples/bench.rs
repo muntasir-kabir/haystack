@@ -50,7 +50,7 @@ fn main() {
     let t3 = Instant::now();
     let resolved_density = tl.resolve_density_bins(&doc, full_start, full_end, 1_000);
     let resolved_lanes: Vec<_> = (0..matches.len())
-        .map(|lane| tl.resolve_filter_bins(lane, full_start, full_end, 125))
+        .map(|lane| tl.resolve_filter_bins(&doc, lane, full_start, full_end, 125))
         .collect();
     let resolve_t = t3.elapsed();
     assert_eq!(
@@ -60,7 +60,7 @@ fn main() {
             .sum::<u64>(),
         tl.density.iter().map(|&count| count as u64).sum::<u64>()
     );
-    for (expected, bins) in tl.filter_points.iter().zip(&resolved_lanes) {
+    for (expected, bins) in tl.filter_lines.iter().zip(&resolved_lanes) {
         assert_eq!(
             bins.iter().map(|bin| bin.count as u64).sum::<u64>(),
             expected.len() as u64

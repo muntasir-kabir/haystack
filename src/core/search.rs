@@ -1,12 +1,317 @@
 //! Multi-filter search powered by a single Aho-Corasick automaton:
-//! every filter is matched in one pass over the file (case-sensitive, exact phrase),
-//! so adding a 12th filter costs the same as adding the 1st.
+//! every filter is matched in one pass over the file.  The legacy helpers below
+//! keep the original case-sensitive phrase semantics; [`scan_advanced`] adds
+//! per-filter case, polarity, and regex controls for the GUI.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aho_corasick::AhoCorasick;
+use regex::{Regex, RegexBuilder};
 
 use crate::core::document::LogDocument;
+
+/// Hard caps keep user supplied regular expressions predictable. Rust's regex
+/// engine is linear-time (no catastrophic backtracking); these caps also bound
+/// compilation and DFA memory.
+pub const MAX_REGEX_PATTERN_BYTES: usize = 4_096;
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterPolarity {
+    #[default]
+    Include,
+    Exclude,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterJoin {
+    #[default]
+    Any,
+    All,
+}
+
+/// A filter as configured by the advanced filter UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterSpec {
+    pub text: String,
+    pub case_sensitive: bool,
+    pub polarity: FilterPolarity,
+    pub regex: bool,
+    /// When present, select mined Drain template IDs instead of matching text.
+    /// `text` remains the human-readable timeline lane label.
+    pub template_id: Option<u32>,
+}
+
+impl FilterSpec {
+    pub fn phrase(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            case_sensitive: true,
+            polarity: FilterPolarity::Include,
+            regex: false,
+            template_id: None,
+        }
+    }
+
+    /// Whether two visual filter specifications select the same physical
+    /// lines. Polarity is deliberately excluded because include/exclude only
+    /// changes lane composition after the scan.
+    pub fn has_same_matcher(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.case_sensitive == other.case_sensitive
+            && self.regex == other.regex
+            && self.template_id == other.template_id
+    }
+}
+
+/// Parse the Template ID spellings accepted by the UI. Keeping this
+/// beside the matcher prevents UI paths from disagreeing about what an ID is.
+pub fn parse_template_id(input: &str) -> Result<u32, String> {
+    let input = input.trim();
+    let digits = input
+        .strip_prefix("T{")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .or_else(|| input.strip_prefix('T'))
+        .unwrap_or(input);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Template ID must be digits, Tdigits, or T{digits}.".to_string());
+    }
+    digits
+        .parse::<u32>()
+        .map_err(|_| "Template ID is outside the supported range.".to_string())
+}
+
+/// Line counts made available to a UI while a long scan is running.
+#[derive(Default)]
+pub struct ScanProgress {
+    pub scanned_lines: std::sync::atomic::AtomicUsize,
+    pub total_lines: std::sync::atomic::AtomicUsize,
+}
+
+/// Validate a regex before it is accepted into a filter. The Rust regex engine
+/// deliberately has no backtracking, so cancellation between lines is the
+/// relevant scan-time safety boundary.
+pub fn validate_regex(pattern: &str, case_sensitive: bool) -> Result<(), String> {
+    if pattern.len() > MAX_REGEX_PATTERN_BYTES {
+        return Err(format!(
+            "regex is limited to {MAX_REGEX_PATTERN_BYTES} bytes"
+        ));
+    }
+    RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+        .build()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+/// Validate the parts of a matcher that are entered as text. Template IDs are
+/// already normalized into `FilterSpec::template_id` by the UI, while phrase
+/// matching needs no compilation-time validation.
+pub fn validate_matcher(spec: &FilterSpec) -> Result<(), String> {
+    if spec.template_id.is_some() || !spec.regex {
+        return Ok(());
+    }
+    validate_regex(spec.text.trim(), spec.case_sensitive)
+}
+
+enum CompiledFilter {
+    Phrase(AhoCorasick),
+    Regex(Regex),
+}
+
+impl CompiledFilter {
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Phrase(ac) => ac.is_match(line),
+            Self::Regex(regex) => regex.is_match(line),
+        }
+    }
+}
+
+/// Compiled per-filter matchers for paint-time highlighting. Unlike the older
+/// shared phrase automaton, this preserves each filter's case and regex mode.
+pub struct FilterHighlighter {
+    matchers: Vec<Option<CompiledFilter>>,
+}
+
+impl FilterHighlighter {
+    /// Return `(filter_index, byte_range)` spans for every matching filter.
+    pub fn spans(&self, text: &str) -> Vec<(usize, std::ops::Range<usize>)> {
+        let mut spans = Vec::new();
+        for (index, matcher) in self.matchers.iter().enumerate() {
+            match matcher {
+                Some(CompiledFilter::Phrase(ac)) => {
+                    spans.extend(ac.find_iter(text).map(|m| (index, m.start()..m.end())))
+                }
+                Some(CompiledFilter::Regex(regex)) => {
+                    spans.extend(regex.find_iter(text).map(|m| (index, m.start()..m.end())))
+                }
+                None => {}
+            }
+        }
+        spans
+    }
+}
+
+pub fn build_filter_highlighter(filters: &[FilterSpec]) -> Result<FilterHighlighter, String> {
+    Ok(FilterHighlighter {
+        matchers: filters
+            .iter()
+            .map(compile_filter)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn compile_filter(spec: &FilterSpec) -> Result<Option<CompiledFilter>, String> {
+    if spec.template_id.is_some() {
+        return Ok(None);
+    }
+    let text = spec.text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if spec.regex {
+        if text.len() > MAX_REGEX_PATTERN_BYTES {
+            return Err(format!(
+                "regex is limited to {MAX_REGEX_PATTERN_BYTES} bytes"
+            ));
+        }
+        return RegexBuilder::new(text)
+            .case_insensitive(!spec.case_sensitive)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+            .build()
+            .map(CompiledFilter::Regex)
+            .map(Some)
+            .map_err(|err| err.to_string());
+    }
+    AhoCorasick::builder()
+        .ascii_case_insensitive(!spec.case_sensitive)
+        .build([text])
+        .map(CompiledFilter::Phrase)
+        .map(Some)
+        .map_err(|err| err.to_string())
+}
+
+/// Scan each advanced filter independently. The result has one sorted line
+/// list per spec, including excluded filters so their timeline lane remains
+/// useful. Invalid regexes fail before the scan begins.
+pub fn scan_advanced(
+    doc: &LogDocument,
+    filters: &[FilterSpec],
+    cancel: &AtomicBool,
+    progress: Option<&ScanProgress>,
+) -> Result<Vec<Vec<u32>>, String> {
+    scan_advanced_range(doc, filters, 0..doc.total_lines(), cancel, progress)
+}
+
+/// Scan only a trim-relative line range. Live append uses this to extend
+/// completed lanes without revisiting the existing document prefix.
+pub fn scan_advanced_range(
+    doc: &LogDocument,
+    filters: &[FilterSpec],
+    range: std::ops::Range<usize>,
+    cancel: &AtomicBool,
+    progress: Option<&ScanProgress>,
+) -> Result<Vec<Vec<u32>>, String> {
+    let compiled: Vec<Option<CompiledFilter>> = filters
+        .iter()
+        .map(compile_filter)
+        .collect::<Result<_, _>>()?;
+    let mut out = vec![Vec::new(); filters.len()];
+    let start = range.start.min(doc.total_lines());
+    let end = range.end.min(doc.total_lines()).max(start);
+    let total = end - start;
+    if let Some(progress) = progress {
+        progress.total_lines.store(total, Ordering::Relaxed);
+        progress.scanned_lines.store(0, Ordering::Relaxed);
+    }
+    for (processed, line_index) in (start..end).enumerate() {
+        if processed % 1_024 == 0 {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(out);
+            }
+            if let Some(progress) = progress {
+                progress.scanned_lines.store(processed, Ordering::Relaxed);
+            }
+        }
+        let line = doc.line(line_index);
+        for (filter_index, matcher) in compiled.iter().enumerate() {
+            let template_matches = filters[filter_index]
+                .template_id
+                .is_some_and(|template_id| doc.template_at(line_index) == template_id);
+            if template_matches
+                || matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_match(line.as_ref()))
+            {
+                out[filter_index].push(line_index as u32);
+            }
+        }
+    }
+    if let Some(progress) = progress {
+        progress.scanned_lines.store(total, Ordering::Relaxed);
+    }
+    Ok(out)
+}
+
+/// Combine already-scanned filter lanes into a visible set. Include filters
+/// use `join`; every exclude filter is subtracted afterwards. Empty include
+/// sets start from all lines, making exclusion-only filters useful.
+pub fn combine_filter_matches(
+    line_count: usize,
+    filters: &[FilterSpec],
+    matches: &[Vec<u32>],
+    join: FilterJoin,
+) -> Vec<usize> {
+    let mut visible = vec![false; line_count];
+    let includes: Vec<usize> = filters
+        .iter()
+        .enumerate()
+        .filter_map(|(i, filter)| (filter.polarity == FilterPolarity::Include).then_some(i))
+        .collect();
+    if includes.is_empty() {
+        visible.fill(true);
+    } else if join == FilterJoin::All {
+        visible.fill(true);
+        for &i in &includes {
+            let mut lane = vec![false; line_count];
+            for &line in matches.get(i).into_iter().flatten() {
+                if (line as usize) < line_count {
+                    lane[line as usize] = true;
+                }
+            }
+            for (result, hit) in visible.iter_mut().zip(lane) {
+                *result &= hit;
+            }
+        }
+    } else {
+        for &i in &includes {
+            for &line in matches.get(i).into_iter().flatten() {
+                if (line as usize) < line_count {
+                    visible[line as usize] = true;
+                }
+            }
+        }
+    }
+    for (i, filter) in filters.iter().enumerate() {
+        if filter.polarity == FilterPolarity::Exclude {
+            for &line in matches.get(i).into_iter().flatten() {
+                if (line as usize) < line_count {
+                    visible[line as usize] = false;
+                }
+            }
+        }
+    }
+    visible
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, yes)| yes.then_some(i))
+        .collect()
+}
 
 /// Build the shared automaton for a filter set (also used by the GUI for
 /// per-line highlighting of visible rows).
@@ -154,6 +459,95 @@ pub fn find_lines(
     out
 }
 
+/// Compact GUI variant of [`find_lines`]. Both the optional filtered subset
+/// and returned matches stay 32-bit throughout the background scan.
+pub fn find_lines_u32(
+    doc: &LogDocument,
+    subset: Option<&[u32]>,
+    needle: &str,
+    case_insensitive: bool,
+    cancel: &AtomicBool,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Some(ac) = build_find_automaton(needle, case_insensitive) else {
+        return out;
+    };
+    let n = doc.total_lines();
+    match subset {
+        Some(lines) => {
+            for (step, &line) in lines.iter().enumerate() {
+                if step % 16_384 == 0 && cancel.load(Ordering::Relaxed) {
+                    return out;
+                }
+                let index = line as usize;
+                if index < n && ac.is_match(doc.line(index).as_ref()) {
+                    out.push(line);
+                }
+            }
+        }
+        None => {
+            for index in 0..n {
+                if index % 16_384 == 0 && cancel.load(Ordering::Relaxed) {
+                    return out;
+                }
+                if ac.is_match(doc.line(index).as_ref()) {
+                    out.push(index as u32);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Search one advanced matcher over a whole document or its current visible
+/// subset. This deliberately uses the same compiler and Template ID branch as
+/// timeline filters, so a matcher can move between the two UIs unchanged.
+pub fn find_advanced_u32(
+    doc: &LogDocument,
+    subset: Option<&[u32]>,
+    spec: &FilterSpec,
+    cancel: &AtomicBool,
+) -> Result<Vec<u32>, String> {
+    validate_matcher(spec)?;
+    let matcher = compile_filter(spec)?;
+    let mut out = Vec::new();
+    let n = doc.total_lines();
+    let mut visit = |line: u32, step: usize| {
+        if step % 16_384 == 0 && cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let index = line as usize;
+        if index < n
+            && (spec
+                .template_id
+                .is_some_and(|id| doc.template_at(index) == id)
+                || matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_match(doc.line(index).as_ref())))
+        {
+            out.push(line);
+        }
+        true
+    };
+    match subset {
+        Some(lines) => {
+            for (step, &line) in lines.iter().enumerate() {
+                if !visit(line, step) {
+                    break;
+                }
+            }
+        }
+        None => {
+            for index in 0..n {
+                if !visit(index as u32, index) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Count matches whose (forward-filled) timestamp falls inside [after, before].
 pub fn count_in_window(
     doc: &LogDocument,
@@ -229,6 +623,165 @@ mod tests {
         let m = scan_document(&doc, &filters, &AtomicBool::new(false));
         assert_eq!(m[0], vec![0]);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn advanced_filters_support_case_polarity_and_join() {
+        let (doc, path) = doc_with("ERROR api timeout\nerror api ok\nINFO api timeout\n");
+        let filters = vec![
+            FilterSpec {
+                text: "error".into(),
+                case_sensitive: false,
+                polarity: FilterPolarity::Include,
+                regex: false,
+                template_id: None,
+            },
+            FilterSpec {
+                text: "timeout".into(),
+                case_sensitive: true,
+                polarity: FilterPolarity::Include,
+                regex: false,
+                template_id: None,
+            },
+            FilterSpec {
+                text: "INFO".into(),
+                case_sensitive: true,
+                polarity: FilterPolarity::Exclude,
+                regex: false,
+                template_id: None,
+            },
+        ];
+        let matches = scan_advanced(&doc, &filters, &AtomicBool::new(false), None).unwrap();
+        assert_eq!(matches, vec![vec![0, 1], vec![0, 2], vec![2]]);
+        assert_eq!(
+            combine_filter_matches(3, &filters, &matches, FilterJoin::Any),
+            vec![0, 1]
+        );
+        assert_eq!(
+            combine_filter_matches(3, &filters, &matches, FilterJoin::All),
+            vec![0]
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn advanced_regex_is_case_configurable_and_bounded() {
+        let (doc, path) = doc_with("WARN 42\nwarn 7\nINFO 8\n");
+        let filters = vec![FilterSpec {
+            text: r"warn \d+".into(),
+            case_sensitive: false,
+            polarity: FilterPolarity::Include,
+            regex: true,
+            template_id: None,
+        }];
+        let matches = scan_advanced(&doc, &filters, &AtomicBool::new(false), None).unwrap();
+        assert_eq!(matches, vec![vec![0, 1]]);
+        assert!(validate_regex("(", true).is_err());
+        assert!(validate_regex(&"x".repeat(MAX_REGEX_PATTERN_BYTES + 1), true).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn exclusion_only_starts_with_the_whole_document() {
+        let filters = vec![FilterSpec {
+            text: "skip".into(),
+            case_sensitive: true,
+            polarity: FilterPolarity::Exclude,
+            regex: false,
+            template_id: None,
+        }];
+        assert_eq!(
+            combine_filter_matches(4, &filters, &[vec![1, 3]], FilterJoin::Any),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn advanced_scan_reports_completed_progress() {
+        let (doc, path) = doc_with("one\ntwo\nthree\n");
+        let progress = ScanProgress::default();
+        let filters = vec![FilterSpec::phrase("two")];
+        let matches =
+            scan_advanced(&doc, &filters, &AtomicBool::new(false), Some(&progress)).unwrap();
+        assert_eq!(matches, vec![vec![1]]);
+        assert_eq!(progress.total_lines.load(Ordering::Relaxed), 3);
+        assert_eq!(progress.scanned_lines.load(Ordering::Relaxed), 3);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn advanced_range_scan_returns_original_line_ids() {
+        let (doc, path) = doc_with("hit old\nmiss\nhit new\nnew hit\n");
+        let progress = ScanProgress::default();
+        let filters = vec![FilterSpec::phrase("hit")];
+        let matches = scan_advanced_range(
+            &doc,
+            &filters,
+            2..doc.total_lines(),
+            &AtomicBool::new(false),
+            Some(&progress),
+        )
+        .unwrap();
+        assert_eq!(matches, vec![vec![2, 3]]);
+        assert_eq!(progress.total_lines.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.scanned_lines.load(Ordering::Relaxed), 2);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn advanced_highlighter_finds_regex_and_case_folded_spans() {
+        let filters = vec![
+            FilterSpec {
+                text: r"err(or)?".into(),
+                case_sensitive: false,
+                polarity: FilterPolarity::Include,
+                regex: true,
+                template_id: None,
+            },
+            FilterSpec {
+                text: "disk".into(),
+                case_sensitive: false,
+                polarity: FilterPolarity::Include,
+                regex: false,
+                template_id: None,
+            },
+        ];
+        let highlighter = build_filter_highlighter(&filters).unwrap();
+        assert_eq!(
+            highlighter.spans("ERROR DISK failure"),
+            vec![(0, 0..5), (1, 6..10)]
+        );
+    }
+
+    #[test]
+    fn template_id_filters_match_mined_templates_not_text() {
+        let (doc, path) =
+            doc_with("INFO connected user=1\nINFO connected user=2\nERROR disk full\n");
+        let connected = doc.template_at(0);
+        assert_eq!(connected, doc.template_at(1));
+        assert_ne!(connected, doc.template_at(2));
+        let filters = vec![FilterSpec {
+            text: format!("T{{{connected}}}"),
+            case_sensitive: true,
+            polarity: FilterPolarity::Include,
+            regex: false,
+            template_id: Some(connected),
+        }];
+        assert_eq!(
+            scan_advanced(&doc, &filters, &AtomicBool::new(false), None).unwrap(),
+            vec![vec![0, 1]],
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn template_id_input_accepts_the_forms_shown_by_the_ui() {
+        assert_eq!(parse_template_id("42"), Ok(42));
+        assert_eq!(parse_template_id("T42"), Ok(42));
+        assert_eq!(parse_template_id(" T{42} "), Ok(42));
+        assert!(parse_template_id("T").is_err());
+        assert!(parse_template_id("T{4x}").is_err());
+        assert!(parse_template_id("T{4294967296}").is_err());
     }
 
     #[test]
@@ -315,6 +868,75 @@ mod tests {
             find_lines(&doc, Some(&stale), "err", true, &cancel),
             vec![0]
         );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn compact_find_matches_platform_sized_results() {
+        let (doc, path) = doc_with(
+            "2026-07-19T10:00:00.000Z err a\n\
+             2026-07-19T10:00:01.000Z ok b\n\
+             2026-07-19T10:00:02.000Z ERR c\n",
+        );
+        let cancel = AtomicBool::new(false);
+        let subset_usize = [0usize, 2];
+        let subset_u32 = [0u32, 2];
+        let expected = find_lines(&doc, Some(&subset_usize), "err", true, &cancel);
+        let compact = find_lines_u32(&doc, Some(&subset_u32), "err", true, &cancel);
+        assert_eq!(
+            compact
+                .iter()
+                .map(|&line| line as usize)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn advanced_find_uses_the_same_modes_as_filter_scans() {
+        let (doc, path) = doc_with(
+            "INFO Error code=42\n\
+             INFO error code=7\n\
+             WARN other\n",
+        );
+        let template_id = doc.template_at(0);
+        let specs = [
+            FilterSpec {
+                text: "Error".into(),
+                case_sensitive: true,
+                polarity: FilterPolarity::Include,
+                regex: false,
+                template_id: None,
+            },
+            FilterSpec {
+                text: "error".into(),
+                case_sensitive: false,
+                polarity: FilterPolarity::Include,
+                regex: false,
+                template_id: None,
+            },
+            FilterSpec {
+                text: r"code=\d+".into(),
+                case_sensitive: true,
+                polarity: FilterPolarity::Include,
+                regex: true,
+                template_id: None,
+            },
+            FilterSpec {
+                text: format!("T{{{template_id}}}"),
+                case_sensitive: true,
+                polarity: FilterPolarity::Include,
+                regex: false,
+                template_id: Some(template_id),
+            },
+        ];
+        let cancel = AtomicBool::new(false);
+        for spec in &specs {
+            let filter_matches = scan_advanced(&doc, &[spec.clone()], &cancel, None).unwrap();
+            let search_matches = find_advanced_u32(&doc, None, spec, &cancel).unwrap();
+            assert_eq!(search_matches, filter_matches[0]);
+        }
         std::fs::remove_file(path).ok();
     }
 

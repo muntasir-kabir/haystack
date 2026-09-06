@@ -97,8 +97,6 @@ pub struct Theme {
     pub selection_line: Color32,
     /// Timeline occurrence hover border.
     pub occurrence_hover: Color32,
-    /// MCP status indicator grey (stopped).
-    pub status_grey: Color32,
     /// MCP URL text colour.
     pub url_text: Color32,
     /// Empty state / placeholder text.
@@ -121,8 +119,6 @@ pub struct Theme {
     pub keyword_highlight_bg: Color32,
     /// Underline / rail color for embedded structured data.
     pub embedded_data: Color32,
-    /// Background for compact structured-data badges.
-    pub embedded_data_bg: Color32,
     /// Quiet underline used for explicit source timestamps.
     pub timestamp: Color32,
 }
@@ -143,14 +139,13 @@ impl Theme {
             gutter_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 12),
             log_text: Color32::from_gray(215),
             axis: Color32::from_gray(130),
-            hint: Color32::from_gray(70),
+            hint: Color32::from_gray(135),
             overlay_bg: Color32::from_rgba_unmultiplied(20, 60, 120, 110),
             brush_fill: Color32::from_rgba_unmultiplied(100, 160, 240, 40),
             brush_stroke: Color32::from_rgb(120, 180, 255),
             minimap_zoom: Color32::from_rgb(100, 160, 240),
             selection_line: Color32::WHITE,
             occurrence_hover: Color32::WHITE,
-            status_grey: Color32::from_gray(128),
             url_text: Color32::LIGHT_BLUE,
             placeholder: Color32::GRAY,
             viewport_shadow: Color32::from_rgba_unmultiplied(100, 160, 240, 30),
@@ -162,7 +157,6 @@ impl Theme {
             search_highlight_bg: Color32::from_rgba_unmultiplied(255, 180, 50, 90),
             keyword_highlight_bg: Color32::from_rgba_unmultiplied(35, 210, 220, 70),
             embedded_data: Color32::from_rgb(166, 227, 161),
-            embedded_data_bg: Color32::from_rgba_unmultiplied(70, 140, 90, 80),
             timestamp: Color32::from_rgb(137, 180, 250),
         }
     }
@@ -182,14 +176,13 @@ impl Theme {
             gutter_bg: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
             log_text: Color32::from_gray(30),
             axis: Color32::from_gray(100),
-            hint: Color32::from_gray(140),
+            hint: Color32::from_gray(105),
             overlay_bg: Color32::from_rgba_unmultiplied(20, 60, 120, 110),
             brush_fill: Color32::from_rgba_unmultiplied(100, 160, 240, 40),
             brush_stroke: Color32::from_rgb(60, 120, 200),
             minimap_zoom: Color32::from_rgb(60, 120, 200),
             selection_line: Color32::from_rgb(0, 0, 0),
             occurrence_hover: Color32::from_rgb(0, 0, 0),
-            status_grey: Color32::from_gray(160),
             url_text: Color32::from_rgb(0, 80, 180),
             placeholder: Color32::GRAY,
             viewport_shadow: Color32::from_rgba_unmultiplied(80, 130, 200, 60),
@@ -201,7 +194,6 @@ impl Theme {
             search_highlight_bg: Color32::from_rgba_unmultiplied(255, 200, 0, 110),
             keyword_highlight_bg: Color32::from_rgba_unmultiplied(15, 155, 175, 60),
             embedded_data: Color32::from_rgb(25, 125, 55),
-            embedded_data_bg: Color32::from_rgba_unmultiplied(80, 170, 100, 55),
             timestamp: Color32::from_rgb(55, 95, 170),
         }
     }

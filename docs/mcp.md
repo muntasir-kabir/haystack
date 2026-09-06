@@ -117,7 +117,7 @@ Suggested investigation approach:
 
 1. `session_info`
 2. In GUI-attached mode, understand the user's question and Pin-tab findings with `get_analysis`
-3. Explore the log shape with `summarize_log(with_filtered_log=false)` and targeted `find_occurrences`
+3. Explore the log shape with `summarize_log(with_filtered_log=false)` and targeted `search`
 4. Use filters (`filters_add`), anomalies, histograms, templates, sequences, and `trim` when they help test a hypothesis and narrow the scope
 5. Request only bounded `raw_log` ranges when exact evidence is needed; add useful evidence-backed root-cause conclusions with `add_analysis`
 
@@ -131,20 +131,67 @@ All tool results include `structuredContent` plus JSON text fallback. Tool error
 | `attach_gui_session` / `detach_gui_session` | stdio lifecycle | Attach with a temporary GUI ID or return to standalone mode |
 | `load_log` | standalone | Index an absolute file path and return `log_id` plus stats |
 | `list_logs` / `close_log` | standalone | Inspect or unload standalone documents |
-| `filters_get` / `filters_add` / `filters_remove` | both | Read or change the case-sensitive keyword filter set (maximum 20) |
+| `filters_get` / `filters_add` / `filters_remove` | both | Read or change text/regex/template-ID filters, case mode, exclusion, and Any/All composition (maximum 20) |
 | `get_analysis` / `add_analysis` | GUI-attached | Read or add user-visible Pin-tab analysis cards (`{text, lines}`); empty `lines` creates a text-only top card |
 | `summarize_log` | both | Compact orientation, templates, errors, gaps, densest minute, and budget estimates |
 | `get_timeline_histogram` | both | Small time/line distribution for a log, keyword, or template |
 | `get_template_anomalies` | both | Rare, late-first-seen, and bursty templates |
 | `get_template` / `get_template_samples` | both | Resolve template IDs and fetch representative examples |
-| `find_occurrences` | both | Paginated `[one_based_line_number, epoch_ms\|null]` matches; supports time bounds, filter scope, and ASCII case mode |
+| `search` | both | Text, regex or template-ID search; paginated `[one_based_line_number, epoch_ms\|null]` matches with scope and GUI Find synchronization |
 | `log_sequence` | both | Dense or collapsed template sequence over a line/time range |
 | `raw_log` | both | Exact bounded raw lines with truncation metadata |
 | `trim` | GUI-attached | Focus or reset the GUI document window |
 
-Analysis tools accept `with_filtered_log`, which defaults to `true`. This means the union of keyword filters; the GUI's **Everything Else** lane is excluded. With no filters, pass `with_filtered_log: false` or add one with `filters_add`.
+`search` defaults to `with_filtered_log:false`, searching the whole current document, including its trim. Other analysis tools keep their `with_filtered_log:true` default. Filtered scope uses the filters' case/regex/template matchers, combines includes with Any/All, then subtracts exclusions. Exclusion-only sets start from all lines. Lane visibility and **Everything Else** do not participate. With no filters, filtered requests return a no-log hint; pass `with_filtered_log:false` or add a filter.
 
-Line bounds are 1-based. `find_occurrences` accepts `offset`, `max_results`, `with_filtered_log`, and `case_sensitive` (default `true`; `false` folds ASCII case), returning `{occurrences, offset, returned, total_matches, has_more}` where every occurrence is `[line, epoch_ms|null]`. Time inputs accept RFC 3339, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD`, or epoch seconds/milliseconds. Respect `returned`, `total_matches`, and `truncated`; narrow the range instead of requesting large raw dumps.
+Line bounds are 1-based and relative to the current trim. Time inputs accept RFC 3339, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD`, or epoch seconds/milliseconds as strings. Respect pagination and truncation; narrow the range instead of requesting large raw dumps.
+
+### Unified search and filters
+
+```json
+{"query":"error","case_sensitive":false}
+{"query":"timeout|retry [0-9]+","regex":true,"case_sensitive":false}
+{"template_id":42,"with_filtered_log":true,"max_results":50,"offset":0}
+```
+
+These are `search` arguments; add `log_id` in standalone mode. Provide either
+`query` or `template_id`. Text defaults to case-sensitive; insensitive text uses
+ASCII folding, while regex uses Rust regex Unicode case folding. Regex patterns
+are capped at 4096 bytes and do not support lookaround or backreferences.
+
+`search` returns `{matches, total_matches, returned, offset, has_more, next_offset,
+scope, ui_sync}`. `matches` contains `[line, epoch_ms|null]` tuples. `max_results`
+must be 1–2000. `after`/`before` are inclusive; a time-bounded search excludes
+unknown timestamps. Reuse `next_offset` only while the document and filters remain
+unchanged. Use `raw_log` to retrieve exact text evidence.
+
+GUI-attached search defaults to `sync_ui:true`: it queues the same scoped match
+list into Find, updates its mode/highlighting, reveals matches hidden by lane
+visibility, and navigates to the first result in the requested page. `ui_sync`
+reports `queued` or `disabled`, not a paint acknowledgement. Set `sync_ui:false`
+for exploratory calls. Document replacements discard pending results. Later GUI
+filter/view/query edits restore normal GUI search behavior; MCP time bounds are
+not a persistent Find setting.
+
+`filters_add` uses the same matcher fields, with `filter_text` instead of `query`:
+
+```json
+{"filter_text":"error","case_sensitive":false}
+{"filter_text":"health(check)?","regex":true,"exclude":true}
+{"template_id":42,"join":"all"}
+```
+
+`join` changes composition for the entire set (`any`/`all`); omitting it preserves
+the current setting. `filters_get` returns each filter's `id`, `filter_text`,
+`case_sensitive`, `regex`, `template_id`, and `exclude`, plus the set's `join`.
+IDs remain positions and renumber after removal. Exact duplicate specs are rejected.
+
+Compatibility: `find_occurrences` remains callable with `keyword` and its original
+`occurrences` response and filtered default. It is no longer advertised in discovery
+and does not synchronize GUI Find. New clients should use `search`.
+
+See [the agent usability review](mcp-review.md) for implemented improvements and
+prioritized next work.
 
 ## Security and lifecycle
 

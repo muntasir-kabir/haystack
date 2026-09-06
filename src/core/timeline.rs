@@ -3,8 +3,25 @@
 //! paint in O(buckets) instead of O(lines).
 
 use crate::core::document::LogDocument;
+use std::sync::Arc;
 
 pub const DEFAULT_BUCKETS: usize = 2048;
+
+trait MatchLane<T> {
+    fn as_match_slice(&self) -> &[T];
+}
+
+impl<T> MatchLane<T> for Vec<T> {
+    fn as_match_slice(&self) -> &[T] {
+        self
+    }
+}
+
+impl<T> MatchLane<T> for Arc<Vec<T>> {
+    fn as_match_slice(&self) -> &[T] {
+        self
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimelineDomain {
@@ -22,17 +39,17 @@ pub struct Timeline {
     pub density: Vec<u32>,
     /// Per-filter matches per bucket.
     pub filter_buckets: Vec<Vec<u32>>,
-    /// Per-filter `(line_idx, x-value)` points, sorted by x-value then line.
-    /// x-value is epoch ms in Time domain, line index in Sequence domain.
-    pub filter_points: Vec<Vec<(u32, i64)>>,
+    /// Per-filter line IDs, sorted by their document x-value then line. The
+    /// x-value is read from `LogDocument` during resolution instead of being
+    /// duplicated for every hit.
+    pub filter_lines: Vec<Vec<u32>>,
     /// True when the document's valid timestamps are non-decreasing in line
     /// order. The adaptive resolver can then binary-search the document's
     /// existing timestamp index without duplicating it.
     pub timestamps_monotonic: bool,
-    /// Sorted `(line_idx, x_value)` fallback used only for timestamped logs
-    /// whose timestamps move backwards. Normal chronological logs leave this
-    /// empty, avoiding another per-line timestamp allocation.
-    pub out_of_order_density_points: Vec<(u32, i64)>,
+    /// X-sorted line-ID fallback used only for timestamped logs whose
+    /// timestamps move backwards. Timestamps remain owned by the document.
+    pub out_of_order_density_lines: Arc<Vec<u32>>,
     pub max_density: u32,
     sequence_end: i64,
 }
@@ -60,9 +77,20 @@ impl Timeline {
         Self::build_from_matches(doc, filter_matches, n_buckets)
     }
 
-    fn build_from_matches<T>(doc: &LogDocument, filter_matches: &[Vec<T>], n_buckets: usize) -> Self
+    /// Build from independently shared GUI match lanes. Retained filters can
+    /// then survive a filter-set edit without copying their hit vectors.
+    pub fn build_shared_u32(
+        doc: &LogDocument,
+        filter_matches: &[Arc<Vec<u32>>],
+        n_buckets: usize,
+    ) -> Self {
+        Self::build_from_matches(doc, filter_matches, n_buckets)
+    }
+
+    fn build_from_matches<T, M>(doc: &LogDocument, filter_matches: &[M], n_buckets: usize) -> Self
     where
         T: Copy + TryInto<usize>,
+        M: MatchLane<T>,
     {
         let n_lines = doc.total_lines();
         let domain = match doc.time_range {
@@ -113,10 +141,11 @@ impl Timeline {
         let max_density = density.iter().copied().max().unwrap_or(0);
 
         let mut filter_buckets = Vec::with_capacity(filter_matches.len());
-        let mut filter_points = Vec::with_capacity(filter_matches.len());
+        let mut filter_lines = Vec::with_capacity(filter_matches.len());
         for matches in filter_matches {
             let mut kb = vec![0u32; nb];
-            let mut pts = Vec::with_capacity(matches.len());
+            let matches = matches.as_match_slice();
+            let mut lines = Vec::with_capacity(matches.len());
             for &line in matches {
                 let Ok(ln) = line.try_into() else {
                     continue;
@@ -126,25 +155,28 @@ impl Timeline {
                     continue;
                 }
                 kb[bucket_of(v)] += 1;
-                pts.push((ln as u32, v));
+                lines.push(ln as u32);
             }
             // Match lists are line-ordered for navigation, but timeline range
             // queries must be x-ordered (timestamps may move backwards).
-            pts.sort_unstable_by_key(|&(line, x)| (x, line));
+            if !timestamps_monotonic {
+                lines.sort_unstable_by_key(|&line| (x_of_line(line as usize), line));
+            }
             filter_buckets.push(kb);
-            filter_points.push(pts);
+            filter_lines.push(lines);
         }
 
-        let mut out_of_order_density_points = Vec::new();
+        let mut out_of_order_density_lines = Vec::new();
         if matches!(domain, TimelineDomain::Time { .. }) && !timestamps_monotonic {
-            out_of_order_density_points.reserve(n_lines);
+            out_of_order_density_lines.reserve(n_lines);
             for line in 0..n_lines {
                 let x = doc.ts_at(line);
                 if x >= 0 {
-                    out_of_order_density_points.push((line as u32, x));
+                    out_of_order_density_lines.push(line as u32);
                 }
             }
-            out_of_order_density_points.sort_unstable_by_key(|&(line, x)| (x, line));
+            out_of_order_density_lines
+                .sort_unstable_by_key(|&line| (doc.ts_at(line as usize), line));
         }
 
         Timeline {
@@ -152,12 +184,142 @@ impl Timeline {
             n_buckets: nb,
             density,
             filter_buckets,
-            filter_points,
+            filter_lines,
             timestamps_monotonic,
-            out_of_order_density_points,
+            out_of_order_density_lines: Arc::new(out_of_order_density_lines),
             max_density,
             sequence_end: n_lines.saturating_sub(1) as i64,
         }
+    }
+
+    /// Cheaply retain the document-wide density indexes while discarding old
+    /// filter lanes. This lets filter edits rebuild only per-hit state.
+    pub fn base_without_filters(&self) -> Self {
+        Self {
+            domain: self.domain,
+            n_buckets: self.n_buckets,
+            density: self.density.clone(),
+            filter_buckets: Vec::new(),
+            filter_lines: Vec::new(),
+            timestamps_monotonic: self.timestamps_monotonic,
+            out_of_order_density_lines: Arc::clone(&self.out_of_order_density_lines),
+            max_density: self.max_density,
+            sequence_end: self.sequence_end,
+        }
+    }
+
+    /// Attach a new set of filter lanes to an existing document-wide base.
+    /// Work is proportional to retained hits, not total document lines.
+    pub fn with_shared_filter_matches(
+        mut self,
+        doc: &LogDocument,
+        filter_matches: &[Arc<Vec<u32>>],
+    ) -> Self {
+        let total_lines = doc.total_lines();
+        self.filter_buckets.clear();
+        self.filter_lines.clear();
+        self.filter_buckets.reserve(filter_matches.len());
+        self.filter_lines.reserve(filter_matches.len());
+        for matches in filter_matches {
+            let mut buckets = vec![0u32; self.n_buckets];
+            let mut lines = Vec::with_capacity(matches.len());
+            for &line in matches.iter() {
+                let line_index = line as usize;
+                if line_index >= total_lines {
+                    continue;
+                }
+                let x = self.x_of_line(doc, line);
+                if x < 0 {
+                    continue;
+                }
+                buckets[self.bucket_for(x, total_lines)] += 1;
+                lines.push(line);
+            }
+            if !self.timestamps_monotonic {
+                lines.sort_unstable_by_key(|&line| (self.x_of_line(doc, line), line));
+            }
+            self.filter_buckets.push(buckets);
+            self.filter_lines.push(lines);
+        }
+        self
+    }
+
+    /// Extend a chronological or sequence-domain timeline after a live
+    /// append. The coarse whole-file histogram is reprojected from its fixed
+    /// bucket summary and only appended document lines are read; adaptive
+    /// viewport resolution remains exact because it reads document indexes.
+    /// Returns `None` for a domain change or newly out-of-order timestamps,
+    /// where a full rebuild is required for correctness.
+    pub fn extend_append(
+        mut self,
+        doc: &LogDocument,
+        old_line_count: usize,
+        filter_matches: &[Arc<Vec<u32>>],
+    ) -> Option<Self> {
+        let new_line_count = doc.total_lines();
+        if old_line_count > new_line_count || !self.timestamps_monotonic {
+            return None;
+        }
+        let new_domain = match doc.time_range {
+            Some((start_ms, end_ms)) if end_ms > start_ms => {
+                TimelineDomain::Time { start_ms, end_ms }
+            }
+            _ => TimelineDomain::Sequence,
+        };
+        if !matches!(
+            (self.domain, new_domain),
+            (TimelineDomain::Time { .. }, TimelineDomain::Time { .. })
+                | (TimelineDomain::Sequence, TimelineDomain::Sequence)
+        ) {
+            return None;
+        }
+        if matches!(new_domain, TimelineDomain::Time { .. }) && old_line_count > 0 {
+            let mut previous = doc.ts_at(old_line_count - 1);
+            for line in old_line_count..new_line_count {
+                let timestamp = doc.ts_at(line);
+                if timestamp >= 0 && previous >= 0 && timestamp < previous {
+                    return None;
+                }
+                if timestamp >= 0 {
+                    previous = timestamp;
+                }
+            }
+        }
+
+        let old_density = std::mem::take(&mut self.density);
+        let old_domain = self.domain;
+        self.domain = new_domain;
+        self.sequence_end = new_line_count.saturating_sub(1) as i64;
+        self.density = vec![0; self.n_buckets];
+        for (bucket, count) in old_density.into_iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let old_center = match old_domain {
+                TimelineDomain::Time { start_ms, end_ms } => {
+                    let span = (end_ms - start_ms).max(1);
+                    start_ms + span * bucket as i64 / (self.n_buckets as i64 - 1).max(1)
+                }
+                TimelineDomain::Sequence => {
+                    old_line_count.saturating_sub(1) as i64 * bucket as i64
+                        / (self.n_buckets as i64 - 1).max(1)
+                }
+            };
+            let target = self.bucket_for(old_center, new_line_count);
+            self.density[target] = self.density[target].saturating_add(count);
+        }
+        for line in old_line_count..new_line_count {
+            let x = match self.domain {
+                TimelineDomain::Time { .. } => doc.ts_at(line),
+                TimelineDomain::Sequence => line as i64,
+            };
+            if x >= 0 {
+                let bucket = self.bucket_for(x, new_line_count);
+                self.density[bucket] = self.density[bucket].saturating_add(1);
+            }
+        }
+        self.max_density = self.density.iter().copied().max().unwrap_or(0);
+        Some(self.with_shared_filter_matches(doc, filter_matches))
     }
 
     /// X-value at the center of a bucket (epoch ms or line index).
@@ -187,18 +349,27 @@ impl Timeline {
         }
     }
 
+    #[inline]
+    fn x_of_line(&self, doc: &LogDocument, line: u32) -> i64 {
+        match self.domain {
+            TimelineDomain::Time { .. } => doc.ts_at(line as usize),
+            TimelineDomain::Sequence => line as i64,
+        }
+    }
+
     /// Line index of the filter match nearest to x-value `v` (any filter).
     /// Uses binary search — O(kw · log n) instead of O(total matches).
-    pub fn nearest_match_line(&self, v: i64) -> Option<usize> {
+    pub fn nearest_match_line(&self, doc: &LogDocument, v: i64) -> Option<usize> {
         let mut best: Option<(u32, i64)> = None;
-        for pts in &self.filter_points {
-            if pts.is_empty() {
+        for lines in &self.filter_lines {
+            if lines.is_empty() {
                 continue;
             }
-            let idx = pts.partition_point(|&(_, x)| x < v);
+            let idx = lines.partition_point(|&line| self.x_of_line(doc, line) < v);
             // Check the point at the insertion position (first >= v).
-            if idx < pts.len() {
-                let (line, x) = pts[idx];
+            if idx < lines.len() {
+                let line = lines[idx];
+                let x = self.x_of_line(doc, line);
                 let d = (x - v).abs();
                 if best.is_none_or(|(_, bd)| d < bd) {
                     best = Some((line, d));
@@ -206,7 +377,8 @@ impl Timeline {
             }
             // Check the point just before the insertion position (last < v).
             if idx > 0 {
-                let (line, x) = pts[idx - 1];
+                let line = lines[idx - 1];
+                let x = self.x_of_line(doc, line);
                 let d = (x - v).abs();
                 if best.is_none_or(|(_, bd)| d < bd) {
                     best = Some((line, d));
@@ -216,24 +388,35 @@ impl Timeline {
         best.map(|(l, _)| l as usize)
     }
 
-    /// Returns filter point slices that fall within [x_min, x_max].
-    /// Points are `(line_index, x_value)`. Uses binary search per filter lane.
-    pub fn points_in_range(&self, ki: usize, x_min: i64, x_max: i64) -> Option<&[(u32, i64)]> {
-        let pts = self.filter_points.get(ki)?;
-        if pts.is_empty() {
+    /// Returns x-sorted filter line IDs that fall within [x_min, x_max].
+    pub fn lines_in_range(
+        &self,
+        doc: &LogDocument,
+        ki: usize,
+        x_min: i64,
+        x_max: i64,
+    ) -> Option<&[u32]> {
+        let lines = self.filter_lines.get(ki)?;
+        if lines.is_empty() {
             return None;
         }
-        let lo = pts.partition_point(|&(_, x)| x < x_min);
-        let hi = pts.partition_point(|&(_, x)| x <= x_max);
+        let lo = lines.partition_point(|&line| self.x_of_line(doc, line) < x_min);
+        let hi = lines.partition_point(|&line| self.x_of_line(doc, line) <= x_max);
         if lo >= hi {
             return None;
         }
-        Some(&pts[lo..hi])
+        Some(&lines[lo..hi])
     }
 
     /// Number of filter points in [x_min, x_max] (for threshold checks).
-    pub fn point_count_in_range(&self, ki: usize, x_min: i64, x_max: i64) -> usize {
-        self.points_in_range(ki, x_min, x_max)
+    pub fn point_count_in_range(
+        &self,
+        doc: &LogDocument,
+        ki: usize,
+        x_min: i64,
+        x_max: i64,
+    ) -> usize {
+        self.lines_in_range(doc, ki, x_min, x_max)
             .map(|s| s.len())
             .unwrap_or(0)
     }
@@ -273,13 +456,14 @@ impl Timeline {
     /// Exact per-filter re-resolution for an inclusive viewport.
     pub fn resolve_filter_bins(
         &self,
+        doc: &LogDocument,
         ki: usize,
         x_min: i64,
         x_max: i64,
         columns: usize,
     ) -> Vec<ResolvedFilterBin> {
         let columns = columns.max(1);
-        let Some(points) = self.filter_points.get(ki) else {
+        let Some(lines) = self.filter_lines.get(ki) else {
             return vec![ResolvedFilterBin::default(); columns];
         };
         let start = x_min.min(x_max);
@@ -289,20 +473,22 @@ impl Timeline {
             let mut bins = vec![ResolvedFilterBin::default(); columns];
             for offset in 0..units {
                 let x = start.saturating_add(offset as i64);
-                let lo = points.partition_point(|&(_, point_x)| point_x < x);
-                let hi = points.partition_point(|&(_, point_x)| point_x <= x);
+                let lo = lines.partition_point(|&line| self.x_of_line(doc, line) < x);
+                let hi = lines.partition_point(|&line| self.x_of_line(doc, line) <= x);
                 if lo == hi {
                     continue;
                 }
                 let column = exact_point_column(x, start, end, columns);
                 let count = hi - lo;
+                let first_line = lines[lo];
+                let last_line = lines[hi - 1];
                 bins[column] = ResolvedFilterBin {
                     count: count.min(u32::MAX as usize) as u32,
-                    sole_point: (count == 1).then_some(points[lo]),
+                    sole_point: (count == 1).then_some((first_line, x)),
                     first_x: x,
                     last_x: x,
-                    first_line: points[lo].0,
-                    last_line: points[hi - 1].0,
+                    first_line,
+                    last_line,
                 };
             }
             return bins;
@@ -310,19 +496,23 @@ impl Timeline {
         let mut bins = Vec::with_capacity(columns);
         for column in 0..columns {
             let (start, end) = discrete_bin_bounds(x_min, x_max, column, columns);
-            let lo = points.partition_point(|&(_, x)| x < start);
-            let hi = points.partition_point(|&(_, x)| x < end);
+            let lo = lines.partition_point(|&line| self.x_of_line(doc, line) < start);
+            let hi = lines.partition_point(|&line| self.x_of_line(doc, line) < end);
             let count = hi.saturating_sub(lo);
             bins.push(if count == 0 {
                 ResolvedFilterBin::default()
             } else {
+                let first_line = lines[lo];
+                let last_line = lines[hi - 1];
+                let first_x = self.x_of_line(doc, first_line);
+                let last_x = self.x_of_line(doc, last_line);
                 ResolvedFilterBin {
                     count: count.min(u32::MAX as usize) as u32,
-                    sole_point: (count == 1).then_some(points[lo]),
-                    first_x: points[lo].1,
-                    last_x: points[hi - 1].1,
-                    first_line: points[lo].0,
-                    last_line: points[hi - 1].0,
+                    sole_point: (count == 1).then_some((first_line, first_x)),
+                    first_x,
+                    last_x,
+                    first_line,
+                    last_line,
                 }
             });
         }
@@ -331,9 +521,14 @@ impl Timeline {
 
     /// Nearest match in one filter lane, used when a resolved cluster is
     /// clicked. Ties prefer the point on or after the pointer.
-    pub fn nearest_match_line_in_filter(&self, ki: usize, v: i64) -> Option<usize> {
-        let points = self.filter_points.get(ki)?;
-        nearest_point(points, v).map(|(line, _)| line as usize)
+    pub fn nearest_match_line_in_filter(
+        &self,
+        doc: &LogDocument,
+        ki: usize,
+        v: i64,
+    ) -> Option<usize> {
+        let lines = self.filter_lines.get(ki)?;
+        nearest_line_by_x(self, doc, lines, v).map(|(line, _)| line as usize)
     }
 
     /// Nearest real log line to a timeline coordinate. This replaces the
@@ -363,7 +558,8 @@ impl Timeline {
                 }
             }
             TimelineDomain::Time { .. } => {
-                nearest_point(&self.out_of_order_density_points, v).map(|(line, _)| line as usize)
+                nearest_line_by_x(self, doc, &self.out_of_order_density_lines, v)
+                    .map(|(line, _)| line as usize)
             }
         }
     }
@@ -385,31 +581,41 @@ impl Timeline {
                 hi.saturating_sub(lo)
             }
             TimelineDomain::Time { .. } => {
-                let points = &self.out_of_order_density_points;
-                let lo = points.partition_point(|&(_, x)| x < start);
-                let hi = points.partition_point(|&(_, x)| x < end);
+                let lines = &self.out_of_order_density_lines;
+                let lo = lines.partition_point(|&line| self.x_of_line(doc, line) < start);
+                let hi = lines.partition_point(|&line| self.x_of_line(doc, line) < end);
                 hi.saturating_sub(lo)
             }
         }
     }
 }
 
-fn nearest_point(points: &[(u32, i64)], v: i64) -> Option<(u32, i64)> {
-    if points.is_empty() {
+fn nearest_line_by_x(
+    timeline: &Timeline,
+    doc: &LogDocument,
+    lines: &[u32],
+    v: i64,
+) -> Option<(u32, i64)> {
+    if lines.is_empty() {
         return None;
     }
-    let idx = points.partition_point(|&(_, x)| x < v);
-    match (idx.checked_sub(1), points.get(idx).copied()) {
-        (Some(previous), Some(next)) => {
-            let previous = points[previous];
-            if (v - previous.1).abs() < (next.1 - v).abs() {
-                Some(previous)
+    let idx = lines.partition_point(|&line| timeline.x_of_line(doc, line) < v);
+    match (idx.checked_sub(1), lines.get(idx).copied()) {
+        (Some(previous_index), Some(next_line)) => {
+            let previous_line = lines[previous_index];
+            let previous_x = timeline.x_of_line(doc, previous_line);
+            let next_x = timeline.x_of_line(doc, next_line);
+            if (v - previous_x).abs() < (next_x - v).abs() {
+                Some((previous_line, previous_x))
             } else {
-                Some(next)
+                Some((next_line, next_x))
             }
         }
-        (Some(previous), None) => Some(points[previous]),
-        (None, Some(next)) => Some(next),
+        (Some(previous_index), None) => {
+            let line = lines[previous_index];
+            Some((line, timeline.x_of_line(doc, line)))
+        }
+        (None, Some(line)) => Some((line, timeline.x_of_line(doc, line))),
         (None, None) => None,
     }
 }
@@ -501,23 +707,78 @@ mod tests {
     }
 
     #[test]
-    fn filter_points_track_matches() {
+    fn filter_lines_track_matches_without_duplicating_timestamps() {
         let doc = doc_with(
             "2026-07-19T10:00:00.000Z err a\n2026-07-19T10:01:00.000Z ok\n2026-07-19T10:02:00.000Z err b\n",
         );
         let tl = Timeline::build(&doc, &[vec![0, 2]], 16);
-        assert_eq!(tl.filter_points.len(), 1);
-        assert_eq!(tl.filter_points[0].len(), 2);
+        assert_eq!(tl.filter_lines, vec![vec![0, 2]]);
+        assert_eq!(std::mem::size_of_val(&tl.filter_lines[0][0]), 4);
         let mid = doc.ts_at(1);
         // Equidistant tie → binary search picks the first >= v (line 2).
-        assert!(tl.nearest_match_line(mid) == Some(0) || tl.nearest_match_line(mid) == Some(2));
-        assert_eq!(tl.nearest_match_line(doc.ts_at(2)), Some(2));
+        assert!(
+            tl.nearest_match_line(&doc, mid) == Some(0)
+                || tl.nearest_match_line(&doc, mid) == Some(2)
+        );
+        assert_eq!(tl.nearest_match_line(&doc, doc.ts_at(2)), Some(2));
+    }
+
+    #[test]
+    fn retained_density_base_rebuilds_only_filter_indexes() {
+        let doc = doc_with(
+            "2026-07-19T10:00:00.000Z alpha\n\
+             2026-07-19T10:01:00.000Z beta\n\
+             2026-07-19T10:02:00.000Z alpha beta\n",
+        );
+        let full = Timeline::build_u32(&doc, &[vec![0, 2], vec![1, 2]], 16);
+        let shared = vec![Arc::new(vec![0, 2]), Arc::new(vec![1, 2])];
+        let rebuilt = full
+            .base_without_filters()
+            .with_shared_filter_matches(&doc, &shared);
+        assert_eq!(rebuilt.domain, full.domain);
+        assert_eq!(rebuilt.density, full.density);
+        assert_eq!(rebuilt.filter_buckets, full.filter_buckets);
+        assert_eq!(rebuilt.filter_lines, full.filter_lines);
+        assert!(Arc::ptr_eq(
+            &rebuilt.out_of_order_density_lines,
+            &full.out_of_order_density_lines
+        ));
+    }
+
+    #[test]
+    fn append_extension_reads_only_new_density_lines_and_keeps_exact_resolution() {
+        let old_doc = doc_with(
+            "2026-07-19T10:00:00.000Z alpha\n\
+             2026-07-19T10:01:00.000Z beta\n",
+        );
+        let new_doc = doc_with(
+            "2026-07-19T10:00:00.000Z alpha\n\
+             2026-07-19T10:01:00.000Z beta\n\
+             2026-07-19T10:02:00.000Z alpha\n\
+             2026-07-19T10:03:00.000Z gamma\n",
+        );
+        let old = Timeline::build_u32(&old_doc, &[vec![0]], 16);
+        let matches = vec![Arc::new(vec![0, 2])];
+        let extended = old
+            .base_without_filters()
+            .extend_append(&new_doc, 2, &matches)
+            .expect("chronological append should be incremental");
+        assert_eq!(extended.density.iter().sum::<u32>(), 4);
+        assert_eq!(extended.filter_lines, vec![vec![0, 2]]);
+        let (start, end) = new_doc.time_range.unwrap();
+        assert_eq!(
+            extended
+                .resolve_density_bins(&new_doc, start, end, 64)
+                .iter()
+                .sum::<u32>(),
+            4
+        );
     }
 
     #[test]
     fn filter_buckets_and_points_match_input_length() {
         // This verifies the invariant that filter_buckets.len() and
-        // filter_points.len() always match the number of filter match
+        // filter_lines.len() always match the number of filter match
         // sets passed to Timeline::build, regardless of how many matches
         // each set contains. The UI depends on this consistency.
         let doc = doc_with(
@@ -527,28 +788,28 @@ mod tests {
         // ----- 0 filter sets -----
         let tl = Timeline::build(&doc, &[], 16);
         assert_eq!(tl.filter_buckets.len(), 0);
-        assert_eq!(tl.filter_points.len(), 0);
+        assert_eq!(tl.filter_lines.len(), 0);
 
         // ----- 1 filter set -----
         let tl = Timeline::build(&doc, &[vec![0, 2]], 16);
         assert_eq!(tl.filter_buckets.len(), 1);
-        assert_eq!(tl.filter_points.len(), 1);
+        assert_eq!(tl.filter_lines.len(), 1);
 
         // ----- 3 filter sets -----
         let tl = Timeline::build(&doc, &[vec![0], vec![2], vec![1]], 16);
         assert_eq!(tl.filter_buckets.len(), 3);
-        assert_eq!(tl.filter_points.len(), 3);
+        assert_eq!(tl.filter_lines.len(), 3);
         for i in 0..3 {
-            assert_eq!(tl.filter_points[i].len(), 1);
+            assert_eq!(tl.filter_lines[i].len(), 1);
         }
 
         // ----- 3 sets, some empty -----
         let tl = Timeline::build(&doc, &[vec![0], vec![], vec![1]], 16);
         assert_eq!(tl.filter_buckets.len(), 3);
-        assert_eq!(tl.filter_points.len(), 3);
-        assert_eq!(tl.filter_points[0].len(), 1);
-        assert_eq!(tl.filter_points[1].len(), 0);
-        assert_eq!(tl.filter_points[2].len(), 1);
+        assert_eq!(tl.filter_lines.len(), 3);
+        assert_eq!(tl.filter_lines[0].len(), 1);
+        assert_eq!(tl.filter_lines[1].len(), 0);
+        assert_eq!(tl.filter_lines[2].len(), 1);
     }
 
     #[test]
@@ -578,18 +839,18 @@ mod tests {
         let tl = Timeline::build(&doc, &[vec![0, 1, 2]], 16);
         let (start, end) = doc.time_range.unwrap();
 
-        let coarse = tl.resolve_filter_bins(0, start, end, 1);
+        let coarse = tl.resolve_filter_bins(&doc, 0, start, end, 1);
         assert_eq!(coarse[0].count, 3);
         assert_eq!(coarse[0].sole_point, None);
 
-        let fine = tl.resolve_filter_bins(0, start, end, 3);
+        let fine = tl.resolve_filter_bins(&doc, 0, start, end, 3);
         assert_eq!(fine.iter().map(|bin| bin.count).sum::<u32>(), 3);
         assert!(fine
             .iter()
             .filter(|bin| bin.count == 1)
             .all(|bin| bin.sole_point.is_some()));
 
-        let wide = tl.resolve_filter_bins(0, start, end, 101);
+        let wide = tl.resolve_filter_bins(&doc, 0, start, end, 101);
         let occupied: Vec<usize> = wide
             .iter()
             .enumerate()
@@ -607,7 +868,7 @@ mod tests {
         );
         let tl = Timeline::build(&doc, &[vec![0, 1]], 16);
         let timestamp = doc.ts_at(0);
-        let bins = tl.resolve_filter_bins(0, timestamp, timestamp, 1);
+        let bins = tl.resolve_filter_bins(&doc, 0, timestamp, timestamp, 1);
         assert_eq!(bins[0].count, 2);
         assert_eq!(bins[0].first_x, timestamp);
         assert_eq!(bins[0].last_x, timestamp);
@@ -622,7 +883,7 @@ mod tests {
         );
         let tl = Timeline::build(&doc, &[vec![0, 1, 2]], 16);
         assert!(!tl.timestamps_monotonic);
-        assert_eq!(tl.out_of_order_density_points.len(), 3);
+        assert_eq!(tl.out_of_order_density_lines.as_slice(), &[1, 2, 0]);
         let (start, end) = doc.time_range.unwrap();
         assert_eq!(
             tl.resolve_density_bins(&doc, start, end, 3)
@@ -630,8 +891,8 @@ mod tests {
                 .sum::<u32>(),
             3
         );
-        assert_eq!(tl.point_count_in_range(0, start, end), 3);
-        assert_eq!(tl.nearest_match_line_in_filter(0, start), Some(1));
+        assert_eq!(tl.point_count_in_range(&doc, 0, start, end), 3);
+        assert_eq!(tl.nearest_match_line_in_filter(&doc, 0, start), Some(1));
     }
 
     #[test]

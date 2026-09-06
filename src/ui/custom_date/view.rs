@@ -14,6 +14,7 @@ use logotomy::core::settings::Settings;
 use logotomy::core::time::CustomDateFormat;
 
 use crate::ui::app::model::LogotomyApp;
+use crate::ui::icons::{self, Icon};
 
 /// Success green, tuned to read well on both light and dark surfaces.
 fn success_color(bg: Color32) -> Color32 {
@@ -38,7 +39,7 @@ pub fn show_custom_date_popup(app: &mut LogotomyApp, ctx: &egui::Context) {
     );
 
     let mut open = true;
-    egui::Window::new("Custom Date Recognizers")
+    egui::Window::new("Custom date recognizers")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -147,8 +148,18 @@ pub fn show_custom_date_popup(app: &mut LogotomyApp, ctx: &egui::Context) {
 
             ui.add_space(8.0);
             let can_add = !app.cd_name.trim().is_empty() && def.validate(&app.cd_sample).is_ok();
-            if ui
-                .add_enabled(can_add, egui::Button::new("Add custom date format"))
+            if icons::action_button_enabled(
+                ui,
+                can_add,
+                Icon::Add,
+                "Add date format",
+                app.theme.text,
+                if can_add {
+                    "Save this custom date recognizer"
+                } else {
+                    "Enter a name and a pattern that matches the sample line"
+                },
+            )
                 .clicked()
             {
                 app.custom_date_formats.push(def);
@@ -167,26 +178,43 @@ pub fn show_custom_date_popup(app: &mut LogotomyApp, ctx: &egui::Context) {
                         .color(text_muted),
                 );
                 let has_active = app.active.is_some();
-                if ui
-                    .add_enabled(
-                        has_active,
-                        egui::Button::new("Re-scan active log"),
-                    )
-                    .on_hover_text(
-                        "Re-opens the current file so the built-in + custom recognizers are \
-                         re-run. Per-tab state (filters, pins, scroll) is reset.",
-                    )
+                if icons::action_button_enabled(
+                    ui,
+                    has_active,
+                    Icon::Reset,
+                    "Re-scan active log",
+                    app.theme.text,
+                    if has_active {
+                        "Reopen the active file and run all date recognizers again; filters, pins, and scroll position will reset"
+                    } else {
+                        "Open a log before re-scanning"
+                    },
+                )
                     .clicked()
                 {
                     app.reopen_active_with_custom();
                 }
             });
+
+            ui.add_space(8.0);
+            ui.separator();
+            if icons::action_button(
+                ui,
+                Icon::Close,
+                "Close",
+                app.theme.text,
+                "Close custom date recognizers",
+            )
+            .clicked()
+            {
+                app.show_custom_date_popup = false;
+            }
         });
     if !open {
         app.show_custom_date_popup = false;
     }
 }
-/// Render the saved-formats list; returns the index to remove when its ✕ is clicked.
+/// Render the saved-formats list; returns the index selected for removal.
 fn saved_formats_ui(
     ui: &mut egui::Ui,
     app: &mut LogotomyApp,
@@ -207,10 +235,13 @@ fn saved_formats_ui(
             for (i, def) in app.custom_date_formats.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&def.name).strong().size(12.0));
-                    if ui
-                        .button("✕")
-                        .on_hover_text("Delete this custom format")
-                        .clicked()
+                    if icons::icon_action_button(
+                        ui,
+                        Icon::Remove,
+                        ui.visuals().text_color(),
+                        "Delete this custom date format",
+                    )
+                    .clicked()
                     {
                         remove = Some(i);
                     }

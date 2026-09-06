@@ -1,12 +1,12 @@
 [package]
 name = "logotomy"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "High-performance log analysis & visualization. 50MB log file? logotomy happened in there — let's find out."
 
 [features]
 default = ["gui"]
-gui = ["eframe", "rfd", "egui_dock", "resvg", "dep:image"]
+gui = ["eframe", "rfd", "egui_dock", "resvg", "dep:image", "dep:zip"]
 
 [lib]
 name = "logotomy"
@@ -19,10 +19,11 @@ path = "src/main.rs"
 [dependencies]
 # GUI dependencies (behind "gui" feature)
 eframe = { version = "0.35", optional = true }
-egui_dock = { version = "0.20", optional = true }
+egui_dock = { version = "0.20", optional = true, features = ["serde"] }
 rfd = { version = "0.17", optional = true }
 resvg = { version = "0.48", optional = true, default-features = false }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+zip = { version = "8.6", optional = true, default-features = false, features = ["deflate"] }
 
 # Core dependencies (always required)
 memmap2 = "0.9"
@@ -42,11 +43,15 @@ rand = "0.8"
 
 [dev-dependencies]
 rand_pcg = "0.3"
+tempfile = "3"
 
 # Static .exe icon + version-info resources (embedded by build.rs). Only
 # active on Windows targets; no-op everywhere else.
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 opt-level = 3
@@ -63,7 +68,7 @@ codegen-units = 1
 [package.metadata.packager]
 identifier = "com.muntasir-kabir.logotomy"
 product-name = "logotomy"
-version = "0.1.3"
+version = "0.1.4"
 description = "High-performance log analysis & visualization"
 homepage = "https://github.com/muntasir-kabir/logotomy"
 authors = ["MK <muntasir.kabir@gmail.com>"]
@@ -80,7 +85,6 @@ icons = [
 # omit the leading dot because that is the cargo-packager format.
 file-associations = [
   { extensions = ["log", "txt", "out", "err"], mime-type = "text/plain", name = "Log file", description = "Log file", role = "viewer" },
-  { extensions = ["evt", "evtx", "sys"], mime-type = "application/octet-stream", name = "System log file", description = "System log file", role = "viewer" },
   { extensions = ["csv"], mime-type = "text/csv", name = "CSV log file", description = "CSV log file", role = "viewer" },
   { extensions = ["json"], mime-type = "application/json", name = "JSON log file", description = "JSON log file", role = "viewer" },
   { extensions = ["xml"], mime-type = "application/xml", name = "XML log file", description = "XML log file", role = "viewer" },

@@ -6,5 +6,6 @@ pub mod masking;
 pub mod saved_filter;
 pub mod search;
 pub mod settings;
+pub mod sidecar;
 pub mod time;
 pub mod timeline;

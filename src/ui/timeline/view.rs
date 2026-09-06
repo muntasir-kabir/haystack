@@ -37,6 +37,8 @@ const DENSE_BUCKET_HEIGHT: f32 = 11.0;
 const SMALL_BUCKET_MAX_OCCURRENCES: u32 = 4;
 const MEDIUM_BUCKET_MAX_OCCURRENCES: u32 = 16;
 const MINIMAP_HEIGHT: f32 = 12.0;
+/// Vertical placement of the minimap after the gesture hint row was removed.
+const MINIMAP_AXIS_OFFSET: f32 = 16.0;
 /// Zoom factor per scroll tick.
 const ZOOM_FACTOR: f64 = 1.18;
 /// Width of the left column for filter labels + visibility/delete controls.
@@ -51,7 +53,7 @@ const ICON_WIDTH: f32 = 18.0;
 /// Height of the header row ("Timeline" label + filter controls). Included in
 /// `panel_height` so the fixed top panel is tall enough for header + body +
 /// minimap.
-const HEADER_HEIGHT: f32 = 30.0;
+const HEADER_HEIGHT: f32 = 24.0;
 
 /// Compute the total height of the timeline panel for the given tab.
 /// Used by the fixed top panel so the whole timeline (header, histogram,
@@ -64,78 +66,42 @@ pub fn panel_height(tab: &LogTab) -> f32 {
         .min(MAX_LANES)
         .min(tab.filters.len());
     let has_filters = !tab.filters.is_empty();
-    let total_lanes = if has_filters { n_filter_lanes + 1 } else { 0 };
+    let has_pin_markers = tab
+        .pins
+        .iter()
+        .any(|pin| pin.visible_bounds(tab.doc.total_lines()).is_some());
+    // The logically-empty Everything Else lane doubles as the Pin marker
+    // lane. Keep it available for pins even before the user adds a filter.
+    let has_lanes = has_filters || has_pin_markers;
+    let total_lanes = if has_lanes { n_filter_lanes + 1 } else { 0 };
     let lanes_height = total_lanes as f32 * LANE_HEIGHT;
     let content_height = HISTO_HEIGHT.max(lanes_height);
 
     HEADER_HEIGHT
         + content_height
-        + (if has_filters { 10.0 } else { 0.0 }) // gap after histo
-        + 20.0 // axis labels row (tick labels + duration labels + hint text)
+        + (if has_lanes { 10.0 } else { 0.0 }) // gap after histo
+        + 18.0 // axis labels row
         + 8.0   // gap
         + MINIMAP_HEIGHT
 }
 
 pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
-    ui.horizontal_top(|ui| {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
+        ui.add(icons::icon_image(
+            ui.ctx(),
+            Icon::Timeline,
+            15.0,
+            theme.text,
+        ));
         ui.label(RichText::new("Timeline").strong());
-        ui.add_space(8.0);
-
-        if !tab.filters.is_empty() {
-            // Show / hide all filter lanes at once (Everything Else is never touched).
-            let all_active = tab.lane_active.iter().all(|&a| a);
-            let toggle_txt = if all_active {
-                "Disable All"
-            } else {
-                "Enable All"
-            };
-            if ui
-                .add(egui::Button::image_and_text(
-                    icons::icon_image(
-                        ui.ctx(),
-                        if all_active {
-                            Icon::Invisible
-                        } else {
-                            Icon::Visible
-                        },
-                        13.0,
-                        theme.text,
-                    ),
-                    toggle_txt,
-                ))
-                .on_hover_text(if all_active {
-                    "Disable every filter lane at once (Everything Else stays as-is)"
-                } else {
-                    "Enable every filter lane at once"
-                })
-                .clicked()
-            {
-                tab.toggle_all_lanes();
-            }
-
-            ui.add_space(6.0);
-            // Clear all filters (asks for confirmation in app/view.rs).
-            if ui
-                .add(egui::Button::image_and_text(
-                    icons::icon_image(ui.ctx(), Icon::Remove, 13.0, theme.text),
-                    "Delete All",
-                ))
-                .on_hover_text("Remove every filter behind a confirmation popup")
-                .clicked()
-            {
-                tab.pending_clear_filters = true;
-            }
-
-            // Keep the separator to header height. A bare separator in this
-            // top-aligned horizontal layout expands to the full panel height,
-            // which would push the timeline body below the visible panel.
-            ui.add_sized(
-                egui::vec2(1.0, HEADER_HEIGHT - 2.0),
-                egui::Separator::default(),
-            );
-        }
+        ui.add_sized(
+            egui::vec2(1.0, HEADER_HEIGHT - 2.0),
+            egui::Separator::default(),
+        );
 
         filter_strip::add_filter_ui(ui, tab, theme);
+
         if tab.selected_lane.is_some() {
             // Keep this navigation hint inside the fixed header row. A bare
             // right-to-left layout inherits the full panel height and centers
@@ -147,7 +113,15 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 egui::vec2(header_width, HEADER_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    if ui.button("Unselect").clicked() {
+                    if icons::action_button(
+                        ui,
+                        Icon::Close,
+                        "Clear selection",
+                        theme.text,
+                        "Clear the selected filter lane",
+                    )
+                    .clicked()
+                    {
                         unselect = true;
                     }
                     ui.add_space(8.0);
@@ -201,7 +175,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         .min(MAX_LANES)
         .min(tab.filters.len());
     let has_filters = !tab.filters.is_empty();
-    let total_lanes = if has_filters { n_filter_lanes + 1 } else { 0 };
+    let has_pin_markers = tab
+        .pins
+        .iter()
+        .any(|pin| pin.visible_bounds(tab.doc.total_lines()).is_some());
+    let has_lanes = has_filters || has_pin_markers;
+    let total_lanes = if has_lanes { n_filter_lanes + 1 } else { 0 };
     let lanes_height = total_lanes as f32 * LANE_HEIGHT;
     let content_height = HISTO_HEIGHT.max(lanes_height);
 
@@ -230,7 +209,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     // ---- layout sub-rects ----
     // The main content area spans either from rect.min.x+4 (no filters) or
     // after the label column (with filters).
-    let content_left = if has_filters {
+    let content_left = if has_lanes {
         rect.min.x + 4.0 + LABEL_WIDTH + 2.0
     } else {
         rect.min.x + 4.0
@@ -241,7 +220,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let hist = Rect::from_min_max(
         Pos2::new(content_left, rect.min.y),
         Pos2::new(
-            if has_filters {
+            if has_lanes {
                 icon_left - 2.0
             } else {
                 icon_left
@@ -251,10 +230,63 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     );
     let lanes_bottom = hist.bottom();
     let axis_top = lanes_bottom + 6.0;
-    let minimap = Rect::from_min_max(
-        Pos2::new(hist.left(), axis_top + 18.0),
-        Pos2::new(hist.right(), axis_top + 18.0 + MINIMAP_HEIGHT),
-    );
+    let minimap = minimap_rect(hist, axis_top);
+
+    // Bulk filter actions live in the otherwise-unused lower part of the
+    // label column, keeping the title/input row quiet and aligned.
+    if has_filters {
+        let actions_rect = Rect::from_min_max(
+            Pos2::new(rect.left() + 6.0, lanes_bottom + 5.0),
+            Pos2::new(
+                content_left - 6.0,
+                lanes_bottom + 5.0 + icons::ACTION_HEIGHT,
+            ),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(actions_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
+                ui.spacing_mut().item_spacing.x = 3.0;
+                let all_active = tab.lane_active.iter().all(|&active| active);
+                if icons::action_button(
+                    ui,
+                    if all_active {
+                        Icon::Invisible
+                    } else {
+                        Icon::Visible
+                    },
+                    if all_active {
+                        "Disable all"
+                    } else {
+                        "Enable all"
+                    },
+                    theme.text_muted,
+                    if all_active {
+                        "Disable every filter lane at once (Everything Else stays as-is)"
+                    } else {
+                        "Enable every filter lane at once"
+                    },
+                )
+                .clicked()
+                {
+                    tab.toggle_all_lanes();
+                }
+                if icons::action_button(
+                    ui,
+                    Icon::Remove,
+                    "Clear filters",
+                    theme.text_muted,
+                    "Remove every filter after confirmation",
+                )
+                .clicked()
+                {
+                    tab.pending_clear_filters = true;
+                }
+            },
+        );
+    }
 
     // ---- helpers: x-value ↔ pixel ----
     let view_span = (view_end - view_start).max(1);
@@ -304,6 +336,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let mut toggle_kw: Option<(usize, bool)> = None;
     let mut select_lane: Option<usize> = None;
     let mut clicked_occurrence = false;
+    let mut clicked_pin_marker = false;
+    let mut navigate_to_pin: Option<usize> = None;
     // Lane hit targets can consume the pointer event before the outer timeline
     // response sees it. Keep the position so an empty lane click still moves
     // the log view.
@@ -312,7 +346,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     // Deferred ensure_visible (occurrence clicks happen inside an immutably-borrowed loop).
     let mut ensure_line: Option<usize> = None;
 
-    if has_filters {
+    if has_lanes {
         // ---- label column ----
         let label_col = Rect::from_min_max(
             Pos2::new(rect.min.x + 4.0, rect.min.y),
@@ -399,6 +433,57 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             },
         );
         // No density line or occurrence buckets for Everything Else lane.
+        // Its otherwise empty visual space is reserved for pinned evidence.
+        let marker_y = ee_y + LANE_HEIGHT / 2.0;
+        for (pin_index, pin) in tab.pins.iter().enumerate() {
+            let Some((start_line, end_line)) = pin.visible_bounds(tab.doc.total_lines()) else {
+                continue;
+            };
+            for (endpoint, line) in [("start", start_line), ("end", end_line)] {
+                // A one-line pin has one marker, not two overlapping copies.
+                if endpoint == "end" && end_line == start_line {
+                    continue;
+                }
+                let value = x_of_line(&tab.doc, &tab.timeline.domain, line);
+                if value < view_start || value > view_end {
+                    continue;
+                }
+                let center = Pos2::new(x_to_px(value), marker_y);
+                let marker_rect = Rect::from_center_size(center, Vec2::splat(12.0));
+                let selected = tab.selected_pin == Some(pin_index);
+                icons::paint_icon(
+                    ui.ctx(),
+                    &painter,
+                    Icon::Pin,
+                    center,
+                    11.0,
+                    if selected {
+                        theme.accent
+                    } else {
+                        theme.analysis_text
+                    },
+                );
+                let response = ui.interact(
+                    marker_rect.expand(3.0),
+                    ui.id().with(("pin_marker", pin_index, endpoint)),
+                    Sense::click(),
+                );
+                if response.clicked() {
+                    clicked_pin_marker = true;
+                    navigate_to_pin = Some(pin_index);
+                }
+                if response.hovered() {
+                    painter.rect_stroke(
+                        marker_rect.expand(1.0),
+                        egui::CornerRadius::same(2),
+                        Stroke::new(1.0, theme.occurrence_hover),
+                        egui::StrokeKind::Middle,
+                    );
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                    response.on_hover_text(pin_marker_tooltip(pin, start_line, end_line));
+                }
+            }
+        }
     }
 
     // ---- filter lanes (index 1..total_lanes) ----
@@ -435,10 +520,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             );
             let lane_id = ui.id().with(("lane_select", ki));
             let lane_resp = ui.interact(lane_select_rect, lane_id, Sense::click());
-            if lane_resp.clicked() && is_active {
-                select_lane = Some(ki);
+            if lane_resp.clicked() {
                 lane_click_pos = lane_resp.interact_pointer_pos();
                 lane_click_lane = Some(ki);
+                if is_active {
+                    select_lane = Some(ki);
+                }
             }
             if ui.rect_contains_pointer(lane_rect) {
                 painter.rect_filled(
@@ -613,14 +700,23 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 kw_check_resp.on_hover_text(format!("{} ({count} occurrence{plural})", text));
             }
 
+            // Keep the lane's baseline visible while disabled, using the same
+            // muted color as its disabled label. Disabled lanes intentionally
+            // have no occurrence markers or buckets.
+            let line_y = y + LANE_HEIGHT / 2.0;
             if !is_active {
-                // Lane is disabled: skip density line and occurrence buckets.
+                painter.line_segment(
+                    [
+                        Pos2::new(hist.left(), line_y),
+                        Pos2::new(hist.right(), line_y),
+                    ],
+                    Stroke::new(1.0_f32, theme.text_muted),
+                );
                 continue;
             }
 
             // Draw a straight 1px horizontal line across the full lane width
             // in the filter's color.
-            let line_y = y + LANE_HEIGHT / 2.0;
             painter.line_segment(
                 [
                     Pos2::new(hist.left(), line_y),
@@ -633,9 +729,13 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             // Zooming therefore splits close points as soon as the screen can
             // distinguish them, while every non-empty cell remains visible.
             let marker_columns = (hist.width() / OCCURRENCE_BUCKET_WIDTH).ceil().max(1.0) as usize;
-            let resolved =
-                tab.timeline
-                    .resolve_filter_bins(ki, view_start, view_end, marker_columns);
+            let resolved = tab.timeline.resolve_filter_bins(
+                &tab.doc,
+                ki,
+                view_start,
+                view_end,
+                marker_columns,
+            );
             for (bin_index, bin) in resolved.iter().enumerate() {
                 if bin.count == 0 {
                     continue;
@@ -704,7 +804,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     if cluster_resp.clicked() {
                         if let Some(pos) = cluster_resp.interact_pointer_pos() {
                             let xv = px_to_x(pos.x);
-                            if let Some(line) = tab.timeline.nearest_match_line_in_filter(ki, xv) {
+                            if let Some(line) =
+                                tab.timeline.nearest_match_line_in_filter(&tab.doc, ki, xv)
+                            {
                                 select_lane = Some(ki);
                                 clicked_occurrence = true;
                                 tab.context_line = Some(line);
@@ -744,29 +846,24 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         // response also reported the eye control, discard that toggle so a
         // lane click can never hide the timeline data it just selected.
         toggle_kw = None;
-        if let Some(active) = tab.lane_active.get_mut(ki) {
-            *active = true;
-        }
+        tab.set_lane_active(ki, true);
         tab.select_lane(ki);
+    }
+
+    if let Some(pin_index) = navigate_to_pin {
+        tab.navigate_to_pin(pin_index);
     }
 
     // Apply deferred lane toggles.
     if let Some(active) = toggle_ee {
-        tab.everything_else_active = active;
-        tab.rebuild_visible_lines_background();
+        tab.set_everything_else_active(active);
     }
     if let Some((ki, active)) = toggle_kw {
-        if ki < tab.lane_active.len() {
-            tab.lane_active[ki] = active;
+        if ki < tab.filters.len() {
             if !active && tab.selected_lane == Some(ki) {
                 tab.selected_lane = None;
             }
-            // Check if this was the last active filter and everything else is off.
-            let active_filter_count = tab.lane_active.iter().filter(|&&b| b).count();
-            if active_filter_count == 0 && !tab.everything_else_active {
-                tab.everything_else_active = true;
-            }
-            tab.rebuild_visible_lines_background();
+            tab.set_lane_active(ki, active);
         }
     }
 
@@ -953,19 +1050,6 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             );
         }
     }
-
-    // ---- hint text ----
-    painter.text(
-        Pos2::new(hist.center().x, label_y + 14.0),
-        egui::Align2::CENTER_TOP,
-        if zoomed {
-            "scroll to zoom · drag to pan · shift+drag to brush · double-click to reset"
-        } else {
-            "scroll to zoom · drag to pan · shift+drag to brush"
-        },
-        egui::FontId::proportional(8.0),
-        theme.hint,
-    );
 
     // ---- reset zoom button ----
     if zoomed {
@@ -1219,7 +1303,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             let v = px_to_x(pos.x);
             let target = tab
                 .timeline
-                .nearest_match_line(v)
+                .nearest_match_line(&tab.doc, v)
                 .or_else(|| tab.timeline.nearest_line(&tab.doc, v));
             tab.context_line = target;
             if target.is_some() {
@@ -1238,7 +1322,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 .flatten()
         });
         if let Some(pos) = click_pos {
-            if !response.dragged() && !clicked_occurrence {
+            if !response.dragged() && !clicked_occurrence && !clicked_pin_marker {
                 let v = px_to_x(pos.x);
                 let target = tab.timeline.nearest_line(&tab.doc, v);
                 if let Some(line) = target {
@@ -1303,11 +1387,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     .ceil() as i64;
                 for ki in 0..tab
                     .timeline
-                    .filter_points
+                    .filter_lines
                     .len()
                     .min(MAX_LANES.min(tab.filters.len()))
                 {
                     let count = tab.timeline.point_count_in_range(
+                        &tab.doc,
                         ki,
                         v.saturating_sub(marker_half_span),
                         v.saturating_add(marker_half_span),
@@ -1378,6 +1463,14 @@ fn cluster_style(count: u32) -> (f32, u8) {
         count if count <= MEDIUM_BUCKET_MAX_OCCURRENCES => (MEDIUM_BUCKET_HEIGHT, 210),
         _ => (DENSE_BUCKET_HEIGHT, 245),
     }
+}
+
+fn minimap_rect(hist: Rect, axis_top: f32) -> Rect {
+    let top = axis_top + MINIMAP_AXIS_OFFSET;
+    Rect::from_min_max(
+        Pos2::new(hist.left(), top),
+        Pos2::new(hist.right(), top + MINIMAP_HEIGHT),
+    )
 }
 
 fn format_human_duration_ms(ms: i64) -> String {
@@ -1523,6 +1616,29 @@ fn x_of_line(doc: &LogDocument, domain: &TimelineDomain, line: usize) -> i64 {
     }
 }
 
+/// Text shown by a Timeline pin marker. The user analysis stays first so the
+/// tooltip answers the investigation question before showing navigation detail.
+fn pin_marker_tooltip(
+    pin: &crate::ui::app::model::PinEntry,
+    start_line: usize,
+    end_line: usize,
+) -> String {
+    let analysis = if pin.comment.is_empty() {
+        "No analysis added."
+    } else {
+        &pin.comment
+    };
+    if start_line == end_line {
+        format!("{analysis}\nPinned line {}", start_line + 1)
+    } else {
+        format!(
+            "{analysis}\nPinned lines {}–{}",
+            start_line + 1,
+            end_line + 1
+        )
+    }
+}
+
 fn v_caption(domain: TimelineDomain, v: i64) -> String {
     match domain {
         TimelineDomain::Time { .. } => format_ms(v),
@@ -1583,10 +1699,37 @@ mod tests {
     }
 
     #[test]
+    fn minimap_uses_the_compacted_axis_offset() {
+        let hist = Rect::from_min_size(Pos2::new(10.0, 100.0), Vec2::new(200.0, 68.0));
+        let minimap = minimap_rect(hist, hist.bottom() + 6.0);
+
+        assert_eq!(minimap.top(), hist.bottom() + 6.0 + 16.0);
+        assert_eq!(minimap.bottom(), minimap.top() + MINIMAP_HEIGHT);
+        assert_eq!(minimap.left(), hist.left());
+        assert_eq!(minimap.right(), hist.right());
+    }
+
+    #[test]
     fn centered_window_preserves_span_at_boundaries() {
         assert_eq!(centered_window(0, 20, 0, 100), (0, 20));
         assert_eq!(centered_window(100, 20, 0, 100), (80, 100));
         assert_eq!(centered_window(50, 20, 0, 100), (40, 60));
         assert_eq!(centered_window(50, 200, 0, 100), (0, 100));
+    }
+
+    #[test]
+    fn pin_marker_tooltip_leads_with_user_analysis_and_range() {
+        let pin = crate::ui::app::model::PinEntry {
+            start_line: 4,
+            line_numbers: vec![4, 7],
+            start_ts: 10,
+            end_ts: 20,
+            comment: "Timeout begins here".into(),
+            unanchored: false,
+        };
+        assert_eq!(
+            pin_marker_tooltip(&pin, 4, 7),
+            "Timeout begins here\nPinned lines 5–8"
+        );
     }
 }

@@ -6,6 +6,8 @@ use egui::{Color32, FontId, Stroke};
 
 use logotomy::core::document::LogDocument;
 use logotomy::core::embedded_data::Detection;
+use logotomy::core::search::FilterHighlighter;
+use logotomy::core::settings::LogLineDisplayMode;
 
 use crate::ui::app::model::{Filter, LogTab};
 use crate::ui::theme::Theme;
@@ -16,8 +18,9 @@ pub const MAX_DISPLAY_BYTES: usize = 2000;
 
 pub struct Highlights<'a> {
     pub filters: &'a [Filter],
-    pub filter_ac: Option<&'a AhoCorasick>,
-    pub search_ac: Option<&'a AhoCorasick>,
+    pub filter_matcher: Option<&'a FilterHighlighter>,
+    pub search_matcher: Option<&'a FilterHighlighter>,
+    pub search_template_id: Option<u32>,
     pub keyword_ac: Option<&'a AhoCorasick>,
     pub embedded: Option<&'a [Detection]>,
 }
@@ -26,18 +29,20 @@ impl<'a> Highlights<'a> {
     pub fn from_tab(tab: &'a LogTab) -> Self {
         Self {
             filters: &tab.filters,
-            filter_ac: tab.highlighter.as_deref(),
-            search_ac: tab.find_automaton.as_deref(),
+            filter_matcher: tab.highlighter.as_deref(),
+            search_matcher: tab.find_highlighter.as_deref(),
+            search_template_id: tab.find_template_id,
             keyword_ac: tab.keyword_automaton.as_deref(),
             embedded: Some(tab.embedded_detections.as_slice()),
         }
     }
 
-    pub fn filters_only(filters: &'a [Filter], ac: Option<&'a AhoCorasick>) -> Self {
+    pub fn filters_only(filters: &'a [Filter], matcher: Option<&'a FilterHighlighter>) -> Self {
         Self {
             filters,
-            filter_ac: ac,
-            search_ac: None,
+            filter_matcher: matcher,
+            search_matcher: None,
+            search_template_id: None,
             keyword_ac: None,
             embedded: None,
         }
@@ -54,6 +59,29 @@ pub fn line_job(
     font_id: FontId,
     theme: &Theme,
 ) -> egui::text::LayoutJob {
+    line_job_for_mode(
+        doc,
+        highlights,
+        idx,
+        selected,
+        font_id,
+        theme,
+        LogLineDisplayMode::Truncate,
+    )
+}
+
+/// Build a line job using the requested long-line presentation. Pinned-line
+/// previews keep the bounded default via [`line_job`], while Log View can
+/// render complete source text in its wrap and horizontal-scroll modes.
+pub fn line_job_for_mode(
+    doc: &LogDocument,
+    highlights: &Highlights,
+    idx: usize,
+    selected: bool,
+    font_id: FontId,
+    theme: &Theme,
+    display_mode: LogLineDisplayMode,
+) -> egui::text::LayoutJob {
     let bg = if selected {
         theme.selection_bg
     } else {
@@ -69,8 +97,8 @@ pub fn line_job(
 
     let line = doc.line(idx);
     let source_is_valid_utf8 = matches!(line, Cow::Borrowed(_));
-    let visible_source_len = display_source_len(&line);
-    let text = display_text(&line);
+    let visible_source_len = display_source_len_for_mode(&line, display_mode);
+    let text = display_text_for_mode(&line, display_mode);
     let embedded_ranges = if source_is_valid_utf8 {
         embedded_ranges_for_line(doc, highlights, idx, visible_source_len)
     } else {
@@ -87,8 +115,8 @@ pub fn line_job(
 
     let base = theme.log_text;
     match (
-        highlights.filter_ac,
-        highlights.search_ac,
+        highlights.filter_matcher,
+        highlights.search_matcher,
         highlights.keyword_ac,
     ) {
         (None, None, None) => append_segment_with_annotations(
@@ -101,11 +129,14 @@ pub fn line_job(
             theme.embedded_data,
             theme.timestamp,
         ),
-        (filter_ac, search_ac, keyword_ac) => append_highlighted(
+        (filter_matcher, search_matcher, keyword_ac) => append_highlighted(
             &mut job,
             &text,
-            filter_ac,
-            search_ac,
+            filter_matcher,
+            search_matcher,
+            highlights
+                .search_template_id
+                .is_some_and(|template_id| doc.template_at(idx) == template_id),
             keyword_ac,
             highlights.filters,
             fmt(base),
@@ -119,7 +150,17 @@ pub fn line_job(
 }
 
 /// Return the original line or a UTF-8-safe display prefix.
+#[allow(dead_code)] // Retained as the concise truncate-mode helper for tests/callers.
 pub fn display_text(line: &str) -> Cow<'_, str> {
+    display_text_for_mode(line, LogLineDisplayMode::Truncate)
+}
+
+/// Return a UTF-8-safe preview in truncate mode or the complete source text
+/// in the full-line modes.
+pub fn display_text_for_mode(line: &str, display_mode: LogLineDisplayMode) -> Cow<'_, str> {
+    if display_mode != LogLineDisplayMode::Truncate {
+        return Cow::Borrowed(line);
+    }
     if line.len() <= MAX_DISPLAY_BYTES {
         return Cow::Borrowed(line);
     }
@@ -136,6 +177,13 @@ pub fn display_text(line: &str) -> Cow<'_, str> {
 }
 
 pub(super) fn display_source_len(line: &str) -> usize {
+    display_source_len_for_mode(line, LogLineDisplayMode::Truncate)
+}
+
+pub(super) fn display_source_len_for_mode(line: &str, display_mode: LogLineDisplayMode) -> usize {
+    if display_mode != LogLineDisplayMode::Truncate {
+        return line.len();
+    }
     if line.len() <= MAX_DISPLAY_BYTES {
         return line.len();
     }
@@ -204,8 +252,9 @@ enum HighlightKind {
 fn append_highlighted(
     job: &mut egui::text::LayoutJob,
     text: &str,
-    filter_ac: Option<&AhoCorasick>,
-    search_ac: Option<&AhoCorasick>,
+    filter_matcher: Option<&FilterHighlighter>,
+    search_matcher: Option<&FilterHighlighter>,
+    search_full_line: bool,
     keyword_ac: Option<&AhoCorasick>,
     filters: &[Filter],
     base_fmt: egui::text::TextFormat,
@@ -217,14 +266,16 @@ fn append_highlighted(
     let mut spans: Vec<(std::ops::Range<usize>, HighlightKind)> = Vec::new();
     let mut covered: Vec<std::ops::Range<usize>> = Vec::new();
 
-    if let Some(ac) = search_ac {
-        for m in ac.find_iter(text) {
-            add_highlight_span(
-                &mut spans,
-                &mut covered,
-                m.start()..m.end(),
-                HighlightKind::Search,
-            );
+    if search_full_line && !text.is_empty() {
+        add_highlight_span(
+            &mut spans,
+            &mut covered,
+            0..text.len(),
+            HighlightKind::Search,
+        );
+    } else if let Some(matcher) = search_matcher {
+        for (_, range) in matcher.spans(text) {
+            add_highlight_span(&mut spans, &mut covered, range, HighlightKind::Search);
         }
     }
     if let Some(ac) = keyword_ac {
@@ -237,13 +288,12 @@ fn append_highlighted(
             );
         }
     }
-    if let Some(ac) = filter_ac {
-        for m in ac.find_iter(text) {
-            let filter = m.pattern().as_usize();
+    if let Some(matcher) = filter_matcher {
+        for (filter, range) in matcher.spans(text) {
             add_highlight_span(
                 &mut spans,
                 &mut covered,
-                m.start()..m.end(),
+                range,
                 HighlightKind::Filter(filter),
             );
         }

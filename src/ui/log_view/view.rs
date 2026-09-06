@@ -5,7 +5,6 @@
 //! Also provides a right-click context menu (pin / add analysis).
 
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,16 +16,18 @@ use logotomy::core::embedded_data::{DataNode, Detection, SourcePos, SourceSpan};
 use logotomy::core::time::format_ms;
 
 use super::embedded::presentation;
+use super::{analysis_popup, annotation_popup};
 use crate::ui::app::model::{
-    AnnotationHoverKey, AnnotationHoverState, EmbeddedInspectorMode, LogTab, PinEntry, TrimAction,
-    MAX_FILTERS,
+    AnnotationHoverKey, EmbeddedInspectorMode, LogTab, PinEntry, TrimAction, MAX_FILTERS,
 };
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::Theme;
+use crate::ui::util::error_bubble::{error_bubble, BubbleAlign};
+use crate::ui::util::suggestion_row;
 
 #[path = "highlight.rs"]
 mod highlight;
-pub use highlight::{line_job, Highlights};
+pub use highlight::{line_job, line_job_for_mode, Highlights};
 
 /// Number of digits reserved by the line-number gutter before it grows.
 const GUTTER_DIGITS: usize = 9;
@@ -36,33 +37,34 @@ const GUTTER_PADDING: f32 = 12.0;
 const GUTTER_VERTICAL_OFFSET: f32 = 1.0;
 /// Minimum pointer displacement (px) to distinguish a drag from a click.
 const DRAG_THRESHOLD: f32 = 3.0;
-/// Pointer dwell before source actions appear.
-const ANNOTATION_HOVER_DELAY: Duration = Duration::from_millis(800);
-/// Keeps the callout alive while the pointer crosses the source-to-bubble gap.
-const ANNOTATION_HOVER_GRACE: Duration = Duration::from_millis(220);
-const ANNOTATION_HOVER_MOVE_RESET: f32 = 3.0;
+/// A nearby navigation target should require only enough scrolling to reveal it.
+const NEAR_SELECTION_SCROLL_LINES: usize = 5;
+/// Keep a one-row visual safety margin when user scrolling reselects an edge
+/// row inside the viewport.
+const SELECTION_VIEWPORT_MARGIN_LINES: usize = 1;
+/// Keep a larger two-row margin when navigation scrolls to a selected line;
+/// this prevents partial row rendering from making the selection look clipped.
+const SELECTION_SCROLL_MARGIN_LINES: usize = 2;
 
 /// Action returned from a single row render, to be applied after the
 /// scroll-area closure so we avoid borrow conflicts with `tab`.
 enum RowAction {
     Select,
     Pin,
+    CopyFull,
+    CopyWithoutHeader,
+    CopyWithLineNumber,
+    OpenFullLine,
     TrimRight,
     TrimLeft,
     Keyword(String),
-    OpenData(Detection, Pos2),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AnnotationHoverCandidate {
-    key: AnnotationHoverKey,
-    source_rect: Rect,
 }
 
 #[derive(Default)]
 struct RowRenderResult {
     action: Option<RowAction>,
-    hovered: Option<AnnotationHoverCandidate>,
+    hovered: Option<annotation_popup::Candidate>,
+    anchor_rect: Option<Rect>,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,10 +95,22 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     show_toolbar(ui, tab, theme, max_visible_lines);
 
     // Deferred actions from context menu (avoid borrow conflicts inside show_rows).
-    let mut context_pin: Option<usize> = None;
+    let mut context_pin: Option<(usize, Rect)> = None;
     let mut context_trim: Option<TrimAction> = None;
-    let mut open_data: Option<Detection> = None;
-    let mut hovered_annotation: Option<AnnotationHoverCandidate> = None;
+    let mut context_copy: Option<(usize, RowAction)> = None;
+    let mut open_full_line: Option<usize> = None;
+    let mut hovered_annotation: Option<annotation_popup::Candidate> = None;
+    // Keep a selection-originated highlight authoritative for the whole
+    // analysis editor lifetime, even if another transient selection field is
+    // cleared while the popup handles an action.
+    let popup_selection_range = tab
+        .analysis_popup
+        .filter(|state| state.from_selection)
+        .map(|state| state.range);
+    let selection_range = popup_selection_range.or(tab.selection_range);
+    let pending_selection_before = tab.pending_selection;
+    let selection_anchor_range = tab.pending_selection.or(selection_range);
+    let mut selection_anchor_rect: Option<Rect> = None;
     let mut suppress_select: bool = false;
 
     let total_visible = match &tab.visible_lines {
@@ -104,26 +118,75 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         None => n,
     };
     let available = ui.available_size();
-
-    // Cell to capture the exact rendered range from show_rows, avoiding
-    // offset-based approximation that can drift due to partial rows and egui buffering.
-    let rendered_range: Cell<Option<(usize, usize)>> = Cell::new(None);
+    // The previous layout gives us the real viewport height, including space
+    // consumed by a horizontal scrollbar. Use the current panel height as a
+    // conservative first-frame estimate and refresh it after layout below.
+    let estimated_viewport_height = tab
+        .log_viewport_height
+        .map(|height| height.min(available.y))
+        .unwrap_or(available.y);
     // Take the pending scroll before entering the closure to avoid borrow conflicts.
     let pending = tab.pending_scroll.take();
+    let restored_scroll = tab.pending_scroll_restore.take();
     // One-shot preserve-anchor set by a filter change; top-aligns the viewport.
     let preserve_anchor = tab.preserve_anchor.take();
 
-    // ---- scroll area setup (vertical) ----
+    // ---- scroll area setup ----
     let char_width = ui.ctx().fonts_mut(|f| f.glyph_width(&font_id, ' '));
     let gutter_width = line_gutter_width(char_width);
-    let mut scroll_area = egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .id_salt("log_scroll");
-
-    if let Some(offset) =
-        compute_pending_scroll_offset(tab, pending, row_height, avail_height, total_visible)
+    let wrap_offsets = (tab.log_line_display_mode
+        == logotomy::core::settings::LogLineDisplayMode::Wrap)
+        .then(|| {
+            wrap_offsets_for(
+                tab,
+                (available.x - gutter_width).max(char_width),
+                char_width,
+                row_height,
+            )
+        });
+    let mut scroll_area = if tab.log_line_display_mode
+        == logotomy::core::settings::LogLineDisplayMode::HorizontalScroll
     {
+        egui::ScrollArea::both()
+    } else {
+        egui::ScrollArea::vertical()
+    }
+    .auto_shrink([false, false])
+    .id_salt("log_scroll");
+
+    if let Some(offsets) = wrap_offsets.as_ref() {
+        let target = pending
+            .or_else(|| restored_scroll.map(|(anchor, _)| anchor))
+            .or(preserve_anchor);
+        let offset = if pending.is_some() {
+            compute_pending_wrap_scroll_offset(
+                tab,
+                pending,
+                offsets,
+                estimated_viewport_height,
+                row_height,
+                total_visible,
+            )
+        } else {
+            target.and_then(|line| wrap_scroll_offset(tab, offsets, line))
+        };
+        if let Some(offset) = offset {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        }
+    } else if let Some(offset) = compute_pending_scroll_offset(
+        tab,
+        pending,
+        row_height,
+        estimated_viewport_height,
+        total_visible,
+    ) {
         scroll_area = scroll_area.vertical_scroll_offset(offset);
+    } else if let Some((anchor, fraction)) = restored_scroll {
+        if let Some(offset) =
+            compute_restore_scroll_offset(tab, anchor, fraction, row_height, total_visible)
+        {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        }
     } else if let Some(anchor) = preserve_anchor {
         // No pending scroll (timeline occurrence click etc.), so honor a filter-change
         // anchor by top-aligning the preserved reference line.
@@ -143,105 +206,283 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         available,
         egui::Layout::top_down_justified(egui::Align::LEFT),
         |ui| {
-            let output = scroll_area.show_rows(ui, row_height, total_visible, |ui, range| {
-                // Capture the exact range egui determined to be visible.
-                // range.end is exclusive, so last = end - 1.
-                if !range.is_empty() {
-                    rendered_range.set(Some((range.start, range.end - 1)));
-                }
-                for vi in range {
-                    let i = match &tab.visible_lines {
-                        Some(vis) => vis[vi],
-                        None => vi,
-                    };
-                    let selected = tab.context_line == Some(i);
-
-                    let rendered = render_row(
-                        ui,
-                        &tab.doc,
-                        &Highlights::from_tab(tab),
-                        i,
-                        selected,
-                        font_id.clone(),
-                        theme,
-                        row_height,
-                        tab.selection_range,
-                        char_width,
-                        gutter_width,
+            let output = if let Some(offsets) = wrap_offsets.as_ref() {
+                scroll_area.show_viewport(ui, |ui, viewport| {
+                    ui.set_height(*offsets.last().unwrap_or(&0.0));
+                    let start = offsets
+                        .partition_point(|offset| *offset <= viewport.min.y)
+                        .saturating_sub(1)
+                        .min(total_visible);
+                    let end = offsets
+                        .partition_point(|offset| *offset < viewport.max.y + row_height)
+                        .min(total_visible);
+                    let rect = Rect::from_x_y_ranges(
+                        ui.max_rect().x_range(),
+                        (ui.max_rect().top() + offsets[start])
+                            ..=(ui.max_rect().top() + offsets[end]),
                     );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.skip_ahead_auto_ids(start);
+                        for vi in start..end {
+                            let i = match &tab.visible_lines {
+                                Some(vis) => vis[vi] as usize,
+                                None => vi,
+                            };
+                            let selected = tab.context_line == Some(i);
+                            let rendered = render_row(
+                                ui,
+                                &tab.doc,
+                                &Highlights::from_tab(tab),
+                                i,
+                                selected,
+                                font_id.clone(),
+                                theme,
+                                offsets[vi + 1] - offsets[vi],
+                                selection_range,
+                                char_width,
+                                gutter_width,
+                                tab.log_line_display_mode,
+                            );
+                            if hovered_annotation.is_none() {
+                                hovered_annotation = rendered.hovered;
+                            }
+                            if let (Some((lo, hi)), Some(anchor_rect)) =
+                                (selection_anchor_range, rendered.anchor_rect)
+                            {
+                                if (lo..=hi).contains(&i) {
+                                    selection_anchor_rect = Some(match selection_anchor_rect {
+                                        Some(current) => current.union(anchor_rect),
+                                        None => anchor_rect,
+                                    });
+                                }
+                            }
+                            let is_select = matches!(rendered.action, Some(RowAction::Select));
+                            match rendered.action {
+                                Some(RowAction::Select) if !suppress_select => {
+                                    tab.set_keyword_highlight(None);
+                                    tab.context_line = Some(i);
+                                    tab.ensure_visible();
+                                }
+                                Some(RowAction::Pin) => {
+                                    if let Some(anchor_rect) = rendered.anchor_rect {
+                                        context_pin = Some((i, anchor_rect));
+                                    }
+                                }
+                                Some(
+                                    action @ (RowAction::CopyFull
+                                    | RowAction::CopyWithoutHeader
+                                    | RowAction::CopyWithLineNumber),
+                                ) => context_copy = Some((i, action)),
+                                Some(RowAction::OpenFullLine) => open_full_line = Some(i),
+                                Some(RowAction::TrimRight) => {
+                                    context_trim = Some(TrimAction::TrimRight(i))
+                                }
+                                Some(RowAction::TrimLeft) => {
+                                    context_trim = Some(TrimAction::TrimLeft(i))
+                                }
+                                Some(RowAction::Keyword(kw)) => tab.set_keyword_highlight(Some(kw)),
+                                _ => {}
+                            }
+                            if is_select && tab.drag_selecting {
+                                suppress_select = true;
+                            }
+                        }
+                    })
+                    .inner
+                })
+            } else {
+                scroll_area.show_rows(ui, row_height, total_visible, |ui, range| {
+                    for vi in range {
+                        let i = match &tab.visible_lines {
+                            Some(vis) => vis[vi] as usize,
+                            None => vi,
+                        };
+                        let selected = tab.context_line == Some(i);
 
-                    if hovered_annotation.is_none() {
-                        hovered_annotation = rendered.hovered;
-                    }
-                    let is_select = matches!(rendered.action, Some(RowAction::Select));
-                    match rendered.action {
-                        Some(RowAction::Select) if !suppress_select => {
-                            tab.set_keyword_highlight(None);
-                            tab.context_line = Some(i);
-                            tab.ensure_visible();
-                        }
-                        Some(RowAction::Pin) => {
-                            context_pin = Some(i);
-                        }
-                        Some(RowAction::TrimRight) => {
-                            context_trim = Some(TrimAction::TrimRight(i));
-                        }
-                        Some(RowAction::TrimLeft) => {
-                            context_trim = Some(TrimAction::TrimLeft(i));
-                        }
-                        Some(RowAction::Keyword(kw)) => {
-                            // Only paint the keyword highlight; never touch the
-                            // search box (Esc / single-click clears it).
-                            tab.set_keyword_highlight(Some(kw));
-                        }
-                        Some(RowAction::OpenData(detection, anchor)) => {
-                            open_data = Some(detection);
-                            tab.embedded_inspector_anchor = Some(anchor);
-                        }
-                        _ => {}
-                    }
+                        let rendered = render_row(
+                            ui,
+                            &tab.doc,
+                            &Highlights::from_tab(tab),
+                            i,
+                            selected,
+                            font_id.clone(),
+                            theme,
+                            row_height,
+                            selection_range,
+                            char_width,
+                            gutter_width,
+                            tab.log_line_display_mode,
+                        );
 
-                    // If this row was a click but we later determine it was actually a drag,
-                    // suppress the select action. For simplicity, we track whether any row
-                    // received a click this frame and suppress on the next frame if drag was detected.
-                    if is_select && tab.drag_selecting {
-                        suppress_select = true;
+                        if hovered_annotation.is_none() {
+                            hovered_annotation = rendered.hovered;
+                        }
+                        if let (Some((lo, hi)), Some(anchor_rect)) =
+                            (selection_anchor_range, rendered.anchor_rect)
+                        {
+                            if (lo..=hi).contains(&i) {
+                                selection_anchor_rect = Some(match selection_anchor_rect {
+                                    Some(current) => current.union(anchor_rect),
+                                    None => anchor_rect,
+                                });
+                            }
+                        }
+                        let is_select = matches!(rendered.action, Some(RowAction::Select));
+                        match rendered.action {
+                            Some(RowAction::Select) if !suppress_select => {
+                                tab.set_keyword_highlight(None);
+                                tab.context_line = Some(i);
+                                tab.ensure_visible();
+                            }
+                            Some(RowAction::Pin) => {
+                                if let Some(anchor_rect) = rendered.anchor_rect {
+                                    context_pin = Some((i, anchor_rect));
+                                }
+                            }
+                            Some(
+                                action @ (RowAction::CopyFull
+                                | RowAction::CopyWithoutHeader
+                                | RowAction::CopyWithLineNumber),
+                            ) => {
+                                context_copy = Some((i, action));
+                            }
+                            Some(RowAction::OpenFullLine) => open_full_line = Some(i),
+                            Some(RowAction::TrimRight) => {
+                                context_trim = Some(TrimAction::TrimRight(i));
+                            }
+                            Some(RowAction::TrimLeft) => {
+                                context_trim = Some(TrimAction::TrimLeft(i));
+                            }
+                            Some(RowAction::Keyword(kw)) => {
+                                // Only paint the keyword highlight; never touch the
+                                // search box (Esc / single-click clears it).
+                                tab.set_keyword_highlight(Some(kw));
+                            }
+                            _ => {}
+                        }
+
+                        // If this row was a click but we later determine it was actually a drag,
+                        // suppress the select action. For simplicity, we track whether any row
+                        // received a click this frame and suppress on the next frame if drag was detected.
+                        if is_select && tab.drag_selecting {
+                            suppress_select = true;
+                        }
                     }
-                }
-            });
+                })
+            };
             output
         },
     );
     let output = inner_resp.inner;
+    let virtual_top = wrap_offsets
+        .as_ref()
+        .map(|offsets| {
+            offsets
+                .partition_point(|offset| *offset <= output.state.offset.y)
+                .saturating_sub(1)
+                .min(total_visible.saturating_sub(1))
+        })
+        .unwrap_or_else(|| (output.state.offset.y / row_height).floor() as usize);
+    let top_line = tab
+        .visible_lines
+        .as_ref()
+        .and_then(|lines| lines.get(virtual_top).copied().map(|line| line as usize))
+        .or_else(|| (virtual_top < n).then_some(virtual_top));
+    if let Some(top_line) = top_line {
+        tab.scroll_top_line = Some(top_line);
+        tab.scroll_fraction = wrap_offsets
+            .as_ref()
+            .and_then(|offsets| {
+                offsets.get(virtual_top..=virtual_top + 1).map(|pair| {
+                    ((output.state.offset.y - pair[0]) / (pair[1] - pair[0]).max(1.0))
+                        .clamp(0.0, 1.0)
+                })
+            })
+            .unwrap_or_else(|| {
+                ((output.state.offset.y / row_height) - virtual_top as f32).clamp(0.0, 1.0)
+            });
+    }
+    tab.log_viewport_height = Some(output.inner_rect.height().max(0.0));
 
     // Apply deferred context menu actions.
-    apply_context_actions(tab, context_pin, context_trim);
-    if let Some(detection) = open_data {
-        // Keep the user's Tree/Pretty/Raw choice for ordinary structured data.
-        // Stack traces and encoded values still get their safe, detector-specific
-        // starting views whenever one of those payloads is opened.
-        tab.embedded_inspector_mode = inspector_mode_for_open(
-            tab.embedded_inspector_mode,
-            inspector_mode_for(detection.detector_id),
-        );
-        tab.embedded_inspector = Some(detection);
+    apply_context_actions(tab, context_pin, context_trim, context_copy, ui.ctx());
+    if let Some(line) = open_full_line {
+        tab.full_line_inspector = Some(line);
     }
-
+    // Reserve Escape for the active analysis bubble before the independent
+    // annotation hover lifecycle gets a chance to consume it.
+    let analysis_popup_escape = tab.analysis_popup.is_some()
+        && ui
+            .ctx()
+            .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let suppress_annotation_hover = tab.drag_selecting
         || tab.pending_selection.is_some()
         || ui
             .input(|input| input.pointer.any_down() || input.smooth_scroll_delta.length_sq() > 0.0);
-    update_annotation_hover(
+    annotation_popup::update(
         tab,
         hovered_annotation,
         suppress_annotation_hover,
         ui.ctx(),
         Instant::now(),
     );
-    show_annotation_hover_bubble(ui, tab, theme);
+    annotation_popup::show(ui, tab, theme);
 
     // ---- compute viewport_range for timeline shadow ----
-    update_viewport_range(tab, &rendered_range, pending);
+    let fully_visible_range = fully_visible_virtual_range(
+        output.state.offset.y,
+        output.inner_rect.height(),
+        row_height,
+        wrap_offsets.as_ref().map(|offsets| offsets.as_slice()),
+        total_visible,
+    );
+    update_viewport_range(tab, fully_visible_range, pending);
+    if let Some(target_line) = pending {
+        let target_virtual = virtual_index_for_line(tab, target_line, total_visible);
+        let target_is_fully_visible = target_virtual
+            .zip(fully_visible_range)
+            .is_some_and(|(target, (first, last))| (first..=last).contains(&target));
+        let target_is_taller_than_viewport = wrap_offsets
+            .as_deref()
+            .and_then(|offsets| target_virtual.map(|target| (offsets, target)))
+            .and_then(|(offsets, target)| Some(offsets.get(target + 1)? - offsets.get(target)?))
+            .is_some_and(|height| height > output.inner_rect.height());
+
+        if !target_is_fully_visible && target_is_taller_than_viewport {
+            // A wrapped logical line taller than the viewport cannot ever be
+            // fully shown. Select the nearest line that can be fully shown.
+            if let Some((first, last)) = fully_visible_range {
+                let replacement = target_virtual.unwrap_or(first).clamp(first, last);
+                let replacement = tab
+                    .visible_lines
+                    .as_ref()
+                    .and_then(|visible| visible.get(replacement).copied())
+                    .map(|line| line as usize)
+                    .unwrap_or(replacement);
+                if tab.context_line != Some(replacement) {
+                    tab.context_line = Some(replacement);
+                    tab.sync_navigation_positions(replacement);
+                }
+            }
+        } else if !target_is_fully_visible && fully_visible_range.is_some() {
+            // The pre-layout estimate can be larger than the actual viewport
+            // (notably when Horizontal Scroll adds its bottom scrollbar).
+            // Re-run navigation once with the measured height.
+            tab.pending_scroll = Some(target_line);
+            ui.ctx().request_repaint();
+        }
+    }
+    // Once the current viewport has been laid out, keep the selection stable
+    // while it remains visible. If it is outside the viewport (most commonly
+    // after a manual scroll), move it to the nearest visible edge instead of
+    // leaving the UI with no selected row in view.
+    if pending.is_none()
+        && restored_scroll.is_none()
+        && preserve_anchor.is_none()
+        && reconcile_selection_after_user_scroll(tab)
+    {
+        ui.ctx().request_repaint();
+    }
     if tab.schedule_embedded_scan() {
         ui.ctx().request_repaint_after(Duration::from_millis(60));
     }
@@ -249,12 +490,13 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     // ---- arrow-key find navigation ----
     if tab.pin_modal.is_none() && tab.pending_selection.is_none() {
         let search_has_focus = tab.find_rx.is_some() || !tab.find_query.is_empty();
-        let search_input_focused = ui
-            .ctx()
-            .memory(|memory| memory.has_focus(egui::Id::new("log_find_input")));
+        // Arrow keys belong to whichever text editor owns keyboard input —
+        // not only the Log View find box. This includes Add Filter, notes,
+        // custom-date fields, and detached text editors.
+        let text_edit_focused = ui.ctx().egui_wants_keyboard_input();
         ui.input_mut(|i| {
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                && !search_input_focused
+                && !text_edit_focused
                 && (tab.selected_lane.is_some() || !search_has_focus)
             {
                 if tab.selected_lane.is_some() {
@@ -264,7 +506,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 }
             }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-                && !search_input_focused
+                && !text_edit_focused
                 && (tab.selected_lane.is_some() || !search_has_focus)
             {
                 if tab.selected_lane.is_some() {
@@ -273,10 +515,10 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     tab.find_next();
                 }
             }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) && !search_input_focused {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) && !text_edit_focused {
                 navigate_vertical(tab, false);
             }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) && !search_input_focused {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) && !text_edit_focused {
                 navigate_vertical(tab, true);
             }
         });
@@ -287,11 +529,11 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         && tab.pending_selection.is_none()
         && ui.input(|i| i.key_pressed(egui::Key::Escape))
     {
-        if tab.keyword_highlight.is_some() {
-            tab.set_keyword_highlight(None);
-        } else if !tab.find_query.is_empty() {
+        if tab.find_rx.is_some() || !tab.find_query.is_empty() {
             tab.clear_find();
             tab.find_input.clear();
+        } else if tab.keyword_highlight.is_some() {
+            tab.set_keyword_highlight(None);
         }
     }
 
@@ -311,6 +553,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                         inner_rect,
                         output.state.offset.y,
                         row_height,
+                        wrap_offsets.as_ref().map(|offsets| offsets.as_slice()),
                         total_visible,
                         &tab.visible_lines,
                     ) {
@@ -329,6 +572,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             inner_rect,
             output.state.offset.y,
             row_height,
+            wrap_offsets.as_ref().map(|offsets| offsets.as_slice()),
             total_visible,
             &tab.visible_lines,
         ) {
@@ -381,361 +625,59 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         tab.selection_range = None;
     }
 
-    // ---- selection popup (single "📌 Pin" button) ----
-    if let Some(pending_range) = tab.pending_selection {
-        let (start, end) = pending_range;
-        let count = match &tab.visible_lines {
-            Some(vis) => visible_lines_in_range(vis, start, end).len(),
-            None => end - start + 1,
-        };
-
-        let popup_id = egui::Id::new("selection_popup");
-        if tab.selection_popup_opened_at.is_none() {
-            tab.selection_popup_opened_at = Some(Instant::now());
-        }
-        let popup_anchor_pos = tab
-            .selection_popup_pos
-            .unwrap_or_else(|| ui.input(|i| i.pointer.latest_pos().unwrap_or_default()));
-        let popup_pos = popup_anchor_pos + egui::vec2(8.0, 8.0);
-
-        let area = egui::Area::new(popup_id)
-            .current_pos(popup_pos)
-            .order(egui::Order::Foreground)
-            .fixed_pos(popup_pos);
-        let area_resp = area.show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(240.0);
-                ui.label(
-                    RichText::new(format!("Selected: {} lines ({}-{})", count, start, end))
-                        .strong()
-                        .size(13.0),
+    // ---- analysis bubble for a drag-selected range ----
+    if tab.analysis_popup.is_none() {
+        if let Some(range) = tab.pending_selection {
+            if pending_selection_before == Some(range) {
+                let fallback = tab
+                    .selection_popup_pos
+                    .map(|position| Rect::from_center_size(position, egui::vec2(1.0, 1.0)))
+                    .unwrap_or_else(|| {
+                        Rect::from_center_size(
+                            ui.input(|input| input.pointer.latest_pos().unwrap_or_default()),
+                            egui::vec2(1.0, 1.0),
+                        )
+                    });
+                let cursor = tab.selection_popup_pos.unwrap_or_else(|| fallback.center());
+                analysis_popup::open_actions(
+                    tab,
+                    range,
+                    cursor,
+                    selection_anchor_rect.unwrap_or(fallback),
                 );
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    if ui.button("Pin").clicked() {
-                        tab.pin_modal = Some(pending_range);
-                        tab.pin_comment.clear();
-                        tab.pending_selection = None;
-                        tab.drag_start_pos = None;
-                        tab.selection_popup_pos = None;
-                        tab.selection_popup_opened_at = None;
-                    }
-                });
-
-                if ui.button("Cancel").clicked() {
-                    tab.selection_range = None;
-                    tab.pending_selection = None;
-                    tab.drag_start_pos = None;
-                    tab.selection_popup_pos = None;
-                    tab.selection_popup_opened_at = None;
-                }
-            });
-        });
-
-        if area_resp.response.hovered() {
-            tab.selection_popup_opened_at = Some(Instant::now());
-        } else if tab
-            .selection_popup_opened_at
-            .is_some_and(|opened| opened.elapsed() >= Duration::from_secs(2))
-        {
-            tab.selection_range = None;
-            tab.pending_selection = None;
-            tab.drag_start_pos = None;
-            tab.selection_popup_pos = None;
-            tab.selection_popup_opened_at = None;
-        } else {
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
-        }
-
-        // Close on click outside
-        if ui.input(|i| i.pointer.any_click()) {
-            if let Some(click_pos) = ui.input(|i| i.pointer.interact_pos()) {
-                if !area_resp.response.rect.contains(click_pos) {
-                    tab.selection_range = None;
-                    tab.pending_selection = None;
-                    tab.drag_start_pos = None;
-                    tab.selection_popup_pos = None;
-                    tab.selection_popup_opened_at = None;
-                }
+            } else {
+                // Let the selected rows lay out once with the final range so
+                // the bubble can be positioned above/below all selected text.
+                ui.ctx().request_repaint();
             }
         }
     }
 
-    // (The pin modal moved to `pin_modal_ui`, drawn at the app level so it
-    // works even when the Log view isn't the focused dock tab.)
-}
-
-fn update_annotation_hover(
-    tab: &mut LogTab,
-    candidate: Option<AnnotationHoverCandidate>,
-    suppress: bool,
-    ctx: &egui::Context,
-    now: Instant,
-) {
-    let (pointer_pos, pointer_delta) = ctx.input(|input| {
-        (
-            input.pointer.latest_pos(),
-            input
-                .pointer
-                .motion()
-                .unwrap_or_else(|| input.pointer.delta()),
-        )
-    });
-    let pointer_over_bubble = tab.annotation_hover.as_ref().is_some_and(|state| {
-        pointer_pos.is_some_and(|pointer| {
-            state
-                .bubble_rect
-                .is_some_and(|bubble| bubble.expand(3.0).contains(pointer))
-        })
-    });
-    if suppress && !pointer_over_bubble {
-        tab.annotation_hover = None;
-        return;
-    }
-
-    match candidate {
-        Some(candidate) => match tab.annotation_hover.as_mut() {
-            Some(state) if state.key == candidate.key => {
-                if state.bubble_rect.is_none()
-                    && pointer_delta.length() > ANNOTATION_HOVER_MOVE_RESET
-                {
-                    state.started_at = now;
-                }
-                state.source_rect = candidate.source_rect;
-                state.last_seen_at = now;
+    if let Some(action) = analysis_popup::show(ui, tab, theme, analysis_popup_escape) {
+        match action {
+            analysis_popup::Action::Save { range, text } => {
+                tab.pin_comment = text;
+                save_pin(tab, range);
+                analysis_popup::clear_after_save(tab);
             }
-            _ => {
-                tab.annotation_hover = Some(AnnotationHoverState {
-                    key: candidate.key,
-                    source_rect: candidate.source_rect,
-                    started_at: now,
-                    last_seen_at: now,
-                    bubble_rect: None,
-                });
-            }
-        },
-        None => {
-            if pointer_over_bubble {
-                if let Some(state) = tab.annotation_hover.as_mut() {
-                    state.last_seen_at = now;
-                }
-            } else if tab.annotation_hover.as_ref().is_some_and(|state| {
-                now.duration_since(state.last_seen_at) > ANNOTATION_HOVER_GRACE
-            }) {
-                tab.annotation_hover = None;
-            }
-        }
-    }
-
-    if let Some(state) = &tab.annotation_hover {
-        if now.duration_since(state.started_at) < ANNOTATION_HOVER_DELAY {
-            ctx.request_repaint_after(
-                ANNOTATION_HOVER_DELAY.saturating_sub(now.duration_since(state.started_at)),
-            );
-        } else {
-            ctx.request_repaint_after(ANNOTATION_HOVER_GRACE);
+            analysis_popup::Action::Cancel => analysis_popup::dismiss(tab),
         }
     }
 }
 
-fn show_annotation_hover_bubble(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
-    let Some(state) = tab.annotation_hover.as_ref() else {
-        return;
-    };
-    if state.started_at.elapsed() < ANNOTATION_HOVER_DELAY {
-        return;
-    }
-    let key = state.key;
-    let source_rect = state.source_rect;
-    let (badge, title, summary, preview, source, accent, detection, secondary_label, normalized) =
-        match key {
-            AnnotationHoverKey::Embedded { .. } => {
-                let Some(detection) = tab
-                    .embedded_detections
-                    .iter()
-                    .find(|detection| AnnotationHoverKey::for_detection(detection) == key)
-                    .cloned()
-                else {
-                    tab.annotation_hover = None;
-                    return;
-                };
-                let presentation = presentation(detection.detector_id);
-                (
-                    presentation.badge,
-                    presentation.title,
-                    detection.summary(),
-                    compact_source_preview(&detection.raw, 180),
-                    detection.raw.clone(),
-                    theme.embedded_data,
-                    Some(detection),
-                    "Open inspector",
-                    None,
-                )
-            }
-            AnnotationHoverKey::Timestamp { span } => {
-                let Some(relative_line) = span.start.line.checked_sub(tab.doc.trim_start) else {
-                    tab.annotation_hover = None;
-                    return;
-                };
-                let Some((epoch_ms, range)) = tab.doc.explicit_timestamp_at(relative_line) else {
-                    tab.annotation_hover = None;
-                    return;
-                };
-                if range.start != span.start.byte || range.end != span.end.byte {
-                    tab.annotation_hover = None;
-                    return;
-                }
-                let line = tab.doc.line(relative_line);
-                let Some(raw) = line.get(range) else {
-                    tab.annotation_hover = None;
-                    return;
-                };
-                let family = tab.doc.time_format_name().unwrap_or_else(|| {
-                    if tab.doc.format_name() == "json" {
-                        "JSON field".to_owned()
-                    } else {
-                        "field-based".to_owned()
-                    }
-                });
-                let normalized = format!("{} UTC", format_ms(epoch_ms));
-                (
-                    "TIME",
-                    "Timestamp",
-                    format!("{family} · normalized to UTC"),
-                    raw.to_owned(),
-                    raw.to_owned(),
-                    theme.timestamp,
-                    None,
-                    "Copy UTC",
-                    Some(normalized),
-                )
-            }
-        };
-
-    let screen = ui.ctx().content_rect();
-    let bubble_width = 340.0_f32.min((screen.width() - 16.0).max(180.0));
-    let estimated_height = 112.0;
-    let above = source_rect.top() - screen.top() > estimated_height + 12.0;
-    let inset = 8.0;
-    let min_x = screen.left() + inset;
-    let max_x = (screen.right() - bubble_width - inset).max(min_x);
-    let x = (source_rect.center().x - bubble_width * 0.5).clamp(min_x, max_x);
-    let preferred_y = if above {
-        source_rect.top() - estimated_height - 7.0
-    } else {
-        source_rect.bottom() + 7.0
-    };
-    let min_y = screen.top() + inset;
-    let max_y = (screen.bottom() - estimated_height - inset).max(min_y);
-    let y = preferred_y.clamp(min_y, max_y);
-
-    let mut copy_source = false;
-    let mut secondary_action = false;
-    let area = egui::Area::new(egui::Id::new(("annotation_hover_bubble", key)))
-        .order(egui::Order::Foreground)
-        .fixed_pos(Pos2::new(x, y))
-        .show(ui.ctx(), |ui| {
-            egui::Frame::NONE
-                .fill(scaled_alpha(theme.surface, 0.94))
-                .stroke(Stroke::new(1.0, scaled_alpha(accent, 0.72)))
-                .corner_radius(6.0)
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_width(bubble_width - 20.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(badge).strong().color(accent));
-                        ui.label(RichText::new(title).strong().color(theme.text));
-                    });
-                    ui.label(RichText::new(summary).small().color(theme.text_muted));
-                    ui.label(RichText::new(preview).monospace().color(theme.text));
-                    ui.horizontal(|ui| {
-                        copy_source = ui.button("Copy source").clicked();
-                        secondary_action = ui.button(secondary_label).clicked();
-                    });
-                });
-        });
-
-    let bubble_rect = area.response.rect;
-    if let Some(state) = tab.annotation_hover.as_mut() {
-        state.bubble_rect = Some(bubble_rect);
-        if area.response.hovered() {
-            state.last_seen_at = Instant::now();
-        }
-    }
-
-    let arrow_x = source_rect
-        .center()
-        .x
-        .clamp(bubble_rect.left() + 10.0, bubble_rect.right() - 10.0);
-    let arrow = if above {
-        vec![
-            Pos2::new(arrow_x - 5.0, bubble_rect.bottom() - 1.0),
-            Pos2::new(arrow_x + 5.0, bubble_rect.bottom() - 1.0),
-            Pos2::new(source_rect.center().x, source_rect.top()),
-        ]
-    } else {
-        vec![
-            Pos2::new(arrow_x - 5.0, bubble_rect.top() + 1.0),
-            Pos2::new(arrow_x + 5.0, bubble_rect.top() + 1.0),
-            Pos2::new(source_rect.center().x, source_rect.bottom()),
-        ]
-    };
-    ui.ctx()
-        .layer_painter(area.response.layer_id)
-        .add(egui::Shape::convex_polygon(
-            arrow,
-            scaled_alpha(theme.surface, 0.94),
-            Stroke::new(1.0, scaled_alpha(accent, 0.72)),
-        ));
-
-    if copy_source {
-        ui.ctx().copy_text(source);
-        tab.pending_toast = Some("Copied source annotation".to_owned());
-        if let Some(state) = tab.annotation_hover.as_mut() {
-            state.last_seen_at = Instant::now();
-        }
-    }
-    if secondary_action {
-        if let Some(detection) = detection {
-            tab.embedded_inspector_mode = inspector_mode_for_open(
-                tab.embedded_inspector_mode,
-                inspector_mode_for(detection.detector_id),
-            );
-            tab.embedded_inspector_anchor = Some(source_rect.left_center());
-            tab.embedded_inspector = Some(detection);
-            tab.annotation_hover = None;
-        } else if let Some(normalized) = normalized {
-            ui.ctx().copy_text(normalized);
-            tab.pending_toast = Some("Copied normalized timestamp".to_owned());
-            if let Some(state) = tab.annotation_hover.as_mut() {
-                state.last_seen_at = Instant::now();
-            }
-        }
-    }
-}
-
-fn compact_source_preview(raw: &str, max_chars: usize) -> String {
-    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = compact.chars();
-    let preview = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{preview}…")
-    } else {
-        preview
-    }
-}
-
-/// Render the pin creation/editing modal (comment + log preview). Called from
-/// the app level so it works regardless of which dock tab or detached
-/// viewport is focused. Reuses the same window for creating a new pin and for
-/// editing an existing one (when `tab.pin_edit_index` is set).
+/// Render the pin editing modal (comment + log preview). Called from the app
+/// level so it works regardless of which dock tab or detached viewport is
+/// focused. New pins from Log View use `analysis_popup`; this remains the
+/// detailed editor for existing Pin-panel entries.
 pub fn pin_modal_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let Some(range) = tab.pin_modal else { return };
     let (start, end) = range;
     // Compute the actual visible lines within the range (respects text filters).
     let visible_in_range: Vec<usize> = match &tab.visible_lines {
-        Some(vis) => visible_lines_in_range(vis, start, end).to_vec(),
+        Some(vis) => visible_lines_in_range(vis, start, end)
+            .iter()
+            .map(|&line| line as usize)
+            .collect(),
         None => (start..=end).collect(),
     };
     let actual_count = visible_in_range.len();
@@ -865,10 +807,26 @@ pub fn pin_modal_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if icons::action_button(
+                    ui,
+                    Icon::Save,
+                    "Save pin",
+                    theme.text,
+                    "Save this pinned evidence",
+                )
+                .clicked()
+                {
                     do_save = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if icons::action_button(
+                    ui,
+                    Icon::Close,
+                    "Cancel",
+                    theme.text,
+                    "Cancel without saving",
+                )
+                .clicked()
+                {
                     do_cancel = true;
                 }
             });
@@ -886,6 +844,67 @@ pub fn pin_modal_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 const INSPECTOR_MIN_SIZE: egui::Vec2 = egui::Vec2::new(520.0, 220.0);
 const INSPECTOR_HORIZONTAL_GAP: f32 = 4.0;
 const INSPECTOR_VERTICAL_GAP: f32 = 12.0;
+
+/// Full, untruncated source for one Log View row. This is deliberately a
+/// plain text inspector (rather than the structured-payload inspector below)
+/// so it works for every log format and preserves the exact mmap-backed line.
+pub fn full_line_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
+    let Some(line) = tab.full_line_inspector else {
+        return;
+    };
+    if line >= tab.doc.total_lines() {
+        tab.full_line_inspector = None;
+        return;
+    }
+    let source = tab.doc.line(line).into_owned();
+    let mut open = true;
+    egui::Window::new(format!("Full line {}", tab.doc.trim_start + line + 1))
+        .id(egui::Id::new((
+            "full_line_inspector",
+            tab.doc.trim_start + line,
+        )))
+        .open(&mut open)
+        .resizable(true)
+        .default_size(egui::vec2(760.0, 380.0))
+        .min_size(egui::vec2(420.0, 180.0))
+        .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} bytes", source.len()))
+                        .monospace()
+                        .color(theme.text_muted),
+                );
+                if icons::action_button(
+                    ui,
+                    Icon::Copy,
+                    "Copy full line",
+                    theme.text,
+                    "Copy the complete, untruncated source line",
+                )
+                .clicked()
+                {
+                    ui.ctx().copy_text(source.clone());
+                    tab.pending_toast = Some("Full line copied".to_string());
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&source).monospace())
+                            .selectable(true)
+                            .extend(),
+                    );
+                });
+        });
+    if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        open = false;
+    }
+    if !open {
+        tab.full_line_inspector = None;
+    }
+}
 
 /// Persistent structured-data inspector, drawn as an in-view foreground
 /// overlay so it stays visually attached to the cue that opened it.
@@ -930,8 +949,7 @@ pub fn embedded_data_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &T
                     detection.span.end.line + 1
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icons::image_button(ui, Icon::Close, egui::vec2(22.0, 22.0), theme.text)
-                        .on_hover_text("Close inspector")
+                    if icons::icon_action_button(ui, Icon::Close, theme.text, "Close inspector")
                         .clicked()
                     {
                         close = true;
@@ -963,14 +981,39 @@ pub fn embedded_data_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &T
                     "Raw",
                 );
                 ui.separator();
-                if presentation.explicit_decode && ui.button("Decode preview").clicked() {
+                if presentation.explicit_decode
+                    && icons::action_button(
+                        ui,
+                        Icon::Analysis,
+                        "Decode preview",
+                        theme.text,
+                        "Decode and preview this embedded value",
+                    )
+                    .clicked()
+                {
                     tab.embedded_inspector_mode = EmbeddedInspectorMode::Decoded;
                 }
-                if ui.button("Copy raw").clicked() {
+                if icons::action_button(
+                    ui,
+                    Icon::Copy,
+                    "Copy raw",
+                    theme.text,
+                    "Copy the exact embedded source",
+                )
+                .clicked()
+                {
                     ui.ctx().copy_text(detection.raw.clone());
                     tab.pending_toast = Some("Copied raw embedded data".to_string());
                 }
-                if ui.button("Copy pretty").clicked() {
+                if icons::action_button(
+                    ui,
+                    Icon::Copy,
+                    "Copy formatted",
+                    theme.text,
+                    "Copy the formatted embedded value",
+                )
+                .clicked()
+                {
                     ui.ctx().copy_text(detection.pretty.clone());
                     tab.pending_toast = Some("Copied formatted embedded data".to_string());
                 }
@@ -1020,7 +1063,7 @@ pub fn embedded_data_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &T
     }
 }
 
-fn inspector_mode_for(detector_id: &str) -> EmbeddedInspectorMode {
+pub(super) fn inspector_mode_for(detector_id: &str) -> EmbeddedInspectorMode {
     match presentation(detector_id).primary_tab {
         "Frames" => EmbeddedInspectorMode::Frames,
         "Summary" => EmbeddedInspectorMode::Summary,
@@ -1028,7 +1071,7 @@ fn inspector_mode_for(detector_id: &str) -> EmbeddedInspectorMode {
     }
 }
 
-fn inspector_mode_for_open(
+pub(super) fn inspector_mode_for_open(
     current: EmbeddedInspectorMode,
     detector_mode: EmbeddedInspectorMode,
 ) -> EmbeddedInspectorMode {
@@ -1263,7 +1306,7 @@ fn data_leaf(ui: &mut egui::Ui, label: &str, display: &str, copy: &str, theme: &
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).strong());
         ui.label(RichText::new(display).monospace().color(theme.log_text));
-        if ui.small_button("Copy").clicked() {
+        if icons::icon_action_button(ui, Icon::Copy, theme.text, "Copy this value").clicked() {
             ui.ctx().copy_text(copy.to_string());
         }
     });
@@ -1289,33 +1332,25 @@ fn save_pin(tab: &mut LogTab, range: (usize, usize)) {
     // When visible_lines is active (filtered view), only include lines that
     // are actually visible, since the user's selection spans virtual indices.
     let line_numbers: Vec<usize> = match &tab.visible_lines {
-        Some(vis) => visible_lines_in_range(vis, start, end).to_vec(),
+        Some(vis) => visible_lines_in_range(vis, start, end)
+            .iter()
+            .map(|&line| line as usize)
+            .collect(),
         None => (start..=end).collect(),
     };
-    let start_ts = tab.doc.ts_at_opt(start).unwrap_or(-1);
-    let end_ts = tab.doc.ts_at_opt(end).unwrap_or(-1);
     let comment = tab.pin_comment.trim().to_string();
+    let Some(pin) = PinEntry::anchored(&tab.doc, line_numbers, comment) else {
+        tab.pending_toast = Some("No visible log lines to pin".to_string());
+        return;
+    };
 
     if let Some(idx) = tab.pin_edit_index {
         // Editing an existing pin: replace its content in place.
         if idx < tab.pins.len() {
-            let p = &mut tab.pins[idx];
-            p.start_line = start;
-            p.line_numbers = line_numbers;
-            p.start_ts = start_ts;
-            p.end_ts = end_ts;
-            p.comment = comment;
-            p.unanchored = false;
+            tab.pins[idx] = pin;
         }
     } else {
-        tab.pins.push(PinEntry {
-            start_line: start,
-            line_numbers,
-            start_ts,
-            end_ts,
-            comment,
-            unanchored: false,
-        });
+        tab.pins.push(pin);
     }
     tab.pin_modal = None;
     tab.pin_edit_index = None;
@@ -1340,16 +1375,23 @@ fn navigate_vertical(tab: &mut LogTab, next: bool) {
 /// Font-size buttons, trim indicator, and "lines visible" label.
 fn show_toolbar(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme, _max_visible_lines: usize) {
     ui.horizontal(|ui| {
+        ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
         if ui
-            .button("A-")
-            .on_hover_text("Decrease text size")
+            .add_sized(
+                egui::vec2(28.0, icons::ACTION_HEIGHT),
+                egui::Button::new("A−").frame_when_inactive(false),
+            )
+            .on_hover_text("Decrease log text size")
             .clicked()
         {
             tab.log_font_size = (tab.log_font_size - 1.0).max(8.0);
         }
         if ui
-            .button("A+")
-            .on_hover_text("Increase text size")
+            .add_sized(
+                egui::vec2(28.0, icons::ACTION_HEIGHT),
+                egui::Button::new("A+").frame_when_inactive(false),
+            )
+            .on_hover_text("Increase log text size")
             .clicked()
         {
             tab.log_font_size = (tab.log_font_size + 1.0).min(24.0);
@@ -1372,10 +1414,14 @@ fn show_toolbar(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme, _max_visible
                     .color(theme.warning)
                     .size(11.0),
             );
-            if ui
-                .button("Reset")
-                .on_hover_text("Reset trim to show all lines")
-                .clicked()
+            if icons::action_button(
+                ui,
+                Icon::Reset,
+                "Reset trim",
+                theme.text,
+                "Reset trim to show all lines",
+            )
+            .clicked()
             {
                 tab.handle_trim_reset();
             }
@@ -1386,21 +1432,289 @@ fn show_toolbar(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme, _max_visible
         ui.separator();
         ui.add_space(8.0);
         show_search_ui(ui, tab, theme);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            show_export_menu(ui, tab, theme);
+        });
     });
 }
 
+/// One right-anchored entry point keeps all Log View export scopes discoverable.
+fn show_export_menu(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
+    let button = egui::Button::image_and_text(
+        icons::icon_image(ui.ctx(), Icon::Export, 14.0, theme.text),
+        "Export",
+    )
+    .frame_when_inactive(false)
+    .min_size(egui::vec2(0.0, icons::ACTION_HEIGHT));
+    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+        if let Some((start, end)) = tab.pending_selection.or(tab.selection_range) {
+            if icons::action_button(
+                ui,
+                Icon::Export,
+                "Selected rows",
+                theme.text,
+                "Export the selected rows as text",
+            )
+            .clicked()
+            {
+                save_text_file(
+                    tab,
+                    "selected-log.txt",
+                    lines_text(tab, start, end, false, false),
+                    "Selected rows exported",
+                );
+                ui.close();
+            }
+        } else {
+            icons::action_button_enabled(
+                ui,
+                false,
+                Icon::Export,
+                "Selected rows",
+                theme.text,
+                "Drag across rows to select an export range",
+            );
+        }
+        if icons::action_button(
+            ui,
+            Icon::Export,
+            "Visible / filtered rows",
+            theme.text,
+            "Export every row in the current filtered view",
+        )
+        .clicked()
+        {
+            let last = tab.doc.total_lines().saturating_sub(1);
+            let text = match &tab.visible_lines {
+                Some(lines) => lines
+                    .iter()
+                    .map(|&line| {
+                        let line = line as usize;
+                        lines_text(tab, line, line, false, false)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                None => lines_text(tab, 0, last, false, false),
+            };
+            save_text_file(tab, "visible-log.txt", text, "Visible rows exported");
+            ui.close();
+        }
+        if tab.timeline_zoom.is_some() {
+            if icons::action_button(
+                ui,
+                Icon::Export,
+                "Current timeline range",
+                theme.text,
+                "Export rows in the current timeline range",
+            )
+            .clicked()
+            {
+                save_text_file(
+                    tab,
+                    "timeline-range.txt",
+                    timeline_range_text(tab),
+                    "Timeline range exported",
+                );
+                ui.close();
+            }
+        } else {
+            icons::action_button_enabled(
+                ui,
+                false,
+                Icon::Export,
+                "Current timeline range",
+                theme.text,
+                "Zoom or brush a timeline range first",
+            );
+        }
+    });
+    response.on_hover_text("Export selected, visible/filtered, or Timeline-range rows.");
+}
+
+/// Return cached estimated wrapped-row offsets. The calculation reads each
+/// source line once when width/font/filter membership changes, never while the
+/// user scrolls; the ScrollArea then lays out only rows intersecting its
+/// viewport.
+fn wrap_offsets_for(
+    tab: &mut LogTab,
+    content_width: f32,
+    char_width: f32,
+    row_height: f32,
+) -> Arc<Vec<f32>> {
+    let visible_len = tab
+        .visible_lines
+        .as_ref()
+        .map_or_else(|| tab.doc.total_lines(), |visible| visible.len());
+    let first_line = tab
+        .visible_lines
+        .as_ref()
+        .and_then(|visible| visible.first().copied().map(|line| line as usize))
+        .or_else(|| (visible_len > 0).then_some(0));
+    let last_line = tab
+        .visible_lines
+        .as_ref()
+        .and_then(|visible| visible.last().copied().map(|line| line as usize))
+        .or_else(|| visible_len.checked_sub(1));
+    let visible_identity = tab
+        .visible_lines
+        .as_ref()
+        .map_or(0, |visible| Arc::as_ptr(visible) as usize);
+    if let Some(layout) = &tab.wrap_layout {
+        if (layout.content_width - content_width).abs() < 1.0
+            && (layout.font_size - tab.log_font_size).abs() < f32::EPSILON
+            && layout.visible_len == visible_len
+            && layout.visible_identity == visible_identity
+            && layout.first_line == first_line
+            && layout.last_line == last_line
+        {
+            return Arc::clone(&layout.offsets);
+        }
+    }
+
+    // Space Mono is monospace. Using byte length makes this a conservative
+    // estimate for non-ASCII source, avoiding visual-row overlap while keeping
+    // the cache inexpensive to build.
+    let columns = (content_width / char_width.max(1.0)).floor().max(1.0);
+    let mut offsets = Vec::with_capacity(visible_len.saturating_add(1));
+    offsets.push(0.0);
+    let mut total = 0.0;
+    for virtual_index in 0..visible_len {
+        let line = tab
+            .visible_lines
+            .as_ref()
+            .map_or(virtual_index, |visible| visible[virtual_index] as usize);
+        let rows = (tab.doc.line_bytes(line).len() as f32 / columns)
+            .ceil()
+            .max(1.0);
+        total += rows * row_height;
+        offsets.push(total);
+    }
+    let offsets = Arc::new(offsets);
+    tab.wrap_layout = Some(crate::ui::app::model::WrapLayout {
+        content_width,
+        font_size: tab.log_font_size,
+        visible_len,
+        visible_identity,
+        first_line,
+        last_line,
+        offsets: Arc::clone(&offsets),
+    });
+    offsets
+}
+
+fn wrap_scroll_offset(tab: &LogTab, offsets: &[f32], line: usize) -> Option<f32> {
+    let virtual_index = virtual_index_for_line(tab, line, offsets.len().saturating_sub(1))?;
+    offsets.get(virtual_index).copied()
+}
+
+fn timeline_range_text(tab: &LogTab) -> String {
+    let Some((start, end)) = tab.timeline_zoom else {
+        return String::new();
+    };
+    let lines: Vec<usize> = match tab.timeline.domain {
+        logotomy::core::timeline::TimelineDomain::Sequence => {
+            let start = start.max(0) as usize;
+            let end = end.max(0) as usize;
+            (start..=end.min(tab.doc.total_lines().saturating_sub(1))).collect()
+        }
+        logotomy::core::timeline::TimelineDomain::Time { .. } => (0..tab.doc.total_lines())
+            .filter(|&line| {
+                tab.doc
+                    .ts_at_opt(line)
+                    .is_some_and(|ts| ts >= start && ts <= end)
+            })
+            .collect(),
+    };
+    lines
+        .into_iter()
+        .map(|line| lines_text(tab, line, line, false, false))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn save_text_file(tab: &mut LogTab, suggested_name: &str, text: String, success: &str) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_file_name(suggested_name)
+        .save_file()
+    else {
+        return;
+    };
+    match std::fs::write(path, text) {
+        Ok(()) => tab.pending_toast = Some(success.to_string()),
+        Err(error) => tab.pending_toast = Some(format!("Export failed: {error}")),
+    }
+}
+
 /// Render the find/search UI in the toolbar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindEnterAction {
+    Start,
+    Next,
+}
+
+fn find_enter_action(
+    input_has_focus: bool,
+    input_lost_focus: bool,
+    enter_pressed: bool,
+    can_execute: bool,
+    query_changed: bool,
+    mode_changed: bool,
+) -> Option<FindEnterAction> {
+    if !enter_pressed || !can_execute || !(input_has_focus || input_lost_focus) {
+        return None;
+    }
+    if query_changed || mode_changed {
+        Some(FindEnterAction::Start)
+    } else {
+        Some(FindEnterAction::Next)
+    }
+}
+
 fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
-    let search_active = !tab.find_query.is_empty();
+    const VALIDATION_DEBOUNCE: Duration = Duration::from_millis(150);
+    let search_active = tab.find_rx.is_some() || !tab.find_query.is_empty();
+    if !tab.find_regex && !tab.find_template_id_mode {
+        tab.find_validate_at = None;
+        tab.find_error = None;
+        tab.find_error_dismissed = false;
+    } else if tab
+        .find_validate_at
+        .is_some_and(|when| Instant::now() >= when)
+    {
+        let input = tab.find_input.trim();
+        tab.find_error = if input.is_empty() {
+            None
+        } else if tab.find_template_id_mode {
+            logotomy::core::search::parse_template_id(input).err()
+        } else {
+            logotomy::core::search::validate_regex(input, tab.find_case_sensitive).err()
+        };
+        tab.find_validate_at = None;
+        tab.find_error_dismissed = false;
+    }
+    let mut input_rect = None;
 
     ui.horizontal(|ui| {
+        ui.add(icons::icon_image(
+            ui.ctx(),
+            Icon::Search,
+            14.0,
+            theme.text_muted,
+        ))
+        .on_hover_text("Search the visible log rows");
         let output = egui::TextEdit::singleline(&mut tab.find_input)
             .id(egui::Id::new("log_find_input"))
-            .hint_text("search log + Enter")
+            .hint_text(if tab.find_template_id_mode {
+                "42, T42, or T{42} + Enter"
+            } else {
+                "search log + Enter"
+            })
             .desired_width(200.0)
+            .min_size(egui::vec2(200.0, icons::ACTION_HEIGHT))
             .show(ui);
         let resp_id = output.response.id;
         let input_resp = output.response;
+        input_rect = Some(input_resp.rect);
 
         // Cmd/Ctrl+F focus: select the existing text and park the caret at the
         // end, so typing replaces the selection and Left-arrow collapses it to
@@ -1445,26 +1759,140 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             }
         }
 
-        if input_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            let trimmed = tab.find_input.trim();
-            if trimmed != tab.find_query {
-                tab.start_find(trimmed.to_string());
-            } else {
-                tab.find_next();
+        if input_resp.has_focus() && tab.find_input.trim().is_empty() {
+            tab.search_suggestions_open = true;
+        }
+        if input_resp.changed() && !tab.find_input.trim().is_empty() {
+            tab.search_suggestions_open = false;
+        }
+        if input_resp.changed() && (tab.find_regex || tab.find_template_id_mode) {
+            tab.find_validate_at = Some(Instant::now() + VALIDATION_DEBOUNCE);
+            tab.find_error = None;
+            tab.find_error_dismissed = false;
+        }
+
+        // Keep this Area alive while a suggestion receives its click. Text
+        // editors release focus before sibling widgets are evaluated, so
+        // tying visibility directly to `has_focus` loses the click.
+        if tab.search_suggestions_open
+            && tab.find_input.trim().is_empty()
+            && !tab.search_history.is_empty()
+            && !tab.find_regex
+            && !tab.find_template_id_mode
+        {
+            let mut chosen = None;
+            let suggestion_area = egui::Area::new(egui::Id::new("log_find_recent_suggestions"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(input_resp.rect.left_bottom())
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(input_resp.rect.width());
+                        ui.set_max_width(input_resp.rect.width());
+                        ui.label(RichText::new("Recent searches").weak());
+                        for query in &tab.search_history {
+                            if suggestion_row::show(ui, query)
+                                .on_hover_text("Run this recent search")
+                                .clicked()
+                            {
+                                chosen = Some(query.clone());
+                            }
+                        }
+                    });
+                });
+            if let Some(query) = chosen {
+                tab.find_input = query.clone();
+                tab.search_suggestions_open = false;
+                tab.start_find(query);
+            } else if ui.input(|input| input.key_pressed(egui::Key::Escape))
+                || (ui.input(|input| input.pointer.any_click())
+                    && !input_resp.has_focus()
+                    && !suggestion_area.response.hovered())
+            {
+                tab.search_suggestions_open = false;
             }
         }
 
-        let case_sensitive = ui
-            .add(
-                egui::Button::new(RichText::new("Aa").monospace())
-                    .selected(tab.find_case_sensitive),
-            )
-            .on_hover_text("Match case");
-        if case_sensitive.clicked() {
-            tab.find_case_sensitive = !tab.find_case_sensitive;
-            if !tab.find_input.trim().is_empty() {
-                tab.start_find(tab.find_input.clone());
+        let mode_label = if tab.find_template_id_mode {
+            "Template ID"
+        } else if tab.find_regex {
+            "Regex"
+        } else if tab.find_case_sensitive {
+            "Text (Aa)"
+        } else {
+            "Text (Ab)"
+        };
+        let original_mode = if tab.find_template_id_mode {
+            3_u8
+        } else if tab.find_regex {
+            2
+        } else if tab.find_case_sensitive {
+            0
+        } else {
+            1
+        };
+        let mut mode = original_mode;
+        egui::ComboBox::from_id_salt("log_find_match_mode")
+            .selected_text(mode_label)
+            .width(108.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut mode, 0, "Text (Aa)")
+                    .on_hover_text("Plain text; match case exactly.");
+                ui.selectable_value(&mut mode, 1, "Text (Ab)")
+                    .on_hover_text("Plain text; match ASCII case-insensitively.");
+                ui.selectable_value(&mut mode, 2, "Regex")
+                    .on_hover_text("Rust regular expression; case follows the selected text mode.");
+                ui.selectable_value(&mut mode, 3, "Template ID")
+                    .on_hover_text("Mined Drain template ID. Enter digits, Tdigits, or T{digits}.");
+            });
+        let mode_changed = mode != original_mode;
+        if mode_changed {
+            match mode {
+                0 => {
+                    tab.find_regex = false;
+                    tab.find_template_id_mode = false;
+                    tab.find_case_sensitive = true;
+                }
+                1 => {
+                    tab.find_regex = false;
+                    tab.find_template_id_mode = false;
+                    tab.find_case_sensitive = false;
+                }
+                2 => {
+                    tab.find_regex = true;
+                    tab.find_template_id_mode = false;
+                }
+                _ => {
+                    tab.find_regex = false;
+                    tab.find_template_id_mode = true;
+                    tab.search_suggestions_open = false;
+                }
             }
+            if tab.find_regex || tab.find_template_id_mode {
+                tab.find_validate_at = Some(Instant::now() + VALIDATION_DEBOUNCE);
+                tab.find_error = None;
+                tab.find_error_dismissed = false;
+                ui.ctx().request_repaint_after(VALIDATION_DEBOUNCE);
+            } else {
+                tab.find_validate_at = None;
+                tab.find_error = None;
+            }
+        }
+
+        let validation_pending = tab.find_validate_at.is_some();
+        let can_execute =
+            !tab.find_input.trim().is_empty() && !validation_pending && tab.find_error.is_none();
+        let trimmed = tab.find_input.trim();
+        match find_enter_action(
+            input_resp.has_focus(),
+            input_resp.lost_focus(),
+            ui.input(|i| i.key_pressed(egui::Key::Enter)),
+            can_execute,
+            trimmed != tab.find_query,
+            mode_changed,
+        ) {
+            Some(FindEnterAction::Start) => tab.start_find(trimmed.to_string()),
+            Some(FindEnterAction::Next) => tab.find_next(),
+            None => {}
         }
 
         if !tab.find_matches.is_empty() {
@@ -1485,42 +1913,26 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             theme.text_muted
         };
         if ui
-            .add_enabled(
-                has_matches,
-                egui::Button::new(icons::icon_image(ui.ctx(), Icon::ArrowUp, 13.0, nav_color)),
-            )
-            .on_hover_text("Previous match")
+            .add_enabled_ui(has_matches, |ui| {
+                icons::icon_action_button(ui, Icon::ArrowUp, nav_color, "Previous match (Shift+F3)")
+            })
+            .inner
             .clicked()
         {
             tab.find_prev();
         }
 
         if ui
-            .add_enabled(
-                has_matches,
-                egui::Button::new(icons::icon_image(
-                    ui.ctx(),
-                    Icon::ArrowDown,
-                    13.0,
-                    nav_color,
-                )),
-            )
-            .on_hover_text("Next match")
+            .add_enabled_ui(has_matches, |ui| {
+                icons::icon_action_button(ui, Icon::ArrowDown, nav_color, "Next match (F3)")
+            })
+            .inner
             .clicked()
         {
             tab.find_next();
         }
 
-        if ui
-            .add(egui::Button::new(icons::icon_image(
-                ui.ctx(),
-                Icon::Close,
-                13.0,
-                theme.text,
-            )))
-            .on_hover_text("Clear search")
-            .clicked()
-        {
+        if icons::icon_action_button(ui, Icon::Close, theme.text, "Clear search (Esc)").clicked() {
             tab.clear_find();
             tab.find_input.clear();
         }
@@ -1533,16 +1945,30 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             && !tab.filters.iter().any(|f| f.text == tab.find_query);
         if can_add_filter {
             if ui
-                .add(egui::Button::image_and_text(
-                    icons::icon_image(ui.ctx(), Icon::Enter, 13.0, theme.text),
-                    "Add Filter",
-                ))
+                .add(
+                    egui::Button::image_and_text(
+                        icons::icon_image(ui.ctx(), Icon::Filter, 14.0, theme.text),
+                        "Add filter",
+                    )
+                    .min_size(egui::vec2(0.0, icons::ACTION_HEIGHT)),
+                )
                 .on_hover_text(format!("Add '{}' as a timeline filter", tab.find_query))
                 .clicked()
             {
                 let color = theme.filter_colors[tab.filters.len() % theme.filter_colors.len()];
-                let query = tab.find_query.clone();
-                tab.push_filter(&query, color);
+                let Some(spec) = tab.find_active_spec.clone() else {
+                    return;
+                };
+                if let Some(template_id) = spec.template_id {
+                    tab.push_template_filter(template_id, color);
+                } else {
+                    tab.push_filter_with_options(
+                        &spec.text,
+                        color,
+                        spec.case_sensitive,
+                        spec.regex,
+                    );
+                }
             }
         }
 
@@ -1550,6 +1976,21 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             ui.spinner();
         }
     });
+
+    if tab.find_validate_at.is_some() {
+        ui.ctx().request_repaint_after(VALIDATION_DEBOUNCE);
+    } else if let (Some(error), Some(anchor)) = (&tab.find_error, input_rect) {
+        let mut bubble_open = !tab.find_error_dismissed;
+        error_bubble(
+            ui.ctx(),
+            "log_find_input_error",
+            anchor,
+            BubbleAlign::Below,
+            error,
+            &mut bubble_open,
+        );
+        tab.find_error_dismissed = !bubble_open;
+    }
 }
 
 fn keyword_at(text: &str, char_idx: usize) -> Option<String> {
@@ -1597,9 +2038,49 @@ fn is_word_delimiter(c: char) -> bool {
         )
 }
 
-/// Compute the deterministic scroll offset for a pending scroll-to-line,
-/// centering the target line in the viewport. Returns `None` when no
-/// pending scroll is needed.
+/// Resolve a real line number to the virtual row used by the Log View.
+/// Filtered views use the nearest row when a programmatic jump targets a
+/// hidden line; unfiltered views map directly to the source line.
+fn virtual_index_for_line(tab: &LogTab, line: usize, total_visible: usize) -> Option<usize> {
+    if total_visible == 0 {
+        return None;
+    }
+    match &tab.visible_lines {
+        Some(visible) => {
+            let index = visible
+                .binary_search(&(line as u32))
+                .unwrap_or_else(|index| index.min(visible.len().saturating_sub(1)));
+            Some(index)
+        }
+        None => Some(line.min(total_visible.saturating_sub(1))),
+    }
+}
+
+/// Convert the real-line viewport shadow back to virtual row indices.
+fn viewport_virtual_range(tab: &LogTab, total_visible: usize) -> Option<(usize, usize)> {
+    let (first, last) = tab.viewport_range?;
+    if total_visible == 0 {
+        return None;
+    }
+    match &tab.visible_lines {
+        Some(visible) => {
+            let first_virtual = visible.partition_point(|&line| (line as usize) < first);
+            let end_virtual = visible.partition_point(|&line| (line as usize) <= last);
+            (first_virtual < end_virtual).then_some((first_virtual, end_virtual - 1))
+        }
+        None => Some((first.min(total_visible - 1), last.min(total_visible - 1))),
+    }
+}
+
+fn max_scroll_offset(total_visible: usize, row_height: f32, avail_height: f32) -> f32 {
+    (total_visible as f32 * row_height - avail_height.max(0.0)).max(0.0)
+}
+
+/// Compute the deterministic scroll offset for a pending selection.
+///
+/// A target already in the viewport does not move it. Nearby targets are
+/// revealed with the smallest possible scroll, while distant targets are
+/// centered for orientation.
 fn compute_pending_scroll_offset(
     tab: &LogTab,
     pending: Option<usize>,
@@ -1608,15 +2089,163 @@ fn compute_pending_scroll_offset(
     total_visible: usize,
 ) -> Option<f32> {
     let line = pending?;
-    let vis_idx = match &tab.visible_lines {
-        Some(ref vis) => match vis.binary_search(&line) {
-            Ok(idx) => idx,
-            Err(idx) => idx.min(vis.len().saturating_sub(1)),
-        },
-        None => line.min(total_visible.saturating_sub(1)),
+    let target = virtual_index_for_line(tab, line, total_visible)?;
+    let max_offset = max_scroll_offset(total_visible, row_height, avail_height);
+
+    // Prefer the persisted physical offset when available. `viewport_range`
+    // intentionally includes rows that only partially intersect the viewport,
+    // which can otherwise make a selected row look visible while its text is
+    // clipped at the top or bottom edge.
+    if let Some(current_offset) = current_fixed_scroll_offset(tab, row_height, total_visible) {
+        let viewport_height = avail_height.max(row_height);
+        let target_start = target as f32 * row_height;
+        let target_end = target_start + row_height;
+        let viewport_end = current_offset + viewport_height;
+        if target_start >= current_offset && target_end <= viewport_end {
+            return None;
+        }
+
+        let target_above = target_start < current_offset;
+        let distance = if target_above {
+            ((current_offset - target_end) / row_height.max(1.0)).ceil() as usize
+        } else {
+            ((target_start - viewport_end) / row_height.max(1.0)).ceil() as usize
+        };
+        if distance <= NEAR_SELECTION_SCROLL_LINES {
+            let margin = SELECTION_SCROLL_MARGIN_LINES as f32 * row_height;
+            let safe_edge_offset = if target_above {
+                target_start - margin
+            } else {
+                target_end - viewport_height + margin
+            };
+            return Some(safe_edge_offset.clamp(0.0, max_offset));
+        }
+
+        let center_offset = target_start - (viewport_height - row_height) * 0.5;
+        return Some(center_offset.clamp(0.0, max_offset));
+    }
+
+    let Some((first, last)) = viewport_virtual_range(tab, total_visible) else {
+        let center_offset =
+            target as f32 * row_height - (avail_height.max(row_height) - row_height) * 0.5;
+        return Some(center_offset.clamp(0.0, max_offset));
     };
-    let center_offset = vis_idx as f32 * row_height - (avail_height - row_height) * 0.5;
-    Some(center_offset.max(0.0))
+
+    if (first..=last).contains(&target) {
+        return None;
+    }
+
+    let (distance, edge_offset) = if target < first {
+        (first - target, target as f32 * row_height)
+    } else {
+        (
+            target - last,
+            target as f32 * row_height - (avail_height.max(row_height) - row_height),
+        )
+    };
+    if distance <= NEAR_SELECTION_SCROLL_LINES {
+        let margin = SELECTION_SCROLL_MARGIN_LINES as f32 * row_height;
+        let safe_edge_offset = if target < first {
+            edge_offset - margin
+        } else {
+            edge_offset + margin
+        };
+        return Some(safe_edge_offset.clamp(0.0, max_offset));
+    }
+
+    let center_offset =
+        target as f32 * row_height - (avail_height.max(row_height) - row_height) * 0.5;
+    Some(center_offset.clamp(0.0, max_offset))
+}
+
+/// Return the current fixed-row scroll offset from the logical anchor stored
+/// after the previous Log View layout pass.
+fn current_fixed_scroll_offset(tab: &LogTab, row_height: f32, total_visible: usize) -> Option<f32> {
+    let line = tab.scroll_top_line?;
+    let index = virtual_index_for_line(tab, line, total_visible)?;
+    Some((index as f32 + tab.scroll_fraction.clamp(0.0, 1.0)) * row_height)
+}
+
+/// Return the current content offset for a wrapped Log View from its persisted
+/// logical line/fraction state.
+fn current_wrap_scroll_offset(tab: &LogTab, offsets: &[f32]) -> Option<f32> {
+    let line = tab.scroll_top_line?;
+    let index = virtual_index_for_line(tab, line, offsets.len().saturating_sub(1))?;
+    let start = *offsets.get(index)?;
+    let end = *offsets.get(index + 1).unwrap_or(&start);
+    Some(start + (end - start) * tab.scroll_fraction.clamp(0.0, 1.0))
+}
+
+/// Wrapped-row equivalent of `compute_pending_scroll_offset`.
+fn compute_pending_wrap_scroll_offset(
+    tab: &LogTab,
+    pending: Option<usize>,
+    offsets: &[f32],
+    avail_height: f32,
+    row_height: f32,
+    total_visible: usize,
+) -> Option<f32> {
+    let line = pending?;
+    let target = virtual_index_for_line(tab, line, total_visible)?;
+    let target_start = *offsets.get(target)?;
+    let target_end = *offsets.get(target + 1).unwrap_or(&target_start);
+    let max_offset = (offsets.last().copied().unwrap_or(0.0) - avail_height.max(0.0)).max(0.0);
+
+    let Some(current_offset) = current_wrap_scroll_offset(tab, offsets) else {
+        let center = (target_start + target_end) * 0.5 - avail_height.max(row_height) * 0.5;
+        return Some(center.clamp(0.0, max_offset));
+    };
+    let viewport_height = avail_height.max(row_height);
+    let viewport_end = current_offset + viewport_height;
+    if target_start >= current_offset && target_end <= viewport_end {
+        return None;
+    }
+
+    let target_above = target_start < current_offset;
+    let (distance, edge_offset) = if target_above {
+        (
+            ((current_offset - target_end) / row_height.max(1.0)).ceil() as usize,
+            target_start,
+        )
+    } else {
+        let target_height = target_end - target_start;
+        (
+            ((target_start - viewport_end) / row_height.max(1.0)).ceil() as usize,
+            if target_height <= avail_height.max(0.0) {
+                target_end - viewport_height
+            } else {
+                target_start
+            },
+        )
+    };
+    if distance <= NEAR_SELECTION_SCROLL_LINES {
+        let margin = SELECTION_SCROLL_MARGIN_LINES as f32 * row_height;
+        let safe_edge_offset = if target_above {
+            edge_offset - margin
+        } else {
+            edge_offset + margin
+        };
+        return Some(safe_edge_offset.clamp(0.0, max_offset));
+    }
+
+    let center = (target_start + target_end) * 0.5 - avail_height.max(row_height) * 0.5;
+    Some(center.clamp(0.0, max_offset))
+}
+
+fn compute_restore_scroll_offset(
+    tab: &LogTab,
+    anchor: usize,
+    fraction: f32,
+    row_height: f32,
+    total_visible: usize,
+) -> Option<f32> {
+    let virtual_idx = match &tab.visible_lines {
+        Some(lines) => lines
+            .binary_search(&(anchor as u32))
+            .unwrap_or_else(|idx| idx.min(lines.len().saturating_sub(1))),
+        None => anchor.min(total_visible.saturating_sub(1)),
+    };
+    Some((virtual_idx as f32 + fraction.clamp(0.0, 1.0)) * row_height)
 }
 
 /// Compute a top-aligned scroll offset that places the preserved anchor line
@@ -1629,7 +2258,7 @@ fn compute_preserve_anchor_offset(
     total_visible: usize,
 ) -> Option<f32> {
     let vis_idx = match &tab.visible_lines {
-        Some(ref vis) => match vis.binary_search(&anchor) {
+        Some(ref vis) => match vis.binary_search(&(anchor as u32)) {
             Ok(idx) => idx,
             Err(idx) => idx.min(vis.len().saturating_sub(1)),
         },
@@ -1644,8 +2273,9 @@ fn row_under_pointer(
     inner_rect: Rect,
     scroll_offset: f32,
     row_height: f32,
+    wrap_offsets: Option<&[f32]>,
     total_visible: usize,
-    visible_lines: &Option<Arc<Vec<usize>>>,
+    visible_lines: &Option<Arc<Vec<u32>>>,
 ) -> Option<usize> {
     let pointer = ui.input(|i| i.pointer.latest_pos())?;
     if pointer.x < inner_rect.left()
@@ -1656,10 +2286,16 @@ fn row_under_pointer(
         return None;
     }
     let relative_y = pointer.y - inner_rect.top() + scroll_offset;
-    let virtual_idx = (relative_y / row_height).floor() as usize;
+    let virtual_idx = wrap_offsets
+        .map(|offsets| {
+            offsets
+                .partition_point(|offset| *offset <= relative_y)
+                .saturating_sub(1)
+        })
+        .unwrap_or_else(|| (relative_y / row_height).floor() as usize);
     let virtual_idx = virtual_idx.min(total_visible.saturating_sub(1));
     match visible_lines {
-        Some(vis) => vis.get(virtual_idx).copied(),
+        Some(vis) => vis.get(virtual_idx).copied().map(|line| line as usize),
         None => Some(virtual_idx),
     }
 }
@@ -1667,9 +2303,9 @@ fn row_under_pointer(
 /// The filtered visible-line list is sorted by real line number. Range
 /// selection and pinning should therefore use two binary searches instead of
 /// walking every visible line each frame.
-fn visible_lines_in_range(lines: &[usize], start: usize, end: usize) -> &[usize] {
-    let first = lines.partition_point(|&line| line < start);
-    let last = lines.partition_point(|&line| line <= end);
+fn visible_lines_in_range(lines: &[u32], start: usize, end: usize) -> &[u32] {
+    let first = lines.partition_point(|&line| (line as usize) < start);
+    let last = lines.partition_point(|&line| (line as usize) <= end);
     &lines[first..last]
 }
 
@@ -1688,9 +2324,11 @@ fn render_row(
     selection_range: Option<(usize, usize)>,
     char_width: f32,
     gutter_width: f32,
+    display_mode: logotomy::core::settings::LogLineDisplayMode,
 ) -> RowRenderResult {
     let mut action: Option<RowAction> = None;
-    let mut hovered: Option<AnnotationHoverCandidate> = None;
+    let mut hovered: Option<annotation_popup::Candidate> = None;
+    let mut anchor_rect: Option<Rect> = None;
 
     let in_selection = selection_range.is_some_and(|(lo, hi)| idx >= lo && idx <= hi);
     let bg = if selected {
@@ -1702,7 +2340,15 @@ fn render_row(
     };
 
     // Build the log content job (no line number, no color marker).
-    let job = line_job(doc, highlights, idx, selected, font_id.clone(), theme);
+    let job = line_job_for_mode(
+        doc,
+        highlights,
+        idx,
+        selected,
+        font_id.clone(),
+        theme,
+        display_mode,
+    );
 
     // Use a horizontal layout: line number (non-interactive) + selectable log content.
     ui.allocate_ui_with_layout(
@@ -1757,7 +2403,47 @@ fn render_row(
             // non-highlighted spans, search/keyword highlight colours on
             // matches); do NOT overwrite it, or highlights are erased.
             let content_job = job;
-            let content_resp = ui.add(log_content_label(content_job));
+            let content_resp = ui.add(log_content_label(
+                content_job,
+                display_mode == logotomy::core::settings::LogLineDisplayMode::Wrap,
+            ));
+            anchor_rect = Some(content_resp.rect);
+
+            if display_mode == logotomy::core::settings::LogLineDisplayMode::Truncate
+                && doc.line(idx).len() > highlight::MAX_DISPLAY_BYTES
+            {
+                let preview_len = highlight::display_source_len(&doc.line(idx));
+                let beyond_match = highlights.search_matcher.is_some_and(|matcher| {
+                    search_match_beyond_preview(doc.line(idx).as_ref(), preview_len, matcher)
+                });
+                let label = if beyond_match { "… match" } else { "…" };
+                let badge = egui::Button::new(
+                    RichText::new(label)
+                        .monospace()
+                        .size((font_id.size * 0.78).max(8.0))
+                        .color(if beyond_match {
+                            theme.warning
+                        } else {
+                            theme.text_muted
+                        }),
+                )
+                .small();
+                let badge_response = ui.put(
+                    Rect::from_min_size(
+                        Pos2::new(content_resp.rect.right() - 52.0, content_resp.rect.top()),
+                        egui::vec2(52.0, row_height),
+                    ),
+                    badge,
+                )
+                .on_hover_text(if beyond_match {
+                    "A search match continues beyond the rendered preview. Open the complete line."
+                } else {
+                    "This line is previewed. Open the complete line."
+                });
+                if badge_response.clicked() {
+                    action = Some(RowAction::OpenFullLine);
+                }
+            }
 
             let visible_source_len = highlight::display_source_len(&doc.line(idx));
             if let Some((_, range)) = doc.explicit_timestamp_at(idx) {
@@ -1792,7 +2478,7 @@ fn render_row(
                             egui::Sense::hover(),
                         );
                         if response.hovered() {
-                            hovered = Some(AnnotationHoverCandidate {
+                            hovered = Some(annotation_popup::Candidate {
                                 key: AnnotationHoverKey::Timestamp { span },
                                 source_rect,
                             });
@@ -1801,7 +2487,6 @@ fn render_row(
                 }
             }
 
-            let mut source_rects = Vec::<(AnnotationHoverKey, Rect)>::new();
             for detection in detections {
                 let key = AnnotationHoverKey::for_detection(detection);
                 for (range_index, range) in
@@ -1832,102 +2517,7 @@ fn render_row(
                         egui::Sense::hover(),
                     );
                     if response.hovered() && hovered.is_none() {
-                        hovered = Some(AnnotationHoverCandidate { key, source_rect });
-                    }
-                    source_rects.push((key, source_rect));
-                }
-            }
-
-            // Paint every opening cue on this row. Cues consume no layout
-            // width, so multiple results never move or reflow log text.
-            let mut painted_badges = Vec::<Rect>::new();
-            for detection in detections_starting_on_line(detections, original_line) {
-                let presentation = presentation(detection.detector_id);
-                if let Some(prefix) =
-                    source_prefix_at(doc.line_bytes(idx), detection.span.start.byte)
-                {
-                    let prefix_width = ui.ctx().fonts_mut(|fonts| {
-                        fonts
-                            .layout_no_wrap(prefix.to_owned(), font_id.clone(), theme.log_text)
-                            .size()
-                            .x
-                    });
-                    let badge_font_size = (font_id.size * 0.46).clamp(4.5, 11.0);
-                    let badge_font = FontId::proportional(badge_font_size);
-                    let label_width = ui.ctx().fonts_mut(|fonts| {
-                        fonts
-                            .layout_no_wrap(
-                                presentation.badge.to_string(),
-                                badge_font.clone(),
-                                theme.embedded_data,
-                            )
-                            .size()
-                            .x
-                    });
-                    let (badge_size, vertical_lift) =
-                        embedded_badge_geometry(font_id.size, label_width);
-                    let anchor_x = content_resp.rect.left() + prefix_width;
-                    let mut badge_y = content_resp.rect.top() - vertical_lift;
-                    let mut badge_rect =
-                        Rect::from_min_size(Pos2::new(anchor_x, badge_y), badge_size);
-                    while painted_badges
-                        .iter()
-                        .any(|painted| painted.intersects(badge_rect.expand(1.0)))
-                    {
-                        badge_y -= badge_size.y + 1.0;
-                        badge_rect = Rect::from_min_size(Pos2::new(anchor_x, badge_y), badge_size);
-                    }
-                    if badge_rect.top() < ui.clip_rect().top() {
-                        badge_rect = badge_rect.translate(egui::vec2(
-                            painted_badges.len() as f32 * (badge_size.x + 2.0),
-                            ui.clip_rect().top() - badge_rect.top(),
-                        ));
-                    }
-                    painted_badges.push(badge_rect);
-                    let badge_id = ui.make_persistent_id((
-                        "embedded_data_overlay",
-                        detection.detector_id,
-                        detection.span.start.line,
-                        detection.span.start.byte,
-                    ));
-                    let response =
-                        ui.interact(badge_rect.expand(2.0), badge_id, egui::Sense::click());
-                    let painter = ui.painter();
-                    let fill = scaled_alpha(theme.embedded_data_bg, 0.62);
-                    let stroke_color = scaled_alpha(theme.embedded_data, 0.52);
-                    let text_color = scaled_alpha(theme.embedded_data, 0.72);
-                    let corner = (badge_size.y * 0.24).round().clamp(1.0, 4.0) as u8;
-                    painter.rect_filled(badge_rect, egui::CornerRadius::same(corner), fill);
-                    painter.rect_stroke(
-                        badge_rect,
-                        egui::CornerRadius::same(corner),
-                        Stroke::new((font_id.size * 0.045).clamp(0.35, 0.85), stroke_color),
-                        StrokeKind::Inside,
-                    );
-                    painter.text(
-                        badge_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        presentation.badge,
-                        badge_font,
-                        text_color,
-                    );
-                    if response.hovered() && hovered.is_none() {
-                        let key = AnnotationHoverKey::for_detection(detection);
-                        let source_rect = source_rects
-                            .iter()
-                            .find(|(candidate, _)| *candidate == key)
-                            .map(|(_, rect)| *rect)
-                            .unwrap_or(content_resp.rect);
-                        hovered = Some(AnnotationHoverCandidate { key, source_rect });
-                    }
-                    if response.clicked() {
-                        // Keep the inspector tied to the line-number gutter,
-                        // so it opens beside it or flips above/below it when
-                        // the viewport edge leaves less room.
-                        action = Some(RowAction::OpenData(
-                            detection.clone(),
-                            Pos2::new(content_resp.rect.left(), content_resp.rect.center().y),
-                        ));
+                        hovered = Some(annotation_popup::Candidate { key, source_rect });
                     }
                 }
             }
@@ -1948,24 +2538,84 @@ fn render_row(
 
             // Right-click: context menu (on the whole row area)
             content_resp.context_menu(|ui| {
-                ui.set_min_width(160.0);
-                if ui.button("Pin").clicked() {
+                ui.set_min_width(210.0);
+                if icons::action_button(ui, Icon::Pin, "Pin", theme.text, "Pin this log line")
+                    .clicked()
+                {
                     action = Some(RowAction::Pin);
                     ui.close();
                 }
                 ui.separator();
-                if ui
-                    .button("Trim top")
-                    .on_hover_text("Remove all lines before this one")
-                    .clicked()
+                if icons::action_button(
+                    ui,
+                    Icon::ExternalWindow,
+                    "Open full line",
+                    theme.text,
+                    "Inspect the complete, untruncated line",
+                )
+                .clicked()
+                {
+                    action = Some(RowAction::OpenFullLine);
+                    ui.close();
+                }
+                ui.separator();
+                if icons::action_button(
+                    ui,
+                    Icon::Copy,
+                    "Copy full line",
+                    theme.text,
+                    "Copy this complete log line",
+                )
+                .clicked()
+                {
+                    action = Some(RowAction::CopyFull);
+                    ui.close();
+                }
+                if icons::action_button(
+                    ui,
+                    Icon::Copy,
+                    "Copy without timestamp/header",
+                    theme.text,
+                    "Copy only the log message body",
+                )
+                .clicked()
+                {
+                    action = Some(RowAction::CopyWithoutHeader);
+                    ui.close();
+                }
+                if icons::action_button(
+                    ui,
+                    Icon::Copy,
+                    "Copy with line number",
+                    theme.text,
+                    "Copy this line with its source line number",
+                )
+                .clicked()
+                {
+                    action = Some(RowAction::CopyWithLineNumber);
+                    ui.close();
+                }
+                ui.separator();
+                if icons::action_button(
+                    ui,
+                    Icon::Trim,
+                    "Trim top",
+                    theme.text,
+                    "Remove all lines before this one",
+                )
+                .clicked()
                 {
                     action = Some(RowAction::TrimLeft);
                     ui.close();
                 }
-                if ui
-                    .button("Trim bottom")
-                    .on_hover_text("Remove all lines after this one")
-                    .clicked()
+                if icons::action_button(
+                    ui,
+                    Icon::Trim,
+                    "Trim bottom",
+                    theme.text,
+                    "Remove all lines after this one",
+                )
+                .clicked()
                 {
                     action = Some(RowAction::TrimRight);
                     ui.close();
@@ -1979,28 +2629,39 @@ fn render_row(
     )
     .inner;
 
-    RowRenderResult { action, hovered }
+    RowRenderResult {
+        action,
+        hovered,
+        anchor_rect,
+    }
 }
 
 /// Keep native egui text selection enabled for log content. Whole-line drag
 /// selection remains handled by `show` for pinning selected rows.
-fn log_content_label(job: egui::text::LayoutJob) -> egui::Label {
-    // Virtual rows have a fixed height, so log content must never wrap into
-    // the next row. The enclosing scroll area clips horizontally.
-    egui::Label::new(job).selectable(true).extend()
+fn log_content_label(job: egui::text::LayoutJob, wrap: bool) -> egui::Label {
+    if wrap {
+        egui::Label::new(job).selectable(true).wrap()
+    } else {
+        // Virtual rows have a fixed height, so log content must never wrap into
+        // the next row. The enclosing scroll area clips horizontally.
+        egui::Label::new(job).selectable(true).extend()
+    }
+}
+
+/// Whether a full-line search hit would be hidden by a truncated preview.
+fn search_match_beyond_preview(
+    line: &str,
+    preview_len: usize,
+    matcher: &logotomy::core::search::FilterHighlighter,
+) -> bool {
+    matcher
+        .spans(line)
+        .into_iter()
+        .any(|(_, matched)| matched.end > preview_len)
 }
 
 fn source_prefix_at(bytes: &[u8], byte_offset: usize) -> Option<&str> {
     std::str::from_utf8(bytes.get(..byte_offset)?).ok()
-}
-
-fn detections_starting_on_line<'a>(
-    detections: &'a [Detection],
-    original_line: usize,
-) -> impl Iterator<Item = &'a Detection> {
-    detections
-        .iter()
-        .filter(move |detection| detection.span.start.line == original_line)
 }
 
 fn source_range_rect(
@@ -2040,14 +2701,6 @@ fn line_gutter_width(char_width: f32) -> f32 {
     char_width * (GUTTER_DIGITS as f32 + 2.0) + GUTTER_PADDING
 }
 
-fn embedded_badge_geometry(log_font_size: f32, label_width: f32) -> (egui::Vec2, f32) {
-    let height = (log_font_size * 0.56).clamp(6.0, 13.5);
-    let horizontal_padding = (log_font_size * 0.16).clamp(1.5, 4.0);
-    let width = label_width + horizontal_padding * 2.0;
-    let vertical_lift = height * 0.76;
-    (egui::vec2(width, height), vertical_lift)
-}
-
 fn scaled_alpha(color: Color32, factor: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(
         color.r(),
@@ -2058,65 +2711,122 @@ fn scaled_alpha(color: Color32, factor: f32) -> Color32 {
 }
 
 /// Apply the deferred pin / trim actions from the context menu.
-/// Single-line right-click "📌 Pin" opens the pin modal.
+/// Single-line right-click "📌 Pin" opens the analysis bubble.
 fn apply_context_actions(
     tab: &mut LogTab,
-    context_pin: Option<usize>,
+    context_pin: Option<(usize, Rect)>,
     context_trim: Option<TrimAction>,
+    context_copy: Option<(usize, RowAction)>,
+    ctx: &egui::Context,
 ) {
-    if let Some(line) = context_pin {
-        tab.pin_modal = Some((line, line));
-        tab.pin_comment.clear();
+    if let Some((line, anchor_rect)) = context_pin {
+        analysis_popup::open_editor(tab, (line, line), anchor_rect, false);
         tab.bottom_panel_open = true;
     }
     if let Some(action) = context_trim {
         tab.handle_trim(action);
     }
+    if let Some((line, action)) = context_copy {
+        let (numbers, without_header) = match action {
+            RowAction::CopyFull => (false, false),
+            RowAction::CopyWithoutHeader => (false, true),
+            RowAction::CopyWithLineNumber => (true, false),
+            _ => return,
+        };
+        ctx.copy_text(lines_text(tab, line, line, numbers, without_header));
+        tab.pending_toast = Some("Line copied".to_string());
+    }
 }
 
-/// Update `tab.viewport_range` for the timeline shadow, using the exact
-/// rendered range from `show_rows`. If a pending scroll was just processed,
-/// force the range to include the target line so the shadow immediately
-/// covers the selection marker.
+/// Clipboard-friendly rows. `start`/`end` are trim-relative, inclusive.
+pub(crate) fn lines_text(
+    tab: &LogTab,
+    start: usize,
+    end: usize,
+    with_line_numbers: bool,
+    without_timestamp: bool,
+) -> String {
+    let mut out = String::new();
+    for line in start..=end.min(tab.doc.total_lines().saturating_sub(1)) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        if with_line_numbers {
+            out.push_str(&(tab.doc.trim_start + line + 1).to_string());
+            out.push_str(": ");
+        }
+        let source = tab.doc.line(line);
+        let text = if without_timestamp {
+            tab.doc
+                .explicit_timestamp_at(line)
+                .map_or(source.as_ref(), |(_, range)| {
+                    source[range.end.min(source.len())..].trim_start()
+                })
+        } else {
+            source.as_ref()
+        };
+        out.push_str(text);
+    }
+    out
+}
+
+/// Return the virtual rows whose complete geometry fits inside the actual
+/// scroll viewport. Virtualization deliberately renders extra rows around the
+/// viewport, so its render range must never be used as a selectable range.
+fn fully_visible_virtual_range(
+    scroll_offset: f32,
+    viewport_height: f32,
+    row_height: f32,
+    wrap_offsets: Option<&[f32]>,
+    total_visible: usize,
+) -> Option<(usize, usize)> {
+    if total_visible == 0 || row_height <= 0.0 || viewport_height <= 0.0 {
+        return None;
+    }
+    let top = scroll_offset.max(0.0);
+    let bottom = top + viewport_height;
+    // Only absorb floating-point noise; a tenth of a pixel must still count
+    // as clipped rather than being rounded into the selectable range.
+    const EPSILON: f32 = 0.001;
+
+    if let Some(offsets) = wrap_offsets {
+        if offsets.len() < total_visible + 1 {
+            return None;
+        }
+        let first = offsets
+            .partition_point(|offset| *offset < top - EPSILON)
+            .min(total_visible);
+        let end = offsets
+            .partition_point(|offset| *offset <= bottom + EPSILON)
+            .saturating_sub(1)
+            .min(total_visible);
+        return (first < end).then_some((first, end - 1));
+    }
+
+    let first = ((top / row_height) - EPSILON).ceil().max(0.0) as usize;
+    let end = ((bottom / row_height) + EPSILON).floor().max(0.0) as usize;
+    let first = first.min(total_visible);
+    let end = end.min(total_visible);
+    (first < end).then_some((first, end - 1))
+}
+
+/// Update `tab.viewport_range` for the timeline shadow using only completely
+/// visible rows. The rendered range is intentionally larger because
+/// virtualization overscans at both edges.
 fn update_viewport_range(
     tab: &mut LogTab,
-    rendered_range: &Cell<Option<(usize, usize)>>,
+    fully_visible_range: Option<(usize, usize)>,
     pending: Option<usize>,
 ) {
     let previous_range = tab.viewport_range;
-    let mut forced_range: Option<(usize, usize)> = None;
-    if pending.is_some() {
-        if let Some(line) = tab.context_line {
-            forced_range = Some((line, line));
-        }
-    }
-    if let Some((first_virtual, last_virtual)) = rendered_range.get() {
-        let map_to_real = |vi: usize| -> usize {
-            match &tab.visible_lines {
-                Some(vis) => {
-                    if vi < vis.len() {
-                        vis[vi]
-                    } else {
-                        vis.last().copied().unwrap_or(0)
-                    }
-                }
-                None => vi,
-            }
-        };
-        let first_real = map_to_real(first_virtual);
-        let last_real = map_to_real(last_virtual);
-        let merged = match (forced_range, first_real <= last_real) {
-            (Some((f, l)), true) => Some((first_real.min(f), last_real.max(l))),
-            (Some(range), false) => Some(range),
-            (None, true) => Some((first_real, last_real)),
-            (None, false) => None,
-        };
-        if let Some((fr, lr)) = merged {
-            tab.viewport_range = Some((fr, lr));
-        }
-    } else if let Some(range) = forced_range {
-        tab.viewport_range = Some(range);
-    }
+    tab.viewport_range =
+        fully_visible_range.and_then(|(first_virtual, last_virtual)| match &tab.visible_lines {
+            Some(visible) => Some((
+                *visible.get(first_virtual)? as usize,
+                *visible.get(last_virtual)? as usize,
+            )),
+            None => Some((first_virtual, last_virtual)),
+        });
 
     // Follow an actual Log View movement or an explicit navigation request.
     // Calling this unconditionally made a manual timeline pan snap back on the
@@ -2126,11 +2836,109 @@ fn update_viewport_range(
     }
 }
 
+/// If the user manually scrolls away from the selected row, keep the
+/// selection attached to the nearest visible row. This deliberately does not
+/// create a new scroll request: the user's viewport is authoritative.
+fn reconcile_selection_after_user_scroll(tab: &mut LogTab) -> bool {
+    let Some(selected) = tab.context_line else {
+        return false;
+    };
+    let Some((first, last)) = tab.viewport_range else {
+        return false;
+    };
+
+    let replacement = match &tab.visible_lines {
+        Some(visible) => {
+            let first_virtual = visible.partition_point(|&line| (line as usize) < first);
+            let end_virtual = visible.partition_point(|&line| (line as usize) <= last);
+            if first_virtual >= end_virtual {
+                return false;
+            }
+            match visible.binary_search(&(selected as u32)) {
+                Ok(selected_virtual)
+                    if (first_virtual..end_virtual).contains(&selected_virtual) =>
+                {
+                    None
+                }
+                Ok(selected_virtual) if selected_virtual < first_virtual => {
+                    let index =
+                        (first_virtual + SELECTION_VIEWPORT_MARGIN_LINES).min(end_virtual - 1);
+                    Some(visible[index] as usize)
+                }
+                Ok(_) => {
+                    let index = (end_virtual - 1).saturating_sub(SELECTION_VIEWPORT_MARGIN_LINES);
+                    Some(visible[index.max(first_virtual)] as usize)
+                }
+                Err(insertion) => {
+                    let lower = insertion.saturating_sub(1).max(first_virtual);
+                    let upper = insertion.min(end_virtual - 1);
+                    let lower_line = visible[lower] as usize;
+                    let upper_line = visible[upper] as usize;
+                    let nearest = if selected.abs_diff(lower_line) <= selected.abs_diff(upper_line)
+                    {
+                        lower
+                    } else {
+                        upper
+                    };
+                    let nearest = if nearest == first_virtual {
+                        (nearest + SELECTION_VIEWPORT_MARGIN_LINES).min(end_virtual - 1)
+                    } else if nearest == end_virtual - 1 {
+                        nearest
+                            .saturating_sub(SELECTION_VIEWPORT_MARGIN_LINES)
+                            .max(first_virtual)
+                    } else {
+                        nearest
+                    };
+                    Some(visible[nearest] as usize)
+                }
+            }
+        }
+        None => {
+            if (first..=last).contains(&selected) {
+                None
+            } else if selected < first {
+                Some((first + SELECTION_VIEWPORT_MARGIN_LINES).min(last))
+            } else {
+                Some(
+                    last.saturating_sub(SELECTION_VIEWPORT_MARGIN_LINES)
+                        .max(first),
+                )
+            }
+        }
+    };
+
+    let Some(replacement) = replacement else {
+        return false;
+    };
+    if replacement == selected {
+        return false;
+    }
+    tab.context_line = Some(replacement);
+    tab.sync_navigation_positions(replacement);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::highlight::{display_text, MAX_DISPLAY_BYTES};
     use super::*;
     use crate::ui::app::model::Filter;
+
+    #[test]
+    fn focused_search_enter_advances_an_existing_query() {
+        assert_eq!(
+            find_enter_action(true, false, true, true, false, false),
+            Some(FindEnterAction::Next)
+        );
+        assert_eq!(
+            find_enter_action(true, false, true, true, true, false),
+            Some(FindEnterAction::Start)
+        );
+        assert_eq!(
+            find_enter_action(false, false, true, true, false, false),
+            None
+        );
+    }
 
     fn write_temp(content: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2192,6 +3000,43 @@ mod tests {
     }
 
     #[test]
+    fn save_pin_uses_first_and_last_visible_selected_rows_for_timestamps() {
+        let path = write_temp(
+            "2026-07-19T10:00:00.000Z zero\n\
+             2026-07-19T10:00:01.000Z one\n\
+             2026-07-19T10:00:02.000Z two\n\
+             2026-07-19T10:00:03.000Z three\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.visible_lines = Some(Arc::new(vec![1, 3]));
+
+        // The selection range includes hidden rows 0 and 2. The pin must use
+        // the two actual selected rows for its timeline endpoints.
+        save_pin(&mut tab, (0, 3));
+
+        let pin = &tab.pins[0];
+        assert_eq!(pin.line_numbers, vec![1, 3]);
+        assert_eq!(pin.start_line, 1);
+        assert_eq!(pin.start_ts, tab.doc.ts_at(1));
+        assert_eq!(pin.end_ts, tab.doc.ts_at(3));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn save_pin_without_comment_still_creates_an_analysis_pin() {
+        let path = write_temp("2026-07-19T10:00:00.000Z INFO alpha\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        save_pin(&mut tab, (0, 0));
+
+        assert_eq!(tab.pins.len(), 1);
+        assert!(tab.pins[0].comment.is_empty());
+        assert_eq!(tab.pins[0].line_numbers, vec![0]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn vertical_navigation_prefers_search_occurrences_then_visible_lines() {
         let path = write_temp(
             "2026-07-19T10:00:00.000Z alpha\n\
@@ -2213,6 +3058,308 @@ mod tests {
         navigate_vertical(&mut tab, false);
         assert_eq!(tab.context_line, Some(0));
         assert_eq!(tab.find_pos, Some(0));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pending_selection_scrolls_only_as_far_as_needed() {
+        let content = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.viewport_range = Some((10, 14));
+
+        // The selected line is already visible, so navigation must not move
+        // the viewport at all.
+        assert_eq!(
+            compute_pending_scroll_offset(&tab, Some(12), 10.0, 50.0, 20),
+            None
+        );
+        // A rendered edge row can still be clipped when the viewport starts
+        // part-way through it; nudge it fully into view with two rows of air.
+        tab.scroll_top_line = Some(10);
+        tab.scroll_fraction = 0.5;
+        assert_eq!(
+            compute_pending_scroll_offset(&tab, Some(10), 10.0, 50.0, 20),
+            Some(80.0)
+        );
+        tab.scroll_fraction = 0.0;
+        // Five rows away uses the nearest edge, with two safety rows inside
+        // the viewport so the target is not clipped.
+        assert_eq!(
+            compute_pending_scroll_offset(&tab, Some(5), 10.0, 50.0, 20),
+            Some(30.0)
+        );
+        assert_eq!(
+            compute_pending_scroll_offset(&tab, Some(15), 10.0, 50.0, 20),
+            Some(130.0)
+        );
+        // Six rows away uses the center policy.
+        assert_eq!(
+            compute_pending_scroll_offset(&tab, Some(4), 10.0, 50.0, 20),
+            Some(20.0)
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pending_selection_scrolls_safely_in_truncate_and_horizontal_modes() {
+        let content = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.viewport_range = Some((10, 14));
+        tab.scroll_top_line = Some(10);
+        tab.scroll_fraction = 0.0;
+
+        for mode in [
+            logotomy::core::settings::LogLineDisplayMode::Truncate,
+            logotomy::core::settings::LogLineDisplayMode::HorizontalScroll,
+        ] {
+            tab.log_line_display_mode = mode;
+            // Both modes use one fixed-height row per source line. The target
+            // must land two rows inside the bottom edge, not on the clipped
+            // virtualization boundary.
+            assert_eq!(
+                compute_pending_scroll_offset(&tab, Some(15), 10.0, 50.0, 20),
+                Some(130.0),
+                "unexpected scroll policy for {mode:?}"
+            );
+            // The top row is only half visible here. It must also be
+            // repositioned instead of being accepted as a selectable row.
+            tab.scroll_fraction = 0.5;
+            assert_eq!(
+                compute_pending_scroll_offset(&tab, Some(10), 10.0, 50.0, 20),
+                Some(80.0),
+                "clipped top row was accepted for {mode:?}"
+            );
+            tab.scroll_fraction = 0.0;
+        }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn fully_visible_rows_exclude_clipped_edges_in_fixed_modes() {
+        for mode in [
+            logotomy::core::settings::LogLineDisplayMode::Truncate,
+            logotomy::core::settings::LogLineDisplayMode::HorizontalScroll,
+        ] {
+            assert_eq!(
+                fully_visible_virtual_range(100.0, 50.0, 10.0, None, 20),
+                Some((10, 14)),
+                "unexpected full-row range for {mode:?}"
+            );
+            assert_eq!(
+                fully_visible_virtual_range(105.0, 50.0, 10.0, None, 20),
+                Some((11, 14)),
+                "partially visible top/bottom rows were accepted for {mode:?}"
+            );
+            assert_eq!(
+                fully_visible_virtual_range(100.0, 49.9, 10.0, None, 20),
+                Some((10, 13)),
+                "partially visible bottom row was accepted for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn show_rows_overscan_is_not_part_of_the_selectable_range() {
+        let rendered = std::cell::Cell::new(None);
+        egui::__run_test_ui(|ui| {
+            let output = egui::ScrollArea::vertical().max_height(50.0).show_rows(
+                ui,
+                13.0,
+                20,
+                |_ui, range| {
+                    rendered.set(Some((range.start, range.end)));
+                },
+            );
+            let (rendered_start, rendered_end) = rendered.get().expect("rows were rendered");
+            let full = fully_visible_virtual_range(
+                output.state.offset.y,
+                output.inner_rect.height(),
+                13.0,
+                None,
+                20,
+            )
+            .expect("at least one complete row should fit");
+
+            assert_eq!(rendered_start, 0);
+            assert!(
+                rendered_end > full.1 + 1,
+                "rendered=({rendered_start}, {rendered_end}), full={full:?}, height={}",
+                output.inner_rect.height()
+            );
+            assert_eq!(full, (0, 3));
+        });
+    }
+
+    #[test]
+    fn wrapped_selection_scroll_uses_visual_row_distance() {
+        let content = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.log_line_display_mode = logotomy::core::settings::LogLineDisplayMode::Wrap;
+        tab.viewport_range = Some((10, 14));
+        tab.scroll_top_line = Some(10);
+        tab.scroll_fraction = 0.0;
+        let offsets = (0..=20).map(|line| line as f32 * 10.0).collect::<Vec<_>>();
+
+        assert_eq!(
+            compute_pending_wrap_scroll_offset(&tab, Some(12), &offsets, 50.0, 10.0, 20),
+            None
+        );
+        assert_eq!(
+            compute_pending_wrap_scroll_offset(&tab, Some(9), &offsets, 50.0, 10.0, 20),
+            Some(70.0)
+        );
+        assert_eq!(
+            compute_pending_wrap_scroll_offset(&tab, Some(3), &offsets, 50.0, 10.0, 20),
+            Some(10.0)
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn wrapped_selection_scroll_keeps_the_complete_visual_line_in_view() {
+        let content = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.log_line_display_mode = logotomy::core::settings::LogLineDisplayMode::Wrap;
+        tab.scroll_top_line = Some(10);
+        tab.scroll_fraction = 0.0;
+        // Lines 10..14 occupy 50 visual rows, while the selected wrapped
+        // record occupies two rows. It must not be placed against the bottom
+        // edge where its final visual row would be clipped.
+        let offsets = (0..=20)
+            .map(|line| line as f32 * 10.0 + if line >= 16 { 10.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compute_pending_wrap_scroll_offset(&tab, Some(15), &offsets, 50.0, 10.0, 20),
+            Some(140.0)
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn fully_visible_wrap_rows_require_the_complete_logical_line() {
+        let offsets = vec![0.0, 10.0, 30.0, 40.0, 50.0, 60.0];
+
+        // The first logical line is clipped above; lines 1 and 2 fit exactly.
+        assert_eq!(
+            fully_visible_virtual_range(5.0, 35.0, 10.0, Some(&offsets), 5),
+            Some((1, 2))
+        );
+        // The second logical line ends below the viewport and is not
+        // selectable even though virtualization would render it.
+        assert_eq!(
+            fully_visible_virtual_range(10.0, 29.9, 10.0, Some(&offsets), 5),
+            Some((1, 1))
+        );
+    }
+
+    #[test]
+    fn manual_scroll_reselection_is_covered_for_all_long_line_modes() {
+        let content = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.viewport_range = Some((5, 9));
+
+        for mode in [
+            logotomy::core::settings::LogLineDisplayMode::Truncate,
+            logotomy::core::settings::LogLineDisplayMode::HorizontalScroll,
+            logotomy::core::settings::LogLineDisplayMode::Wrap,
+        ] {
+            tab.log_line_display_mode = mode;
+            tab.context_line = Some(12);
+            assert!(reconcile_selection_after_user_scroll(&mut tab));
+            assert_eq!(
+                tab.context_line,
+                Some(8),
+                "manual scroll selected a clipped row for {mode:?}"
+            );
+        }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn user_scroll_reselects_only_when_selection_leaves_viewport() {
+        let content = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.viewport_range = Some((5, 9));
+
+        tab.context_line = Some(7);
+        assert!(!reconcile_selection_after_user_scroll(&mut tab));
+        assert_eq!(tab.context_line, Some(7));
+
+        tab.context_line = Some(3);
+        assert!(reconcile_selection_after_user_scroll(&mut tab));
+        assert_eq!(tab.context_line, Some(6));
+
+        tab.context_line = Some(12);
+        assert!(reconcile_selection_after_user_scroll(&mut tab));
+        assert_eq!(tab.context_line, Some(8));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn user_scroll_reselection_uses_visible_filtered_rows() {
+        let content = (0..30)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.visible_lines = Some(Arc::new(vec![0, 10, 20]));
+        tab.viewport_range = Some((10, 20));
+        tab.context_line = Some(15);
+
+        assert!(reconcile_selection_after_user_scroll(&mut tab));
+        assert_eq!(tab.context_line, Some(20));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn viewport_shadow_maps_only_fully_visible_filtered_rows() {
+        let content = (0..30)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.visible_lines = Some(Arc::new(vec![0, 10, 20]));
+
+        // The virtual rows 1 and 2 are fully visible; the mapping used by the
+        // timeline must expose their real source lines, not an overscanned row.
+        let full = fully_visible_virtual_range(10.0, 20.0, 10.0, None, 3);
+        assert_eq!(full, Some((1, 2)));
+        update_viewport_range(&mut tab, full, None);
+        assert_eq!(tab.viewport_range, Some((10, 20)));
 
         std::fs::remove_file(path).ok();
     }
@@ -2266,21 +3413,6 @@ mod tests {
         // project into the rendered text; the underline remains the fallback.
         let inside_unicode = line.find('ঢ').unwrap() + 1;
         assert_eq!(source_prefix_at(line.as_bytes(), inside_unicode), None);
-    }
-
-    #[test]
-    fn embedded_badge_scales_with_log_font() {
-        let (small, small_lift) = embedded_badge_geometry(8.0, 9.0);
-        let (large, large_lift) = embedded_badge_geometry(24.0, 25.0);
-        assert!(large.x > small.x);
-        assert!(large.y > small.y);
-        assert!(large_lift > small_lift);
-        assert!(small.y <= 8.0, "small cue should stay between compact rows");
-        assert!(
-            large.y < 24.0,
-            "large cue must remain smaller than log text"
-        );
-        assert!(scaled_alpha(Color32::from_rgba_unmultiplied(1, 2, 3, 100), 0.5).a() == 50);
     }
 
     #[test]
@@ -2363,10 +3495,13 @@ mod tests {
     #[test]
     fn log_content_label_supports_native_text_drag_selection() {
         egui::__run_test_ui(|ui| {
-            let response = ui.add(log_content_label(egui::text::LayoutJob::single_section(
-                "select me".to_owned(),
-                egui::text::TextFormat::default(),
-            )));
+            let response = ui.add(log_content_label(
+                egui::text::LayoutJob::single_section(
+                    "select me".to_owned(),
+                    egui::text::TextFormat::default(),
+                ),
+                false,
+            ));
             assert!(response.sense.senses_drag());
             assert!(response.sense.senses_click());
         });
@@ -2380,11 +3515,15 @@ mod tests {
         let font_id = crate::ui::fonts::log_font(12.0);
 
         // Search match must carry the search highlight background.
-        let search_ac = logotomy::core::search::build_find_automaton("error", true);
+        let search_matcher = logotomy::core::search::build_filter_highlighter(&[
+            logotomy::core::search::FilterSpec::phrase("error"),
+        ])
+        .unwrap();
         let hl = Highlights {
             filters: &[],
-            filter_ac: None,
-            search_ac: search_ac.as_ref(),
+            filter_matcher: None,
+            search_matcher: Some(&search_matcher),
+            search_template_id: None,
             keyword_ac: None,
             embedded: None,
         };
@@ -2400,8 +3539,9 @@ mod tests {
         let keyword_ac = logotomy::core::search::build_find_automaton("error", true);
         let hl = Highlights {
             filters: &[],
-            filter_ac: None,
-            search_ac: None,
+            filter_matcher: None,
+            search_matcher: None,
+            search_template_id: None,
             keyword_ac: keyword_ac.as_ref(),
             embedded: None,
         };
@@ -2426,12 +3566,19 @@ mod tests {
             text: "error".to_owned(),
             color: Color32::RED,
         }];
-        let filter_ac = logotomy::core::search::build_automaton(&["error".to_owned()]);
-        let search_ac = logotomy::core::search::build_find_automaton("error", true);
+        let filter_matcher = logotomy::core::search::build_filter_highlighter(&[
+            logotomy::core::search::FilterSpec::phrase("error"),
+        ])
+        .unwrap();
+        let search_matcher = logotomy::core::search::build_filter_highlighter(&[
+            logotomy::core::search::FilterSpec::phrase("error"),
+        ])
+        .unwrap();
         let hl = Highlights {
             filters: &filters,
-            filter_ac: filter_ac.as_ref(),
-            search_ac: search_ac.as_ref(),
+            filter_matcher: Some(&filter_matcher),
+            search_matcher: Some(&search_matcher),
+            search_template_id: None,
             keyword_ac: None,
             embedded: None,
         };
@@ -2465,11 +3612,15 @@ mod tests {
             AnalysisLimits::default(),
             &AtomicBool::new(false),
         );
-        let search_ac = logotomy::core::search::build_find_automaton("error", true);
+        let search_matcher = logotomy::core::search::build_filter_highlighter(&[
+            logotomy::core::search::FilterSpec::phrase("error"),
+        ])
+        .unwrap();
         let highlights = Highlights {
             filters: &[],
-            filter_ac: None,
-            search_ac: search_ac.as_ref(),
+            filter_matcher: None,
+            search_matcher: Some(&search_matcher),
+            search_template_id: None,
             keyword_ac: None,
             embedded: Some(&detections),
         };
@@ -2499,8 +3650,9 @@ mod tests {
             &doc,
             &Highlights {
                 filters: &[],
-                filter_ac: None,
-                search_ac: None,
+                filter_matcher: None,
+                search_matcher: None,
+                search_template_id: None,
                 keyword_ac: None,
                 embedded: None,
             },
@@ -2534,8 +3686,9 @@ mod tests {
         );
         let highlights = Highlights {
             filters: &[],
-            filter_ac: None,
-            search_ac: None,
+            filter_matcher: None,
+            search_matcher: None,
+            search_template_id: None,
             keyword_ac: None,
             embedded: Some(&detections),
         };
@@ -2560,70 +3713,67 @@ mod tests {
     }
 
     #[test]
-    fn every_detection_starting_on_a_row_gets_a_cue_candidate() {
-        use logotomy::core::embedded_data::{DataNode, SourcePos, SourceSpan};
-
-        let make = |byte| {
-            let span = SourceSpan {
-                start: SourcePos { line: 4, byte },
-                end: SourcePos {
-                    line: 4,
-                    byte: byte + 3,
-                },
-            };
-            Detection::structured("test", span, "a=1", DataNode::Object(vec![]))
-        };
-        let detections = vec![make(2), make(20), {
-            let span = SourceSpan {
-                start: SourcePos { line: 5, byte: 0 },
-                end: SourcePos { line: 5, byte: 3 },
-            };
-            Detection::structured("test", span, "b=2", DataNode::Object(vec![]))
-        }];
-        assert_eq!(detections_starting_on_line(&detections, 4).count(), 2);
-    }
-
-    #[test]
-    fn annotation_hover_waits_and_then_expires_after_grace() {
-        let path = write_temp("INFO value=one\n");
-        let doc = LogDocument::open(&path).unwrap();
-        let mut tab = LogTab::new(doc);
-        let span = logotomy::core::embedded_data::SourceSpan {
-            start: logotomy::core::embedded_data::SourcePos { line: 0, byte: 5 },
-            end: logotomy::core::embedded_data::SourcePos { line: 0, byte: 14 },
-        };
-        let candidate = AnnotationHoverCandidate {
-            key: AnnotationHoverKey::Embedded {
-                detector_id: "logfmt",
-                span,
-            },
-            source_rect: Rect::from_min_max(Pos2::ZERO, Pos2::new(80.0, 16.0)),
-        };
-        egui::__run_test_ui(|ui| {
-            let now = Instant::now();
-            update_annotation_hover(&mut tab, Some(candidate), false, ui.ctx(), now);
-            let state = tab.annotation_hover.as_ref().expect("hover state");
-            assert_eq!(state.key, candidate.key);
-            assert_eq!(state.started_at, now);
-
-            update_annotation_hover(
-                &mut tab,
-                None,
-                false,
-                ui.ctx(),
-                now + ANNOTATION_HOVER_GRACE + Duration::from_millis(1),
-            );
-            assert!(tab.annotation_hover.is_none());
-        });
+    fn copy_rows_can_strip_timestamp_and_include_source_line_numbers() {
+        let path = write_temp("2026-07-19T10:00:00.000Z INFO alpha\n");
+        let tab = LogTab::new(LogDocument::open(&path).unwrap());
+        assert_eq!(lines_text(&tab, 0, 0, false, true), "INFO alpha");
+        assert_eq!(
+            lines_text(&tab, 0, 0, true, false),
+            "1: 2026-07-19T10:00:00.000Z INFO alpha"
+        );
         std::fs::remove_file(path).ok();
     }
 
     #[test]
-    fn compact_hover_preview_is_single_line_and_bounded() {
+    fn search_match_beyond_preview_distinguishes_hidden_and_visible_hits() {
+        let matcher = logotomy::core::search::build_filter_highlighter(&[
+            logotomy::core::search::FilterSpec::phrase("needle"),
+        ])
+        .unwrap();
+        assert!(!search_match_beyond_preview(
+            "needle then more",
+            12,
+            &matcher
+        ));
+        assert!(search_match_beyond_preview("prefix needle", 6, &matcher));
+        // A match crossing the preview edge is not fully paintable either.
+        assert!(search_match_beyond_preview("needle", 3, &matcher));
+    }
+
+    #[test]
+    fn full_line_modes_do_not_apply_the_display_byte_cap() {
+        let line = format!("{}needle", "x".repeat(highlight::MAX_DISPLAY_BYTES + 20));
+        assert!(highlight::display_text(&line).contains("truncated"));
         assert_eq!(
-            compact_source_preview("first\n  second", 20),
-            "first second"
+            highlight::display_text_for_mode(
+                &line,
+                logotomy::core::settings::LogLineDisplayMode::HorizontalScroll,
+            ),
+            line
         );
-        assert_eq!(compact_source_preview("abcdefgh", 4), "abcd…");
+        assert_eq!(
+            highlight::display_text_for_mode(
+                &line,
+                logotomy::core::settings::LogLineDisplayMode::Wrap,
+            ),
+            line
+        );
+    }
+
+    #[test]
+    fn wrap_offsets_are_variable_height_and_reused_until_layout_changes() {
+        let path = write_temp("short\nthis line needs multiple visual rows\n");
+        let mut tab = LogTab::new(LogDocument::open(&path).unwrap());
+        let first = wrap_offsets_for(&mut tab, 8.0, 1.0, 10.0);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[1], 10.0);
+        assert!(first[2] > 10.0);
+        let cached = wrap_offsets_for(&mut tab, 8.0, 1.0, 10.0);
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        let resized = wrap_offsets_for(&mut tab, 16.0, 1.0, 10.0);
+        assert!(!Arc::ptr_eq(&first, &resized));
+        assert!(resized[2] < first[2]);
+        std::fs::remove_file(path).ok();
     }
 }

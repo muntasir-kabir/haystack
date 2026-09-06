@@ -26,4 +26,6 @@ artifacts
 
 **.ignore
 **.log
+# Per-log investigation sidecars are generated locally by the GUI.
+*.logotomy
 .kilo

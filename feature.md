@@ -28,10 +28,12 @@ Everything currently implemented, and what's deliberately not (yet).
 
 | Feature | Detail |
 |---|---|
-| Drag & drop | drop any file anywhere; "Drop it" overlay while hovering files |
+| Application shell | `LOGotomy` product mark; grouped Open file/Recent/Saved filters/Commands actions; format/date status; AI Assistant state menu; Settings; responsive More menu below 1100px |
+| SVG action system | exhaustive embedded 24×24 `currentColor` outline catalog, aligned compact 22px controls, quiet icon+label and icon-only helpers, action-oriented tooltips, light/dark rendering tests |
+| Drag & drop | drop any file anywhere; clear file-type overlay while hovering files; actionable empty/loading/error states |
 | Open dialog | native picker via `rfd` |
 | Progress bar | per-loading-file card with stage label + % + cancel |
-| Multi-tab | open/close/switch many files; re-dropping an open file focuses its tab |
+| Multi-tab | cohesive log-icon tabs with integrated close action, loading spinner, and compact AI status badge; re-dropping an open file focuses its tab |
 | Virtualized log view | renders only visible rows; line # + template ID gutter; filter highlight; color marker per line |
 | Source annotations | quiet exact timestamp underlines with raw/normalized-UTC hover actions; background structured-data analysis with font-scaled zero-layout cues, exact underlines, delayed source actions, Tree/Pretty/Raw inspector, frame-oriented trace view, and explicit encoded preview |
 | Log font | embedded Space Mono monospace (SIL OFL 1.1) — log text only, rest of UI stays on default fonts |
@@ -45,8 +47,9 @@ Everything currently implemented, and what's deliberately not (yet).
 | Timeline navigation | click → nearest filter match (or approx. position) |
 | Context panel | selected line ± 5 (radius adjustable 1–50), timestamp + template header, jump-to-full-view, clear |
 | Template browser | right panel, mined patterns sorted by frequency, click → example line |
-| Dark/light mode | semantic colour palette, 🌙/☀️ toggle in toolbar, all panels themed |
-| UX details | clickable everything, pointer cursors, drag overlay, status bar, humor |
+| Docked/separate views | one conventional External Window action per active dock leaf; closing the child window restores the previous dock layout |
+| Dark/light mode | semantic colour palette, theme control in Settings, all panels and SVGs themed with readable secondary text |
+| UX details | title-height Timeline controls with bulk actions moved into the lower filter-label area, single-row Log/Pinned/Templates chrome, pointer cursors, clear empty states, sentence-case copy, Escape/outside-click dismissal, explicit dialog footers |
 | Status bar format readout | shows the active log's detected format + date format (`format: json · date: field-based`) |
 
 ## ✅ MCP server (`src/mcp.rs`, `logotomy --mcp`)
@@ -84,11 +87,11 @@ Match results are cached per (log, keyword, case mode); time params accept RFC33
 1-based line number (integer) or a time (string).
 
 ### GUI MCP Server controls
-- **MCP** controls in the top-right toolbar and Settings
-- Green/gray status indicator (blinks green on activity within 10s)
+- A single **AI Assistant** top-bar menu contains connection status, Start/Stop, session-instruction copy, and integration guidance
+- A compact tab badge identifies the GUI document currently available to the assistant
 - One permanent `--mcp` setup for Codex, Claude, and Cline
 - Explicit copy of a temporary GUI session instruction; no URL or temporary MCP configuration
-- Start/Stop toggle button
+- Exactly one appropriate Start or Stop action is shown for the current state
 - Runs **in-process** on a background thread — shares loaded documents with the GUI
 - Status bar updates on start/stop/ready/error
 
@@ -103,21 +106,24 @@ Match results are cached per (log, keyword, case mode); time params accept RFC33
 
 ## ✅ Quality & verification
 
-- 402 unit and integration tests (core, MCP, GUI, embedded-data contracts) — `cargo test`
+- 500+ unit and integration tests (core, MCP, GUI, SVG, responsive-shell, popup, and embedded-data contracts) — `cargo test`
 - Release benchmark harness — `cargo run --release --example bench -- <file> [kws]`
   (generates a 64MB synthetic log when run without args)
 
 ## 🔮 Deliberate next steps (not implemented)
 
-- Filter view (show only matching lines) & regex filters
-- Export of filtered ranges / templates report
-- Persistent filter sets per file
+- Advanced filter expressions (nested boolean groups and reusable named expressions; lane visibility already filters the log view)
 - Multi-file merged timeline
 - MCP prompts (resources are implemented)
 - Embedded data detectors for YAML, TOML, generic XML, and delimited records
 - Structured-data field/path search, schema grouping, comparison, similarity search, and MCP extraction tools
+- Keyboard selection and richer result highlighting in Commands
+- Color-vision-safe filter palettes and optional non-color lane markers
+- Automated screenshot regression coverage for major UI states
+- Searchable saved-filter manager for large collections
+- Configurable density, customizable toolbar actions, first-run guidance, native desktop menus, localization-ready strings, and richer accessibility semantics
 
-## 🗑 Removed
+## Removed
 
 - `src/python/parser_ml_microservice.py` — the old half-baked Python sidecar.
   Template mining is native Rust now; nothing is shelled out, ever.

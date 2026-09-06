@@ -59,8 +59,8 @@ opening a file from Finder, Windows Explorer, a Linux desktop-file association,
 or another shell command reuses that window, focuses it, and opens the file in
 a new tab instead of starting another GUI process.
 
-Release installers register `.log`, `.txt`, `.out`, `.err`, `.evt`, `.evtx`,
-`.sys`, `.csv`, `.json`, `.xml`, and `.md` with logotomy. After installation,
+Release installers register `.log`, `.txt`, `.out`, `.err`, `.csv`, `.json`,
+`.xml`, and `.md` with logotomy. After installation,
 use **Open with** or **Set as default** in the operating system’s file manager.
 The Linux `.deb`/AppImage association depends on the desktop environment’s MIME
 database; the Windows and macOS installers register the extensions directly.
@@ -85,41 +85,59 @@ cargo build --release --no-default-features
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ 🔥 logotomy | 📂 Open file | 🧩 Saved filters |    status   │  toolbar
-│ [app.log ×] [server.log ×]                              │  tabs (multi-file)
-│ 🔑 Add Filter ┌──────────────────────┐                  │  filter strip
-│                │ filter + Enter      │ ➕ Add           │  (prominent frame)
+│ LOGotomy | Open file | Recent | Saved filters | Commands │  primary actions
+│             format/date status | AI Assistant | Settings │  context + utilities
+│ [log app.log close] [log server.log close]               │  tabs (multi-file)
+│ Filter ┌──────────────────────────┐ Add filter            │  filter strip
+│        │ filter + Enter           │                       │
 │                └──────────────────────┘                  │
 │ ┌──────┬────────────────────────────┬────┐              │
-│ │ 👁 EE │ ▁▂█▆▅▃ density (full-hgt) │ ↕  │              │  timeline
-│ │ 👁 kw1│ ───────────── 1px line    │ ↔  │              │  (eye markers,
-│ │ 👁 kw2│ ── ▌ ███ ── ▌ occurrences│ 🗑 │              │   trash = remove)
+│ │ eye EE │ ▁▂█▆▅▃ density (full-hgt) │    │              │  timeline
+│ │ eye kw1│ ───────────── 1px line    │    │              │  (visibility +
+│ │ eye kw2│ ── ▌ ███ ── ▌ occurrences│ del│              │   remove actions)
 │ │      │ 10:00      Δ3.3s  10:01   │    │              │   (inter-tick dur)
 │ │      │ [══════minimap══════]       │    │              │
 │ └──────┴────────────────────────────┴────┘              │
 │  1234 T 7  2026-07-19T10:00:01.123Z INFO hello           │
 │  1235 T 9  2026-07-19T10:00:01.223Z ERROR boom  ←center  │  log view
-│  ...                                  │ 🧩 Templates     │  (virtualized)
+│  ...                                  │ Templates        │  (virtualized)
 │                                       │ ×9812 T3 GET…    │  (right panel)
 │                              ┃ (scroll bar)              │
 ├──────────────────────────────────────────────────────────┤
-│ ▼ 📌 1 pinned  |  📝 2 analyses                          │  bottom panel
-│ 📌 L1235  GET /api/users 200 OK                 ×        │  (collapsible,
-│ 📝 L1235  This is the failing request — boom      ×        │   pinned + notes)
+│ Pinned · 3 findings        Copy | Save Markdown | Clear   │  bottom panel
+│ L1235  GET /api/users 200 OK                  Edit Remove │  (collapsible,
+│ L1235  This is the failing request — boom                │   pinned + notes)
 └──────────────────────────────────────────────────────────┘
 ```
 
 ### Open a file
 - **Drag & drop** any text file (`.log`, `.txt`, `.out`, `.csv`, …) anywhere into the window, or
-- click **📂 Open file**.
-- A **progress bar** shows real indexing progress (two stages: *Indexing lines*, then *Mining templates & timestamps*). Cancel with × if you dropped the wrong file.
-- Each file opens in its own **tab** — open as many as you like, close them with the × next to the tab name.
-- When a file is being appended (live tailing), new lines are indexed and template-mined in the background before appearing atomically. The current view stays responsive while this happens; truncation or in-place edits still require reopening the file.
+- click **Open file**.
+- **ZIP archives:** drop a `.zip` (or choose it with **Open File**) to extract it in the background into a folder beside the archive, named after the ZIP. Existing folders/files are preserved by choosing a numbered name such as `logs (2)`. The file picker then opens in that folder; select one or more logs to open as tabs. The extraction window shows progress and offers **Cancel**. Canceling extraction removes the incomplete folder; canceling the picker keeps the extracted files for later. Password-protected archives, unsupported compression, damaged ZIPs, and unsafe paths/symbolic links show an error instead of opening binary data as a log.
+- A **progress bar** shows real indexing progress (two stages: *Indexing lines*, then *Mining templates & timestamps*). Use **Cancel** if you chose the wrong file.
+- Each file opens in its own cohesive **tab** with a log icon and integrated close action. A spinner replaces the tab icon while the file is opening.
+- Every open tab watches for appended data, including tabs that are not active. New lines are indexed and template-mined in the background, existing filters scan only the appended range, and the updated document appears atomically. The current view stays responsive while this happens; truncation or in-place edits still require reopening the file.
+
+### Investigation state
+
+Logotomy restores the open tab list and active tab between sessions. Each opened
+file also gets a versioned sidecar next to it, named `.filename.log.logotomy`
+for a file named `filename.log`. The sidecar stores filters and lane visibility,
+search and selection, scroll position, timeline zoom, pins and notes, trim
+range, the Templates panel, dock layout, and log font size. It is written
+atomically and never changes the source log.
+
+When the log's canonical path, size, or modification time no longer matches the
+saved sidecar, notes are restored as text-only entries first. Logotomy asks
+before applying old line positions and uses line hashes and timestamps to
+best-effort remap anchors. Investigation state is saved automatically when it
+changes, at least once per minute, when a tab closes, and when the application
+exits.
 
 ### Custom date recognizers
 logotomy auto-detects the timestamp family (shown as `format: … · date: …` in the top bar). If your log uses a date shape it doesn't recognize, add your own:
 
-1. Click **Custom date** (top bar, left of Settings).
+1. Open **Settings → Log parsing → Custom date recognizers**.
 2. Give the format a **Name**, paste a **Regex** that captures the timestamp using named groups — required `year, month, day, hour, min, sec`, optional `ms` (milliseconds) and `ampm` (for 12-hour `AM`/`PM`). Example for `2026-08-14 4:08:23.668 PM`:
    ```text
    (?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2}) (?P<hour>\d{1,2}):(?P<min>\d{2}):(?P<sec>\d{2})\.(?P<ms>\d{3}) (?P<ampm>[AP]M)
@@ -128,43 +146,74 @@ logotomy auto-detects the timestamp family (shown as `format: … · date: …` 
 4. Click **Add custom date format** (enabled once the regex matches). It's saved to `~/.logotomy/custom_date_format_list.json` and tried together with the built-in families on the **next file you open**.
 5. To apply to the file that's already open, use **Re-scan active log** in the same window (per-tab filters/pins/scroll reset on re-scan).
 
+### Settings and AI Assistant
+
+- **Settings** groups controls into Appearance, Behavior, Log parsing, AI Assistant, and Support. Everyday choices appear first.
+- **Advanced parsing** is collapsed by default. Template similarity, header sample lines, and Drain tree depth affect newly opened files; each control explains the tradeoff in plain language.
+- **Confirm before deleting filters** is positively worded. Turning it off preserves the existing stored setting and skips future filter confirmations.
+- The top-bar **AI Assistant** menu is the single place for live connection status, Start/Stop, copying temporary session instructions, and opening integration guidance. The Settings AI Assistant section exposes the same one-action-at-a-time state without a duplicate disabled Start button.
+- Dropdowns and lightweight popovers close with **Esc** or an outside click. Editors and confirmations close with **Esc** and retain an explicit **Cancel** or **Close** action.
+
 ### The log view (center)
 - Virtualized: a 5-million-line file scrolls as smoothly as a 50-line one.
 - Gutter shows the **line number** and the line's **template ID** (`T12`).
 - Click any line to select it (white selection bar on the timeline).
-- **Right-click** any line for a context menu with **📌 Pin**.
+- Changing the selected line keeps the current viewport when the target is fully visible, scrolls only enough to reveal a nearby target (within five rows) with a two-row safety margin, and centers a distant target. If manual scrolling moves the selected line out of view, selection follows the nearest visible row.
+- **Right-click** any line to pin it or copy the full row, its message without timestamp/header, or a numbered line. Drag-select rows to copy or export the range; use the Log toolbar to export visible/filtered rows or the current timeline range.
 - The right edge has a **black scroll-position indicator bar** showing where you are in the file.
 - Log lines render in the embedded **Space Mono** monospace font (SIL OFL 1.1 — see the README thanks section); the **A− / A+** toolbar buttons change the size from 8 to 24 px.
-- Very long log rows are kept to one visual row and safely display a 2,000-byte Unicode-aware prefix, so an unusually large message cannot interrupt scrolling.
+- Choose **Settings → Long log lines** to truncate, horizontally scroll, or wrap complete long records. **Truncate** remains the default: it safely shows a 2,000-byte Unicode-aware prefix and a `…` control that opens the complete-line inspector. **Horizontal scroll** keeps each full record on one row with a bottom scrollbar; **Wrap** shows the complete record across visual rows.
+- Truncated rows show `… match` when a Find result is beyond the visible prefix. Open the full-line inspector to view and copy the complete source text.
 - Structured values embedded anywhere in visible log records are detected in the background: JSON, single or grouped logfmt/key-value events, conservative colon fields, Swift/Foundation/Python/JVM debug values, XML and labeled OpenStep property lists, HTTP, protobuf text, stack traces, and JWT/Base64/hex/PEM. Double-, single-, and backtick-quoted values, URL/path values, and compact or multiline payloads are supported; parsing never runs in the paint path.
 - A translucent format cue (**JSON**, **KV**, **HTTP**, **TRACE**, etc.) scales with the active log font and sits immediately above each payload's opening token without reserving layout space or shifting log text. Multiline payloads receive one cue at their opener, while every exact visible source fragment receives a subtle underline; gaps between grouped fields remain untouched.
-- Rest the pointer over an underlined source fragment or its cue for about 0.8 seconds to open a semi-transparent source callout. It points back to the source and offers **Copy source** and **Open inspector**; scrolling, selecting, or moving elsewhere dismisses it, with a short grace period for crossing into the callout. Clicking a cue still opens the inspector immediately.
+- Rest the pointer over an underlined source fragment or its cue for about 0.8 seconds to open a semi-transparent source callout. Structured key/value entries appear one per line; the callout grows to fit modest payloads but caps its width/height and truncates oversized previews, while **Open inspector** provides the complete value. It points back to the source and offers **Copy source**; once visible it stays locked while you cross dense highlights on the way to the callout, then dismisses after leaving the source-to-callout region. Press **Esc** or click outside the callout to close it immediately. Clicking a cue still opens the inspector immediately.
 - Explicit timestamps use a quieter blue underline and no gutter cue. Their delayed callout identifies the detected timestamp family and can copy either the exact source or its normalized UTC value. Forward-filled continuation lines are not marked because they contain no timestamp source.
 - The Apple profile understands classic Foundation `{ key = value; }` / multiline array descriptions as well as Swift `Type(field: value)`, nested `Optional(...)`, enum associated values, labeled tuples, `[...]` collections, `<NSObject: address; …>` descriptions, and multiline `dump`/Mirror trees. Ordinary `(foo, bar)` prose and `[Subsystem:Category]` tags are deliberately left alone.
 - XML plists and OpenStep collections explicitly labeled `plist`/`propertyList` open as normalized trees. A **BPLIST** cue identifies literal, hex, or Base64 `bplist00` data; its safe summary is immediate, while **Decode preview** only decodes the text transport and does not automatically interpret the binary object table.
 - Structured values open in **Pretty** by default and offer Tree/Pretty/Raw; the last selected tab is remembered for future payloads and sessions. Stack traces start in Frames; encoded values start with a safe Summary and require **Decode preview**. The inspector sizes itself to the payload, can be resized from its edges, and scrolls when needed. Copy the exact raw payload, formatted value, or an individual tree value. Press **Esc**, click outside, or use the close icon to dismiss it.
 - Filtered views still analyze the contiguous physical log record—hidden filter rows are never joined into artificial JSON. Timestamped multiline records retain a compact boundary index so jumping directly into the middle can recover the opener.
 - Filters you add (below) are **highlighted inline**, in the filter's color.
-- **Search box** (right side of toolbar): type a string and press **Enter** to find all occurrences in the visible log lines. Amber highlights mark every match. With multiple results, the Log View header shows Up/Down navigation and a shortcut hint toast; use **▲/▼** (or Up/Down arrows) to step through matches. Press **Esc** to clear the search, or **Esc** again to clear a keyword highlight.
+- **Find group** (in the Log toolbar): the search icon is attached to the input. Choose **Text (Aa)** for exact-case text, **Text (Ab)** for ASCII case-insensitive text, **Regex** for a bounded Rust regular expression, or **Template ID** for `42`, `T42`, or `T{42}`. The selected matcher searches visible log lines using the same rules as Timeline filters; regexes and Template IDs are validated as you type and whenever the type changes. Press **Enter** to run a valid search. Amber highlights mark text/regex spans and whole Template ID rows. Use the close icon or **Esc** to cancel the active search; with multiple results, use the previous/next buttons (or Up/Down arrows) to step through matches.
 - **Double-click any word** in a log line to highlight every occurrence of that word in cyan. The word is also pre-filled into the search box — press **Enter** to turn it into a full search. Single-click anywhere clears the keyword highlight.
 
+### Keyboard navigation and Commands
+- **⌘/Ctrl+O** opens a file; **⌘/Ctrl+W** closes the active tab. Before closing, Logotomy saves the investigation sidecar; if that cannot be saved, it offers retry, discard, or cancel rather than silently losing notes and filters.
+- **Ctrl+Tab** and **Ctrl+Shift+Tab** cycle open log tabs. **⌘/Ctrl+F** focuses Find; **F3** / **Shift+F3** move to the next/previous search result.
+- **⌘/Ctrl+L** or **⌘/Ctrl+G** opens Go to Line or Time. Enter a one-based line number, an RFC3339 timestamp, or `@` followed by epoch seconds/milliseconds; a timestamp jumps to the nearest log record.
+- **Home/End** select the top/bottom currently rendered row; **⌘/Ctrl+Home/End** jump to the first/last line in the current filtered view.
+- Select a timeline filter lane and press **Space** to toggle it. Select a pin card or filter lane and press **Delete** to remove it; **⌘/Ctrl+Z** restores the latest deletion in that tab. Filter deletion still honors the confirmation preference in Settings.
+- Click **Commands** in the top bar or press **⌘/Ctrl+Shift+P** to search and run app commands. Below 1100px wide, **Recent files**, **Saved filters**, and **Commands** move into the labeled **More** menu while **Open file** remains visible. Press **?** for a keyboard and mouse gesture cheat sheet.
+
 ### Filter bookmarks
-- The add section is prominently framed with a heading "🔑 Add Filter".
-- Type a filter in the text field and press **Enter** (e.g. `ERROR`, `timeout`, `user_id=42`) or click the **➕ Add** button.
+- The Timeline header begins with a recognizable **Filter** icon and input.
+- Type a filter in the text field and press **Enter** (e.g. `ERROR`, `timeout`, `user_id=42`) or click **Add filter**.
 - Up to **20 filters** are supported. The input is disabled once the cap is reached.
 - Scanning happens in the background (spinner while chewing).
+- Each filter remains editable after adding it. Use **Aa** for case-sensitive
+  matching, **Exclude** to subtract its matches, and **.*** for a regular
+  expression. Regexes are validated before scanning and use Rust's linear-time
+  regex engine with compilation-memory limits.
+- Choose **Match: any/all** to union or intersect active include filters.
+  Exclude filters are always subtracted afterwards. Focus an empty filter
+  field to choose a recent filter that is not already active; choosing one
+  starts its scan immediately.
+- Enable **Current timeline range** to scope a new scan to the current zoom;
+  scans always respect an applied trim. Long scans show their line count and
+  can be cancelled without blocking the log view.
 
 ### The timeline
 - The timeline is a **fixed-height panel** at the top — it always shows the full histogram, all filter lanes, axis labels, and the zoom/minimap strip, and can never be shrunk to hide lanes. Its height grows/shrinks with the number of filters.
 - Shows the whole file as a full-height density histogram, with one **colored lane per filter**. Each lane has a **straight 1px line** in the filter's color across the full lane width. A bucket containing one visible match shows a **2px × 7px marker at the occurrence's exact time/line position**. Multi-occurrence buckets are edge-to-edge rectangles spanning the bucket's full timeline width: small is **7px** high, medium **10px**, and dense **13px**. Adjacent non-empty buckets therefore read as a continuous density strip. Exact counts remain available on hover, and zooming re-resolves the buckets until distinguishable occurrences become exact markers.
-- **Left column** shows filter names (up to 14 chars) with **👁 eye markers** (👁 = lane enabled, bold label; 🚫 = disabled, normal weight label). Click to toggle. The first lane is "Everything Else" — it has the eye toggle but **cannot be removed**.
+- **Left column** shows filter names (up to 14 chars) with visible/hidden SVG controls; enabled lanes also use bold labels, so state is not communicated by color alone. Click to toggle. The first lane is "Everything Else" — it has the visibility control but **cannot be removed**.
+- The otherwise-empty **Everything Else** lane also shows pinned evidence with pin markers at the first and last selected log rows (one marker for a single-row pin). Markers remain available without filters, use line positions for timestamp-less logs, and follow the active zoom window.
+- Hover a pin marker to read its saved analysis and pinned line range. Click it to jump the Log view to the pin's first selected row, then select and reveal the corresponding card in the **Pinned** tab.
 - **Hover a filter's name/eye** to see a tooltip with the **full filter text** and its **total match count**, e.g. `Some Filter (334 occurrences)`.
-- Each filter lane has a **🗑 trash icon** on the right of its label. Clicking it always asks for confirmation before removing the filter — unless you tick **"Do not ask me again"** in the popup (or enable *Settings → Do not ask before deleting a filter*).
+- Each filter lane has a recognizable remove control on the right of its label. **Settings → Behavior → Confirm before deleting filters** controls whether Logotomy asks first; it maps to the existing persisted preference for compatibility.
 - Click a filter lane, exact occurrence marker, or density bucket to select the lane. The Timeline header shows previous/next navigation with Left/Right arrows whenever the current Log View line is an occurrence in that lane. The current occurrence is derived from the selected lane and current line; no separate occurrence-selection marker is stored.
-- **Bottom toolbar** (shown while filters exist, left-aligned):
-  - **🚫 Disable All / 👁 Enable All** — toggles every filter lane at once; the **Everything Else** lane is never touched.
-  - **🗑 Delete All** — removes every filter (behind a confirmation popup, following the same "do not ask again" preference).
-- **Right column** has ↕ (zoom) and ↔ (pan) hint icons with hover tooltips.
+- **Lower-left filter actions** (shown beneath the filter labels while filters exist) keep bulk visibility and destructive actions out of the compact Timeline header:
+  - **Disable all / Enable all** toggles every filter lane at once; the **Everything Else** lane is never touched.
+  - **Clear filters** removes every filter (behind a confirmation popup when confirmation is enabled).
+- The visible gesture hint reads **“Scroll to zoom · Drag to pan · Shift-drag to select”**; zoom, pan, and reset controls keep detailed tooltips.
 - **Zoom** — scroll anywhere over the timeline. Zoom is continuous, pointer-anchored, works on both trackpads and mouse wheels, and can reach millisecond/individual-line detail.
 - **Pan** — drag left/right (without shift). The visible span is preserved and snaps at the file boundaries.
 - **Brush select** — shift+drag to draw a rectangle; on release, zooms to that range.
@@ -178,17 +227,24 @@ logotomy auto-detects the timestamp family (shown as `format: … · date: …` 
 
 ### Bottom panel (pinned lines + analyses)
 - **Right-click** any log line → context menu:
-  - **📌 Pin** — saves the line to the bottom panel for quick revisiting; its optional comment is an analysis note.
+  - **📌 Pin** — opens a movable, resizable analysis bubble anchored to the line. Enter saves the optional analysis note; Escape or clicking elsewhere cancels.
+- Drag across log rows to open an anchored **Pin / Copy / Copy + lines / Cancel** bubble. Choosing **Pin** switches it to the analysis editor; the selected rows remain highlighted until the bubble is saved or cancelled.
+- The analysis editor uses `Add analysis/info or enter to save` as its placeholder and can save a pin without any analysis text.
 - Expand/collapse the panel with the **▼/▶** header. When collapsed, shows counts.
 - When empty, shows a brief hint to right-click a log line and pin it.
-- Pinned lines show **line number + text snippet**; click the **✏️ edit** button to reopen the pin window and edit its comment/lines, or **×** to unpin.
+- Pinned lines show **line number + text snippet**; use the SVG **Edit** action to reopen the pin window and change its comment/lines, or **Remove** to unpin.
+- Selecting a Timeline pin marker opens this card and scrolls it into view; the matching Log row is selected first, even if current filter visibility would otherwise hide it.
 - GUI-attached AI agents can read existing entries with `get_analysis()` and add user-visible entries with `add_analysis({text, lines})`. An empty `lines` array creates a text-only analysis card at the top of this panel.
 - **"Clear all"** empties everything and collapses the panel.
 
-### Templates panel (right, 🧩)
+### Templates tab
 - logotomy runs the **Drain template-mining algorithm** natively in Rust while loading.
-- The panel lists mined patterns sorted by frequency, e.g. `×12043 T3 GET /api/<*> status=<*>`.
-- **Click a template** to jump to an example occurrence.
+- The dockable **Templates** tab starts beside **Pinned** and can be dragged or opened in a separate window like the other views. Each active dock leaf has exactly one external-window action at its right edge; closing the separate window restores the prior dock layout.
+- Search template IDs or patterns; sort by count, first seen, last seen, or rarity.
+- The Pinned tab is the initially visible lower dock tab for every newly opened log; Templates remains directly beside it.
+- Select a template to move the Log view to its occurrence nearest the current viewport midpoint. Up/down changes the selected template row; left/right moves through its occurrences.
+- The selected row shows an inline action strip to search its Template ID in the Log tab, add a Template ID filter, or copy its full pattern. Left/Right still moves through occurrences.
+- Rare, late-arriving, and bursty templates are marked directly in the list.
 - Great first stop when you don't even know what's *in* a file.
 
 ### Timestamps
@@ -234,10 +290,10 @@ Untimestamped lines (stack traces etc.) inherit the previous line's timestamp.
 AI assistant can load logs independently, query them with filters, and pull exact windows.
 
 Configure `logotomy --mcp` once. By default the agent works independently: it calls `load_log`
-and uses the returned `log_id`. To analyze the log open in the GUI, click **Start MCP**, copy
+and uses the returned `log_id`. To analyze the log open in the GUI, open the **AI Assistant** menu, start the connection, copy
 the GUI session instruction, and paste it into the agent conversation. The agent calls
 `attach_gui_session`, then `session_info`; while `mode` is `gui_attached`, it must not call
-`load_log` or pass `log_id`. Stop MCP when finished to invalidate the temporary session ID.
+`load_log` or pass `log_id`. Stop the connection from the same menu when finished to invalidate the temporary session ID.
 
 In GUI-attached mode, the GUI already provides the open log: `load_log`, `list_logs`, and
 `close_log` are unavailable, and `log_id` is not needed. A useful approach is to understand the
@@ -320,6 +376,7 @@ printf '%s\n' \
   bar, 3-filter whole-file scan **≈ 0.7s**, timeline build **≈ 13ms**.
   Run `cargo run --release --example bench` to check your machine.
 - Per-line render length is capped at 2000 chars in the GUI (data stays intact in the mmap).
+- Line indexes are stored as 32-bit values; a single source is limited to 4,294,967,295 lines.
 - Embedded JSON analysis is debounced while scrolling, cancellable, and worker-only. GUI record scans are bounded to 8 MiB / 20,000 lines, 128 nesting levels, 20,000 normalized nodes, and 64 results per physical interval; values exceeding a bound are not presented as valid detections.
 - Tested edge cases: CRLF endings, missing trailing newline, blank lines,
   multi-MB single lines, invalid UTF-8 (lossy display), files with no timestamps.
@@ -329,9 +386,10 @@ printf '%s\n' \
 | Action | Effect |
 |---|---|
 | Drop file on window | Open in new tab |
+| Drop `.zip` on window | Extract beside the ZIP, then choose logs from the extracted folder |
 | Click tab | Switch file |
-| Tab × | Close file |
-| Filter box + Enter or ➕ Add | Add filter bookmark |
+| Tab close button | Close file |
+| Filter box + Enter or **Add filter** | Add a text/regex filter, or choose **Template ID** and enter `42`, `T42`, or `T{42}` |
 | Click timeline | Jump to nearest filter match, white marker shows position |
 | Scroll on timeline | Zoom in/out (continuous, trackpad + mouse) |
 | Drag (no shift) on timeline | Pan left/right |
@@ -339,16 +397,17 @@ printf '%s\n' \
 | Double-click timeline | Reset zoom to full range |
 | Click minimap | Pan view to that position |
 | Click log line | Select line (white line on timeline) |
-| Right-click log line | Context menu: 📌 Pin |
-| Click 👁/🚫 lane marker | Toggle filter lane on/off (filters log view) |
+| Right-click log line | Open copy, pin, inspect, and trim actions |
+| Click lane visibility icon | Toggle filter lane on/off (filters log view) |
 | Hover filter name/eye | Tooltip with full filter text + match count |
-| Click 🗑 on a filter lane | Remove that filter (with confirmation) |
-| Timeline 🗑 Delete All | Remove every filter (with confirmation) |
-| Timeline 👁️ Show/Hide all filters | Toggle every filter lane at once |
-| Pinned ✏️ edit button | Reopen the pin window to edit the pin |
+| Click Remove on a filter lane | Remove that filter (with confirmation when enabled) |
+| Timeline **Clear filters** | Remove every filter (with confirmation when enabled) |
+| Timeline **Enable all / Disable all** | Toggle every filter lane at once |
+| Pinned **Edit** button | Reopen the pin window to edit the pin |
 | A− / A+ buttons | Decrease / increase log text size |
-| 🧩 Templates → click row | Jump to example occurrence |
-| Bottom panel ▼/▶ | Expand / collapse pinned lines and analyses |
+| Templates tab → right-click row | Navigate, copy, sample, or filter that template |
+| Pinned header expand/collapse button | Expand / collapse pinned lines and analyses |
+| External Window button | Open the active dock view in a separate window; close it to restore the dock layout |
 
 ---
 

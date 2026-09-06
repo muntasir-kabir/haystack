@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use eframe::egui;
 use egui::{Color32, RichText};
 
@@ -7,8 +5,20 @@ use crate::ui::icons::{self, Icon};
 use crate::ui::theme::Theme;
 
 use crate::ui::app::model::LogotomyApp;
+use logotomy::core::settings::LogLineDisplayMode;
 
-/// Show the settings popup (Area-based, anchored to the settings button).
+fn section_header(ui: &mut egui::Ui, icon: Icon, title: &str, theme: &Theme) {
+    ui.horizontal(|ui| {
+        ui.add(icons::icon_image(ui.ctx(), icon, 15.0, theme.text));
+        ui.label(RichText::new(title).strong().size(14.0));
+    });
+}
+
+fn confirm_before_deleting(skip_confirmation: bool) -> bool {
+    !skip_confirmation
+}
+
+/// Show the settings popup, grouped by everyday task rather than implementation detail.
 pub fn show_settings_popup(ui: &mut egui::Ui, app: &mut LogotomyApp) {
     if !app.show_settings_popup {
         return;
@@ -17,220 +27,284 @@ pub fn show_settings_popup(ui: &mut egui::Ui, app: &mut LogotomyApp) {
         return;
     };
 
-    let popup_id = egui::Id::new("settings_popup");
-    let area = egui::Area::new(popup_id)
-        .current_pos(button_rect.left_bottom())
+    let popup_width = 390.0;
+    let area_resp = egui::Area::new(egui::Id::new("settings_popup"))
         .order(egui::Order::Foreground)
-        .fixed_pos(button_rect.left_bottom());
-    let area_resp = area.show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(300.0);
-            ui.set_max_width(400.0);
-            ui.horizontal(|ui| {
-                let ctx = ui.ctx().clone();
-                ui.add(icons::icon_image(&ctx, Icon::Settings, 14.0, app.theme.text));
-                ui.label(RichText::new("Settings").strong().size(14.0));
-            });
-            ui.separator();
+        .fixed_pos(button_rect.right_bottom() - egui::vec2(popup_width, 0.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(popup_width);
+                egui::ScrollArea::vertical()
+                    .max_height((ui.ctx().content_rect().height() - 80.0).max(260.0))
+                    .show(ui, |ui| {
+                        section_header(ui, Icon::Settings, "Settings", &app.theme);
+                        ui.separator();
 
-            // Dark mode
-            let mut dark_mode = app.dark_mode;
-            if ui.checkbox(&mut dark_mode, "Dark mode").clicked() {
-                app.toggle_theme();
-            }
+                        section_header(ui, Icon::ThemeLight, "Appearance", &app.theme);
+                        let mut dark_mode = app.dark_mode;
+                        if ui.checkbox(&mut dark_mode, "Use dark mode").changed() {
+                            app.toggle_theme();
+                        }
 
-            // Filter deletion confirmations
-            let mut skip_confirm = app.settings.skip_filter_delete_confirm;
-            if ui
-                .checkbox(&mut skip_confirm, "Do not ask before deleting a filter")
-                .on_hover_text("Deletes the filter (trash icon / 'Clear all filters') immediately, without the confirmation popup.")
-                .changed()
-            {
-                app.settings.skip_filter_delete_confirm = skip_confirm;
-                app.settings.save();
-            }
-
-            // Default template
-            ui.horizontal(|ui| {
-                ui.label("Default filter:");
-                let selected_template = app.settings.default_filter.clone().unwrap_or_else(|| "None".to_string());
-                egui::ComboBox::from_label("")
-                    .selected_text(selected_template)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(app.settings.default_filter.is_none(), "None").clicked() {
-                            app.settings.default_filter = None;
+                        ui.add_space(8.0);
+                        section_header(ui, Icon::Check, "Behavior", &app.theme);
+                        let mut confirm = confirm_before_deleting(
+                            app.settings.skip_filter_delete_confirm,
+                        );
+                        if ui
+                            .checkbox(&mut confirm, "Confirm before deleting filters")
+                            .on_hover_text("Ask before removing one filter or clearing all filters")
+                            .changed()
+                        {
+                            app.settings.skip_filter_delete_confirm = !confirm;
                             app.settings.save();
                         }
-                        for filter_name in &app.available_filters {
-                            if ui.selectable_label(app.settings.default_filter.as_deref() == Some(filter_name), filter_name).clicked() {
-                                app.settings.default_filter = Some(filter_name.clone());
+                        ui.horizontal(|ui| {
+                            ui.label("Long log lines");
+                            let mut mode = app.settings.log_line_display_mode;
+                            egui::ComboBox::from_id_salt("log_line_display_mode")
+                                .selected_text(mode.label())
+                                .show_ui(ui, |ui| {
+                                    for candidate in LogLineDisplayMode::ALL {
+                                        ui.selectable_value(&mut mode, candidate, candidate.label())
+                                            .on_hover_text(candidate.description());
+                                    }
+                                });
+                            if mode != app.settings.log_line_display_mode {
+                                app.settings.log_line_display_mode = mode;
+                                for tab in &mut app.tabs {
+                                    tab.log_line_display_mode = mode;
+                                }
                                 app.settings.save();
                             }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Default saved filter");
+                            let selected = app
+                                .settings
+                                .default_filter
+                                .clone()
+                                .unwrap_or_else(|| "None".to_string());
+                            egui::ComboBox::from_id_salt("default_saved_filter")
+                                .selected_text(selected)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(app.settings.default_filter.is_none(), "None")
+                                        .clicked()
+                                    {
+                                        app.settings.default_filter = None;
+                                        app.settings.save();
+                                    }
+                                    for filter_name in &app.available_filters {
+                                        if ui
+                                            .selectable_label(
+                                                app.settings.default_filter.as_deref()
+                                                    == Some(filter_name),
+                                                filter_name,
+                                            )
+                                            .clicked()
+                                        {
+                                            app.settings.default_filter = Some(filter_name.clone());
+                                            app.settings.save();
+                                        }
+                                    }
+                                });
+                        });
+
+                        ui.separator();
+                        section_header(ui, Icon::Log, "Log parsing", &app.theme);
+                        if icons::action_button(
+                            ui,
+                            Icon::Date,
+                            "Custom date formats",
+                            app.theme.text,
+                            "Add or manage user-defined date and time recognizers",
+                        )
+                        .clicked()
+                        {
+                            app.show_custom_date_popup = true;
+                            app.show_settings_popup = false;
                         }
+
+                        egui::CollapsingHeader::new("Advanced parsing")
+                            .id_salt("advanced_parsing_settings")
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("These settings apply to newly opened files.")
+                                        .small()
+                                        .color(app.theme.text_muted),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Template similarity");
+                                    let mut similarity = app.settings.sim_threshold as f32;
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut similarity)
+                                                .speed(0.01)
+                                                .range(0.3..=0.9),
+                                        )
+                                        .on_hover_text(
+                                            "Higher values create more precise, more numerous templates",
+                                        )
+                                        .changed()
+                                    {
+                                        app.settings.sim_threshold =
+                                            (similarity as f64 * 100.0).round() / 100.0;
+                                        app.settings.save();
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Header sample lines");
+                                    let mut lines = app.settings.header_sample_lines as u32;
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut lines)
+                                                .speed(1)
+                                                .range(0..=2000),
+                                        )
+                                        .on_hover_text(
+                                            "Leading lines used to learn recurring header fields; 0 disables it",
+                                        )
+                                        .changed()
+                                    {
+                                        app.settings.header_sample_lines = lines as usize;
+                                        app.settings.save();
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Template tree depth");
+                                    let mut depth = app.settings.drain_depth as u32;
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut depth)
+                                                .speed(1)
+                                                .range(3..=8),
+                                        )
+                                        .on_hover_text(
+                                            "Higher values route templates more precisely but can fragment groups",
+                                        )
+                                        .changed()
+                                    {
+                                        app.settings.drain_depth = depth as usize;
+                                        app.settings.save();
+                                    }
+                                });
+                            });
+
+                        ui.separator();
+                        section_header(ui, Icon::Mcp, "AI Assistant", &app.theme);
+                        ui.label(if app.mcp_enabled {
+                            "Ready for a private GUI connection"
+                        } else if app.tabs.is_empty() {
+                            "Open a log before starting the connection"
+                        } else {
+                            "Connection is stopped"
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if app.mcp_enabled {
+                                if icons::action_button(
+                                    ui,
+                                    Icon::Stop,
+                                    "Stop connection",
+                                    app.theme.text,
+                                    "Stop MCP and invalidate the temporary GUI session",
+                                )
+                                .clicked()
+                                {
+                                    app.stop_mcp();
+                                    app.show_toast("AI Assistant connection stopped".to_string());
+                                }
+                                if let Some(instruction) = app.mcp_instruction() {
+                                    if icons::action_button(
+                                        ui,
+                                        Icon::Copy,
+                                        "Copy session",
+                                        app.theme.text,
+                                        "Copy temporary session instructions for your coding agent",
+                                    )
+                                    .clicked()
+                                    {
+                                        ui.ctx().copy_text(instruction);
+                                        app.show_toast(
+                                            "GUI session instructions copied to clipboard".to_string(),
+                                        );
+                                    }
+                                }
+                            } else if icons::action_button_enabled(
+                                ui,
+                                !app.tabs.is_empty(),
+                                Icon::Start,
+                                "Start connection",
+                                app.theme.text,
+                                if app.tabs.is_empty() {
+                                    "Open a log file first"
+                                } else {
+                                    "Start a private MCP connection for the active log"
+                                },
+                            )
+                            .clicked()
+                            {
+                                app.start_mcp();
+                            }
+                            if icons::action_button(
+                                ui,
+                                Icon::Integrate,
+                                "Integration guide",
+                                app.theme.text,
+                                "Set up Logotomy in Codex, Claude, or Cline",
+                            )
+                            .clicked()
+                            {
+                                app.show_integrate_popup = true;
+                                app.show_settings_popup = false;
+                            }
+                        });
+
+                        ui.separator();
+                        section_header(ui, Icon::Help, "Support", &app.theme);
+                        ui.horizontal_wrapped(|ui| {
+                            if icons::action_button(
+                                ui,
+                                Icon::Bug,
+                                "Report a bug",
+                                app.theme.text,
+                                "Open the Logotomy issue tracker",
+                            )
+                            .clicked()
+                            {
+                                open_url("https://github.com/muntasir-kabir/logotomy/issues");
+                                app.show_settings_popup = false;
+                            }
+                            if icons::action_button(
+                                ui,
+                                Icon::Info,
+                                "About",
+                                app.theme.text,
+                                "Open the Logotomy project page",
+                            )
+                            .clicked()
+                            {
+                                open_url("https://github.com/muntasir-kabir/logotomy");
+                                app.show_settings_popup = false;
+                            }
+                        });
                     });
             });
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                let ctx = ui.ctx().clone();
-                ui.add(icons::icon_image(&ctx, Icon::Log, 14.0, app.theme.text));
-                ui.label(RichText::new("Log Parsing").strong().size(14.0));
-            });
-            ui.add_space(2.0);
-
-            // Custom date recognizers (opened from Settings; was in the top bar)
-            ui.horizontal(|ui| {
-                let ctx = ui.ctx().clone();
-                ui.add(icons::icon_image(&ctx, Icon::Date, 14.0, app.theme.text));
-                if ui.button("Custom date recognizers")
-                    .on_hover_text("Add / manage user-defined date/time recognizers")
-                    .clicked()
-                {
-                    app.show_custom_date_popup = !app.show_custom_date_popup;
-                }
-            });
-
-            // Drain similarity threshold
-            ui.horizontal(|ui| {
-                ui.label("Similarity threshold:");
-                let mut sim = app.settings.sim_threshold as f32;
-                if ui.add(egui::DragValue::new(&mut sim).speed(0.01).range(0.3..=0.9)).changed() {
-                    app.settings.sim_threshold = (sim as f64 * 100.0).round() / 100.0;
-                    app.settings.save();
-                }
-            }).response.on_hover_text("Drain template merge threshold (0.3–0.9). Higher = stricter clustering, more templates. Applies to newly opened files.");
-
-            // Header sample size
-            ui.horizontal(|ui| {
-                ui.label("Header sample lines:");
-                let mut n = app.settings.header_sample_lines as u32;
-                if ui.add(egui::DragValue::new(&mut n).speed(1).range(0..=2000)).changed() {
-                    app.settings.header_sample_lines = n as usize;
-                    app.settings.save();
-                }
-            }).response.on_hover_text("Leading lines sampled to learn the common log header (host/pid/thread slots). 0 disables header learning. Applies to newly opened files.");
-
-            // Drain depth
-            ui.horizontal(|ui| {
-                ui.label("Drain depth:");
-                let mut depth = app.settings.drain_depth as u32;
-                if ui.add(egui::DragValue::new(&mut depth).speed(1).range(3..=8)).changed() {
-                    app.settings.drain_depth = depth as usize;
-                    app.settings.save();
-                }
-            }).response.on_hover_text("Drain parse-tree depth. Depth N = token count + (N-2) routing tokens. Higher = more precise routing but higher fragmentation risk. Default: 4. Applies to newly opened files.");
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                let ctx = ui.ctx().clone();
-                ui.add(icons::icon_image(&ctx, Icon::Mcp, 14.0, app.theme.text));
-                ui.label(RichText::new("MCP Server").strong().size(14.0));
-            });
-            ui.add_space(2.0);
-
-            // Status indicator: green circle with pulse animation when running, gray when stopped
-            let tooltip = if app.mcp_enabled {
-                "Private GUI session ready for an attached agent".to_string()
-            } else {
-                "MCP not running".to_string()
-            };
-            ui.horizontal(|ui| {
-                let color = if app.mcp_enabled {
-                    let is_active = app.mcp_started_at.map(|t| t.elapsed() < Duration::from_secs(10)).unwrap_or(false);
-                    let alpha = if is_active {
-                        let t = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-                        let pulse = ((t * 2.0 * std::f64::consts::PI / 1.2).sin() * 0.3 + 0.7).clamp(0.4, 1.0);
-                        (pulse * 255.0) as u8
-                    } else { 255 };
-                    let (gr, gg, gb) = if app.dark_mode { (0, 255, 0) } else { (0, 160, 0) };
-                    Color32::from_rgba_unmultiplied(gr, gg, gb, alpha)
-                } else {
-                    app.theme.status_grey
-                };
-                ui.add(egui::Label::new(RichText::new("●").color(color).size(14.0)));
-                ui.label(if app.mcp_enabled { "Running · private GUI session" } else { "Stopped" });
-            }).response.on_hover_text(tooltip);
-
-            // Start / Stop buttons
-            if app.mcp_enabled {
-                // Start is disabled while a server is already running.
-                ui.horizontal(|ui| {
-                    ui.add_enabled(false, egui::Button::new("Start MCP Server"));
-                    ui.label(RichText::new("MCP already running").small().color(app.theme.text_muted));
-                });
-                if ui.button("Stop MCP Server").clicked() {
-                    app.stop_mcp();
-                    app.show_toast("MCP server stopped".to_string());
-                    app.show_settings_popup = false;
-                }
-            } else {
-                let is_disabled = app.tabs.is_empty();
-                let start_resp = ui.add_enabled(!is_disabled, egui::Button::new("Start MCP Server"));
-                if is_disabled {
-                    start_resp.clone().on_hover_text("Open a log file first");
-                }
-                if start_resp.clicked() {
-                    app.start_mcp();
-                    if app.mcp_enabled {
-                        app.show_toast(
-                            "MCP started. Use Integrate with AI Assistant to connect.".to_string(),
-                        );
-                    }
-                    app.show_settings_popup = false;
-                }
-            }
-
-            // Prompt AI assistant section
-            ui.add_space(4.0);
-            if let Some(instruction) = app.mcp_instruction() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("GUI session instruction").strong().size(13.0));
-                    if ui.button("Copy").on_hover_text("Copy temporary session ID and agent instructions").clicked() {
-                        ui.ctx().copy_text(instruction);
-                    }
-                });
-                ui.label(RichText::new("Configure `logotomy --mcp` once, then copy this temporary session instruction to the agent. The session ID is secret and must never be saved in MCP settings.").small().color(app.theme.text_muted));
-            } else {
-                ui.label(RichText::new("Start MCP to connect AI assistant").strong().size(13.0).color(app.theme.text_muted));
-            }
-
-            ui.separator();
-
-            // Integrate with AI Assistant button
-            if ui.button("Integrate with AI Assistant").clicked() {
-                app.show_integrate_popup = true;
-            }
-
-            ui.separator();
-
-            // Report Bug — opens the project's issue tracker in the browser.
-            if ui.button("Report Bug")
-                .on_hover_text("Open https://github.com/muntasir-kabir/logotomy/issues")
-                .clicked()
-            {
-                open_url("https://github.com/muntasir-kabir/logotomy/issues");
-            }
-
-            // About — opens the project's GitHub page in the browser.
-            if ui.button("About")
-                .on_hover_text("Open https://github.com/muntasir-kabir/logotomy")
-                .clicked()
-            {
-                open_url("https://github.com/muntasir-kabir/logotomy");
-            }
         });
-    });
 
-    // Close on click outside
-    if ui.input(|i| i.pointer.any_click()) {
-        if let Some(click_pos) = ui.input(|i| i.pointer.interact_pos()) {
-            let on_button = button_rect.contains(click_pos);
-            let on_popup = area_resp.response.rect.contains(click_pos);
-            if !on_button && !on_popup {
-                app.show_settings_popup = false;
-            }
-        }
+    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    let outside_click = ui.input(|input| {
+        input
+            .pointer
+            .any_click()
+            .then(|| input.pointer.interact_pos())
+            .flatten()
+            .is_some_and(|position| {
+                !button_rect.contains(position) && !area_resp.response.rect.contains(position)
+            })
+    });
+    if escape || outside_click {
+        app.show_settings_popup = false;
     }
 }
 
@@ -240,15 +314,15 @@ pub fn show_integrate_popup(ui: &mut egui::Ui, app: &mut LogotomyApp) {
         return;
     }
     let mut open = app.show_integrate_popup;
-    egui::Window::new("Integrate with AI Coding Agents")
+    egui::Window::new("Integrate with AI coding agents")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        .default_size([560.0, 480.0])
+        .default_size([640.0, 560.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ui.ctx(), |ui| {
-            ui.label(RichText::new("Connect Logotomy to Codex, Claude, or Cline via MCP.").small().color(app.theme.text_muted));
-            ui.label(RichText::new("Configure one stdio server once. It works standalone and can attach to a temporary GUI session when you provide a session ID.").small().color(app.theme.text_muted));
+            ui.label(RichText::new("Connect a local AI coding agent to Logotomy through MCP.").small().color(app.theme.text_muted));
+            ui.label(RichText::new("Configure one stdio server once, then use it standalone or with a temporary GUI session.").small().color(app.theme.text_muted));
             ui.separator();
 
             let exe_path = std::env::current_exe()
@@ -262,20 +336,17 @@ pub fn show_integrate_popup(ui: &mut egui::Ui, app: &mut LogotomyApp) {
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_space(4.0);
-                ui.label(RichText::new("First, try the simple agent-assisted setup").strong());
-                ui.label(RichText::new("Copy this prompt into your coding agent. It asks the agent to add Logotomy to its global/user MCP configuration using the correct format for that client.").small().color(app.theme.text_muted));
+                integration_section_header(ui, "Recommended setup");
+                ui.label(RichText::new("Paste this into any local coding agent. It configures Logotomy in that client's user/global MCP settings.").small().color(app.theme.text_muted));
                 agent_section(ui, &app.theme, "Agent setup prompt",
-                    "Paste into the agent, approve the configuration change if asked, then reload the agent's MCP servers:",
+                    "Approve the configuration change if asked, then reload the agent's MCP servers:",
                     "", &setup_prompt);
 
                 ui.separator();
-                ui.label(RichText::new("If agent setup fails, add it manually").strong());
-                ui.label(RichText::new("Choose your client below and copy its native configuration.").small().color(app.theme.text_muted));
+                integration_section_header(ui, "Manual setup");
+                ui.label(RichText::new("Choose your client and copy its native user-level configuration.").small().color(app.theme.text_muted));
                 ui.add_space(6.0);
-                ui.label(RichText::new("One MCP server (configure once)").strong());
-                ui.label(RichText::new("This permanent configuration contains no session credential. Without attachment it opens logs independently; after `attach_gui_session` it operates on the log selected in the GUI.").small().color(app.theme.text_muted));
-                ui.add_space(6.0);
-                agent_section(ui, &app.theme, "Codex CLI, ChatGPT app, VS Code",
+                agent_section(ui, &app.theme, "Codex (CLI, desktop, VS Code)",
                     "Add to the user configuration so Logotomy is available across projects:",
                     "~/.codex/config.toml", &codex_server_toml);
                 agent_section(ui, &app.theme, "Claude Desktop",
@@ -289,35 +360,50 @@ pub fn show_integrate_popup(ui: &mut egui::Ui, app: &mut LogotomyApp) {
                     "~/.cline/mcp.json", &cline_server_json);
 
                 ui.separator();
-                ui.label(RichText::new("Using the same server").strong());
-                ui.label(RichText::new("Standalone: ask the agent to call `load_log`, then use the returned `log_id`. Live GUI: start MCP here, copy the GUI session instruction, and give it to the agent. The agent attaches without changing its MCP configuration.").small().color(app.theme.text_muted));
+                integration_section_header(ui, "Use Logotomy");
+                ui.label(RichText::new("Standalone").strong());
+                ui.label(RichText::new("Ask the agent to call `load_log`, then use the returned `log_id`.").small().color(app.theme.text_muted));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Interactive GUI session").strong());
+                ui.label(RichText::new("Open and select a log, start MCP, then copy the GUI session instruction to the agent. It attaches to the selected tab without changing its MCP configuration.").small().color(app.theme.text_muted));
+                ui.add_space(10.0);
+                ui.separator();
+                if icons::action_button(
+                    ui,
+                    Icon::Close,
+                    "Close",
+                    app.theme.text,
+                    "Close the integration guide",
+                )
+                .clicked()
+                {
+                    app.show_integrate_popup = false;
+                }
             });
         });
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        open = false;
+    }
     if !open {
         app.show_integrate_popup = false;
     }
 }
 
 fn mcp_agent_setup_prompt(exe_path: &str) -> String {
-    let config = serde_json::to_string_pretty(&serde_json::json!({
-        "mcpServers": {
-            "logotomy": {
-                "args": ["--mcp"],
-                "command": exe_path,
-                "disabled": false
-            }
-        }
-    }))
-    .unwrap_or_default();
     format!(
-        "Logotomy is a local log analyzer. Add its MCP server globally (user scope) for this \
-agent client. Preserve existing MCP servers and translate the following configuration to this \
-client's native config format if necessary:\n\n{config}\n\nAfter updating the configuration, \
-tell me whether the client must reload or restart. Verify that the Logotomy server exposes \
-`session_info` and `attach_gui_session`. Use exactly the command and arguments above; do not \
-substitute another transport or a legacy flag. If you cannot modify global MCP settings from \
-this session, say so and tell me which settings file or UI to update."
+        "Set up Logotomy as a user/global MCP server for this client. Preserve existing MCP \
+servers and use this client's native MCP configuration format.\n\n\
+Transport: stdio\n\
+command: \"{exe_path}\"\n\
+args: [\"--mcp\"]\n\n\
+Reload MCP servers and verify `session_info` is available. If you cannot update the user \
+configuration, tell me the required file or UI step."
     )
+}
+
+fn integration_section_header(ui: &mut egui::Ui, title: &str) {
+    ui.label(RichText::new(title).strong().size(14.0));
+    ui.add_space(2.0);
 }
 
 /// Stable stdio configuration shared by standalone and GUI-attached use.
@@ -402,10 +488,14 @@ fn agent_section(
 ) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(agent).strong().size(13.0));
-        if ui
-            .button("Copy")
-            .on_hover_text(format!("Copy config for {}", agent))
-            .clicked()
+        if icons::action_button(
+            ui,
+            Icon::Copy,
+            "Copy",
+            theme.text,
+            format!("Copy configuration for {agent}"),
+        )
+        .clicked()
         {
             ui.ctx().copy_text(code.to_string());
         }
@@ -468,6 +558,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn confirmation_label_maps_to_existing_skip_setting() {
+        assert!(confirm_before_deleting(false));
+        assert!(!confirm_before_deleting(true));
+        for skip in [false, true] {
+            assert_eq!(!confirm_before_deleting(skip), skip);
+        }
+    }
+
+    #[test]
     fn generated_json_configs_escape_executable_paths() {
         let path = if cfg!(windows) {
             r#"C:\Program Files\Logotomy\logotomy.exe"#
@@ -505,13 +604,13 @@ mod tests {
     #[test]
     fn agent_setup_prompt_uses_dynamic_path_and_safe_global_stdio_config() {
         let prompt = mcp_agent_setup_prompt("/Applications/Logotomy.app/Contents/MacOS/logotomy");
-        assert!(prompt.contains("globally (user scope)"));
+        assert!(prompt.contains("user/global MCP server"));
         assert!(prompt.contains("/Applications/Logotomy.app/Contents/MacOS/logotomy"));
-        assert!(prompt.contains("\"args\": [\n        \"--mcp\""));
-        assert!(prompt.contains("\"disabled\": false"));
+        assert!(prompt.contains("args: [\"--mcp\"]"));
         assert!(prompt.contains("Preserve existing MCP servers"));
+        assert!(prompt.contains("Transport: stdio"));
         assert!(prompt.contains("session_info"));
-        assert!(prompt.contains("attach_gui_session"));
+        assert!(prompt.contains("required file or UI step"));
         assert!(!prompt.contains("http://"));
     }
 }

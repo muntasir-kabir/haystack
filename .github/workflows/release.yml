@@ -63,7 +63,7 @@ jobs:
       - name: Validate file associations
         shell: bash
         run: |
-          expected='["csv","err","evt","evtx","json","log","md","out","sys","txt","xml"]'
+          expected='["csv","err","json","log","md","out","txt","xml"]'
           actual=$(cargo metadata --no-deps --format-version 1 \
             | jq -c '[.packages[]
               | select(.name == "logotomy")

@@ -2,6 +2,7 @@ use eframe::egui;
 use egui::RichText;
 
 use crate::ui::app::model::LogotomyApp;
+use crate::ui::icons::{self, Icon};
 
 impl LogotomyApp {
     pub(super) fn show_filters_dropdown(&mut self, ui: &mut egui::Ui) {
@@ -15,14 +16,22 @@ impl LogotomyApp {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(260.0);
                     ui.set_max_width(360.0);
-                    ui.label(RichText::new("Saved filters").strong().size(14.0));
+                    ui.label(RichText::new("Filters").strong().size(14.0));
                     ui.separator();
 
                     let save_name = self
                         .active
                         .and_then(|i| self.tabs.get(i).and_then(|t| t.applied_filter.clone()));
                     ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
+                        if icons::action_button(
+                            ui,
+                            Icon::Save,
+                            "Save",
+                            self.theme.text,
+                            "Save changes to the applied filter set",
+                        )
+                        .clicked()
+                        {
                             if let Some(ref name) = save_name {
                                 self.save_filter(name);
                             } else {
@@ -30,7 +39,15 @@ impl LogotomyApp {
                             }
                             self.show_filter_dropdown = false;
                         }
-                        if ui.button("Save As...").clicked() {
+                        if icons::action_button(
+                            ui,
+                            Icon::Save,
+                            "Save as…",
+                            self.theme.text,
+                            "Save the active filters as a new named set",
+                        )
+                        .clicked()
+                        {
                             self.show_new_filter_popup = true;
                             self.show_filter_dropdown = false;
                         }
@@ -62,10 +79,13 @@ impl LogotomyApp {
                                             self.apply_filter(filter_name);
                                             self.show_filter_dropdown = false;
                                         }
-                                        if ui
-                                            .button("Edit")
-                                            .on_hover_text("Rename filter")
-                                            .clicked()
+                                        if icons::icon_action_button(
+                                            ui,
+                                            Icon::Edit,
+                                            self.theme.text,
+                                            "Rename this saved filter set",
+                                        )
+                                        .clicked()
                                         {
                                             self.rename_filter_target = filter_name.clone();
                                             self.rename_filter_new_name = filter_name.clone();
@@ -74,11 +94,21 @@ impl LogotomyApp {
                                         }
                                         let is_default = self.settings.default_filter.as_deref()
                                             == Some(filter_name);
-                                        let star_icon = if is_default { "★" } else { "☆" };
-                                        if ui
-                                            .button(star_icon)
-                                            .on_hover_text("Set as default filter")
-                                            .clicked()
+                                        if icons::icon_action_button(
+                                            ui,
+                                            if is_default {
+                                                Icon::Star
+                                            } else {
+                                                Icon::StarOutline
+                                            },
+                                            self.theme.text,
+                                            if is_default {
+                                                "Stop applying this filter set by default"
+                                            } else {
+                                                "Apply this filter set by default"
+                                            },
+                                        )
+                                        .clicked()
                                         {
                                             if is_default {
                                                 self.settings.default_filter = None;
@@ -94,15 +124,20 @@ impl LogotomyApp {
                         });
                 });
             });
-            // Close on click outside
-            if ui.input(|i| i.pointer.any_click()) {
-                if let Some(click_pos) = ui.input(|i| i.pointer.interact_pos()) {
-                    let on_button = button_rect.contains(click_pos);
-                    let on_popup = area_resp.response.rect.contains(click_pos);
-                    if !on_button && !on_popup {
-                        self.show_filter_dropdown = false;
-                    }
-                }
+            let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+            let outside = ui.input(|input| {
+                input
+                    .pointer
+                    .any_click()
+                    .then(|| input.pointer.interact_pos())
+                    .flatten()
+                    .is_some_and(|position| {
+                        !button_rect.contains(position)
+                            && !area_resp.response.rect.contains(position)
+                    })
+            });
+            if escape || outside {
+                self.show_filter_dropdown = false;
             }
         }
     }

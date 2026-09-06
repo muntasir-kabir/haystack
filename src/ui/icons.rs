@@ -17,7 +17,6 @@ pub enum Icon {
     Expand,
     Collapse,
     Pin,
-    PopOut,
     Close,
     Remove,
     Reset,
@@ -26,6 +25,15 @@ pub enum Icon {
     Add,
     Edit,
     Save,
+    Search,
+    History,
+    Commands,
+    ExternalWindow,
+    Export,
+    Help,
+    Info,
+    Bug,
+    More,
 
     // Analysis & Data
     Analysis,
@@ -40,6 +48,8 @@ pub enum Icon {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
+    FirstOccurrence,
+    LastOccurrence,
     Enter,
     ArrowsVertical,
     ArrowsHorizontal,
@@ -50,6 +60,7 @@ pub enum Icon {
     Puzzle,
     Star,
     StarOutline,
+    Filter,
 
     // File & App
     App,
@@ -72,18 +83,78 @@ pub enum Icon {
     Check,
     Uncheck,
     Visible,
-    Invisible,    // Checkbox / visibility
-    WindowResize, // Window management
+    Invisible,
 }
 
 impl Icon {
+    /// Complete icon catalog. Keep UI tests and icon-browser tooling tied to
+    /// this list so a newly added asset cannot silently escape validation.
+    #[cfg(test)]
+    pub const ALL: &'static [Icon] = &[
+        Icon::Expand,
+        Icon::Collapse,
+        Icon::Pin,
+        Icon::Close,
+        Icon::Remove,
+        Icon::Reset,
+        Icon::Settings,
+        Icon::Copy,
+        Icon::Add,
+        Icon::Edit,
+        Icon::Save,
+        Icon::Search,
+        Icon::History,
+        Icon::Commands,
+        Icon::ExternalWindow,
+        Icon::Export,
+        Icon::Help,
+        Icon::Info,
+        Icon::Bug,
+        Icon::More,
+        Icon::Analysis,
+        Icon::Date,
+        Icon::Target,
+        Icon::Timeline,
+        Icon::Log,
+        Icon::Jump,
+        Icon::ArrowUp,
+        Icon::ArrowDown,
+        Icon::ArrowLeft,
+        Icon::ArrowRight,
+        Icon::FirstOccurrence,
+        Icon::LastOccurrence,
+        Icon::Enter,
+        Icon::ArrowsVertical,
+        Icon::ArrowsHorizontal,
+        Icon::Key,
+        Icon::Book,
+        Icon::Puzzle,
+        Icon::Star,
+        Icon::StarOutline,
+        Icon::Filter,
+        Icon::App,
+        Icon::OpenFile,
+        Icon::Box,
+        Icon::Trim,
+        Icon::Start,
+        Icon::Stop,
+        Icon::ThemeLight,
+        Icon::ThemeDark,
+        Icon::Mcp,
+        Icon::Integrate,
+        Icon::Popcorn,
+        Icon::Check,
+        Icon::Uncheck,
+        Icon::Visible,
+        Icon::Invisible,
+    ];
+
     /// Returns the embedded SVG bytes for this icon.
     pub fn svg_bytes(&self) -> &'static [u8] {
         match self {
             Icon::Expand => include_bytes!("icons/expand.svg"),
             Icon::Collapse => include_bytes!("icons/collapse.svg"),
             Icon::Pin => include_bytes!("icons/pin.svg"),
-            Icon::PopOut => include_bytes!("icons/pop-out.svg"),
             Icon::Close => include_bytes!("icons/close.svg"),
             Icon::Remove => include_bytes!("icons/remove.svg"),
             Icon::Reset => include_bytes!("icons/reset.svg"),
@@ -92,6 +163,15 @@ impl Icon {
             Icon::Add => include_bytes!("icons/add.svg"),
             Icon::Edit => include_bytes!("icons/edit.svg"),
             Icon::Save => include_bytes!("icons/save.svg"),
+            Icon::Search => include_bytes!("icons/search.svg"),
+            Icon::History => include_bytes!("icons/history.svg"),
+            Icon::Commands => include_bytes!("icons/commands.svg"),
+            Icon::ExternalWindow => include_bytes!("icons/external-window.svg"),
+            Icon::Export => include_bytes!("icons/export.svg"),
+            Icon::Help => include_bytes!("icons/help.svg"),
+            Icon::Info => include_bytes!("icons/info.svg"),
+            Icon::Bug => include_bytes!("icons/bug.svg"),
+            Icon::More => include_bytes!("icons/more.svg"),
             Icon::Analysis => include_bytes!("icons/analysis.svg"),
             Icon::Date => include_bytes!("icons/date.svg"),
             Icon::Target => include_bytes!("icons/target.svg"),
@@ -102,6 +182,8 @@ impl Icon {
             Icon::ArrowDown => include_bytes!("icons/arrow-down.svg"),
             Icon::ArrowLeft => include_bytes!("icons/arrow-left.svg"),
             Icon::ArrowRight => include_bytes!("icons/arrow-right.svg"),
+            Icon::FirstOccurrence => include_bytes!("icons/first-occurrence.svg"),
+            Icon::LastOccurrence => include_bytes!("icons/last-occurrence.svg"),
             Icon::Enter => include_bytes!("icons/enter.svg"),
             Icon::ArrowsVertical => include_bytes!("icons/arrows-vertical.svg"),
             Icon::ArrowsHorizontal => include_bytes!("icons/arrows-horizontal.svg"),
@@ -110,6 +192,7 @@ impl Icon {
             Icon::Puzzle => include_bytes!("icons/puzzle.svg"),
             Icon::Star => include_bytes!("icons/star.svg"),
             Icon::StarOutline => include_bytes!("icons/star-outline.svg"),
+            Icon::Filter => include_bytes!("icons/filter.svg"),
             Icon::App => include_bytes!("icons/app.svg"),
             Icon::OpenFile => include_bytes!("icons/open-file.svg"),
             Icon::Box => include_bytes!("icons/box.svg"),
@@ -125,7 +208,6 @@ impl Icon {
             Icon::Uncheck => include_bytes!("icons/uncheck.svg"),
             Icon::Visible => include_bytes!("icons/visible.svg"),
             Icon::Invisible => include_bytes!("icons/invisible.svg"),
-            Icon::WindowResize => include_bytes!("icons/window_resize.svg"),
         }
     }
 
@@ -137,7 +219,6 @@ impl Icon {
             Icon::Expand => "▶",
             Icon::Collapse => "▼",
             Icon::Pin => "📌",
-            Icon::PopOut => "⤴",
             Icon::Close => "✕",
             Icon::Remove => "−",
             Icon::Reset => "↺",
@@ -146,6 +227,15 @@ impl Icon {
             Icon::Add => "+",
             Icon::Edit => "✎",
             Icon::Save => "💾",
+            Icon::Search => "⌕",
+            Icon::History => "↺",
+            Icon::Commands => ">_",
+            Icon::ExternalWindow => "↗",
+            Icon::Export => "⇩",
+            Icon::Help => "?",
+            Icon::Info => "i",
+            Icon::Bug => "!",
+            Icon::More => "…",
             Icon::Analysis => "📊",
             Icon::Date => "📅",
             Icon::Target => "🎯",
@@ -156,6 +246,8 @@ impl Icon {
             Icon::ArrowDown => "↓",
             Icon::ArrowLeft => "←",
             Icon::ArrowRight => "→",
+            Icon::FirstOccurrence => "<|",
+            Icon::LastOccurrence => "|>",
             Icon::Enter => "↵",
             Icon::ArrowsVertical => "↕",
             Icon::ArrowsHorizontal => "↔",
@@ -164,6 +256,7 @@ impl Icon {
             Icon::Puzzle => "🧩",
             Icon::Star => "★",
             Icon::StarOutline => "☆",
+            Icon::Filter => "⏷",
             Icon::App => "🖥",
             Icon::OpenFile => "📂",
             Icon::Box => "📦",
@@ -179,7 +272,6 @@ impl Icon {
             Icon::Uncheck => "□",
             Icon::Visible => "👁",
             Icon::Invisible => "🚫",
-            Icon::WindowResize => "⤢",
         }
     }
 }
@@ -332,16 +424,113 @@ pub fn app_logo(ctx: &egui::Context, size: f32) -> egui::Image<'static> {
     egui::Image::new(source).fit_to_exact_size(Vec2::splat(size))
 }
 
-/// A simple icon button using SVG rendering.
-pub fn image_button(
+/// Compact standard height for application chrome so controls stay aligned
+/// without competing with the timeline and log content.
+pub const ACTION_HEIGHT: f32 = 22.0;
+
+/// A consistent icon-and-text action with a required explanatory tooltip.
+pub fn action_button(
     ui: &mut egui::Ui,
     icon: Icon,
-    size: egui::Vec2,
+    label: impl Into<egui::WidgetText>,
     color: Color32,
+    tooltip: impl Into<egui::WidgetText>,
 ) -> egui::Response {
-    let ctx = ui.ctx().clone();
-    let image = icon_image(&ctx, icon, size.y.min(16.0), color);
-    ui.add_sized(size, egui::Button::new(image))
+    let image = icon_image(ui.ctx(), icon, 14.0, color);
+    ui.add(
+        egui::Button::image_and_text(image, label)
+            .gap(4.0)
+            .frame_when_inactive(false)
+            .min_size(egui::vec2(0.0, ACTION_HEIGHT)),
+    )
+    .on_hover_text(tooltip)
+}
+
+/// Disabled-capable form of [`action_button`].
+pub fn action_button_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: Icon,
+    label: impl Into<egui::WidgetText>,
+    color: Color32,
+    tooltip: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let image = icon_image(ui.ctx(), icon, 14.0, color);
+    ui.add_enabled(
+        enabled,
+        egui::Button::image_and_text(image, label)
+            .gap(4.0)
+            .frame_when_inactive(false)
+            .min_size(egui::vec2(0.0, ACTION_HEIGHT)),
+    )
+    .on_hover_text(tooltip)
+}
+
+/// A visually emphasized icon-and-text action for dialog confirmation and
+/// other single primary outcomes.
+pub fn primary_action_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: impl Into<egui::WidgetText>,
+    fill: Color32,
+    tooltip: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let foreground = contrasting_text(fill);
+    let image = icon_image(ui.ctx(), icon, 14.0, foreground);
+    ui.add(
+        egui::Button::image_and_text(image, label)
+            .gap(4.0)
+            .fill(fill)
+            .min_size(egui::vec2(0.0, ACTION_HEIGHT + 2.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+/// Disabled-capable form of [`primary_action_button`].
+pub fn primary_action_button_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: Icon,
+    label: impl Into<egui::WidgetText>,
+    fill: Color32,
+    tooltip: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let foreground = contrasting_text(fill);
+    let image = icon_image(ui.ctx(), icon, 14.0, foreground);
+    ui.add_enabled(
+        enabled,
+        egui::Button::image_and_text(image, label)
+            .gap(4.0)
+            .fill(fill)
+            .min_size(egui::vec2(0.0, ACTION_HEIGHT + 2.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+fn contrasting_text(fill: Color32) -> Color32 {
+    let luminance =
+        0.2126 * f32::from(fill.r()) + 0.7152 * f32::from(fill.g()) + 0.0722 * f32::from(fill.b());
+    if luminance > 150.0 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
+
+/// A conventional compact icon-only secondary action with a required tooltip.
+/// Primary actions should use [`action_button`].
+pub fn icon_action_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    color: Color32,
+    tooltip: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let image = icon_image(ui.ctx(), icon, 14.0, color);
+    ui.add_sized(
+        egui::vec2(ACTION_HEIGHT, ACTION_HEIGHT),
+        egui::Button::new(image).frame_when_inactive(false),
+    )
+    .on_hover_text(tooltip)
 }
 
 /// A default egui `Button` with an SVG image inside, but positioned at an
@@ -397,56 +586,7 @@ mod tests {
     /// widget (e.g. egui_dock's close ✕ under our pop-out icon) shows through.
     #[test]
     fn all_embedded_icons_parse_in_usvg() {
-        let icons = [
-            Icon::Expand,
-            Icon::Collapse,
-            Icon::Pin,
-            Icon::PopOut,
-            Icon::Close,
-            Icon::Remove,
-            Icon::Reset,
-            Icon::Settings,
-            Icon::Copy,
-            Icon::Add,
-            Icon::Edit,
-            Icon::Save,
-            Icon::Analysis,
-            Icon::Date,
-            Icon::Target,
-            Icon::Timeline,
-            Icon::Log,
-            Icon::Jump,
-            Icon::ArrowUp,
-            Icon::ArrowDown,
-            Icon::ArrowLeft,
-            Icon::ArrowRight,
-            Icon::Enter,
-            Icon::ArrowsVertical,
-            Icon::ArrowsHorizontal,
-            Icon::Key,
-            Icon::Book,
-            Icon::Puzzle,
-            Icon::Star,
-            Icon::StarOutline,
-            Icon::App,
-            Icon::OpenFile,
-            Icon::Box,
-            Icon::Trim,
-            Icon::Start,
-            Icon::Stop,
-            Icon::ThemeLight,
-            Icon::ThemeDark,
-            Icon::Mcp,
-            Icon::Integrate,
-            Icon::Popcorn,
-            Icon::Check,
-            Icon::Uncheck,
-            Icon::Visible,
-            Icon::Invisible,
-            Icon::WindowResize,
-        ];
-
-        for icon in icons {
+        for &icon in Icon::ALL {
             let svg = icon.svg_bytes();
             let style_sheet = "svg { color: #ABCABC; }".to_string();
             let opt = resvg::usvg::Options {
@@ -460,6 +600,21 @@ mod tests {
                 "icon {:?} produced an empty image",
                 icon
             );
+
+            for size in [12_u32, 15, 16] {
+                let scale = size as f32 / tree.size().width().max(1.0);
+                let height = (tree.size().height() * scale).max(1.0).ceil() as u32;
+                let mut pixmap = resvg::tiny_skia::Pixmap::new(size, height).unwrap();
+                resvg::render(
+                    &tree,
+                    resvg::tiny_skia::Transform::from_scale(scale, scale),
+                    &mut pixmap.as_mut(),
+                );
+                assert!(
+                    pixmap.data().chunks_exact(4).any(|pixel| pixel[3] != 0),
+                    "icon {icon:?} rendered no visible pixels at {size}px"
+                );
+            }
         }
     }
 }

@@ -21,9 +21,10 @@ cargo install cargo-packager --locked
 The packaging config lives in `Cargo.toml` under `[package.metadata.packager]`
 (identifier, product name/version, app icons, file associations, and
 NSIS/macOS/Linux options). The native installers register `.log`, `.txt`,
-`.out`, `.err`, `.evt`, `.evtx`, `.sys`, `.csv`, `.json`, `.xml`, and `.md` with
-logotomy. On Linux, registration follows the MIME types advertised by the
-desktop entry; Windows and macOS register the extensions directly.
+`.out`, `.err`, `.csv`, `.json`, `.xml`, and `.md` with logotomy. On Linux, registration follows the MIME types advertised by the
+desktop entry; Windows and macOS register the extensions directly. Windows
+Event Log binaries (`.evt`/`.evtx`) and `.sys` files are not registered because
+logotomy’s core expects text input.
 
 ### Platform prerequisites
 

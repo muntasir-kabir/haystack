@@ -12,6 +12,7 @@
 
 use std::borrow::Cow;
 use std::fs::File;
+use std::ops::{Index, IndexMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,6 +50,139 @@ impl Default for ParsingConfig {
 
 /// Report progress at most every 4 MiB so the channel stays quiet.
 const PROGRESS_STRIDE: u64 = 4 * 1024 * 1024;
+const INDEX_CHUNK_LEN: usize = 65_536;
+
+/// Append-friendly copy-on-write storage for per-line indexes. A staged live
+/// append shares all completed chunks with the rendered document and copies
+/// at most the final partial chunk when extending it.
+#[derive(Clone, Debug)]
+pub struct ChunkedIndex<T> {
+    chunks: Arc<Vec<Arc<Vec<T>>>>,
+    len: usize,
+}
+
+impl<T> Default for ChunkedIndex<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Arc::new(Vec::new()),
+            len: 0,
+        }
+    }
+}
+
+impl<T> ChunkedIndex<T> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&T> {
+        (index < self.len).then(|| &self[index])
+    }
+
+    pub fn last(&self) -> Option<&T> {
+        self.len.checked_sub(1).map(|index| &self[index])
+    }
+
+    fn iter_range(&self, range: std::ops::Range<usize>) -> impl Iterator<Item = &T> {
+        range.map(|index| &self[index])
+    }
+
+    #[cfg(test)]
+    fn shares_chunk_with(&self, other: &Self, index: usize) -> bool {
+        let chunk = index / INDEX_CHUNK_LEN;
+        self.chunks
+            .get(chunk)
+            .zip(other.chunks.get(chunk))
+            .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
+    }
+}
+
+impl<T: Clone> ChunkedIndex<T> {
+    pub fn push(&mut self, value: T) {
+        let chunks = Arc::make_mut(&mut self.chunks);
+        if let Some(last) = chunks
+            .last_mut()
+            .filter(|chunk| chunk.len() < INDEX_CHUNK_LEN)
+        {
+            Arc::make_mut(last).push(value);
+        } else {
+            chunks.push(Arc::new(vec![value]));
+        }
+        self.len += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let value = Arc::make_mut(chunks.last_mut()?).pop();
+        if chunks.last().is_some_and(|chunk| chunk.is_empty()) {
+            chunks.pop();
+        }
+        self.len -= 1;
+        value
+    }
+
+    pub fn resize(&mut self, new_len: usize, value: T) {
+        if new_len < self.len {
+            let chunks = Arc::make_mut(&mut self.chunks);
+            let needed_chunks = new_len.div_ceil(INDEX_CHUNK_LEN);
+            chunks.truncate(needed_chunks);
+            let remainder = new_len % INDEX_CHUNK_LEN;
+            if remainder > 0 {
+                if let Some(last) = chunks.last_mut() {
+                    Arc::make_mut(last).truncate(remainder);
+                }
+            }
+            self.len = new_len;
+        } else {
+            while self.len < new_len {
+                self.push(value.clone());
+            }
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for ChunkedIndex<T> {
+    fn from(values: Vec<T>) -> Self {
+        let len = values.len();
+        let mut iter = values.into_iter();
+        let mut chunks = Vec::with_capacity(len.div_ceil(INDEX_CHUNK_LEN));
+        loop {
+            let chunk: Vec<T> = iter.by_ref().take(INDEX_CHUNK_LEN).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            chunks.push(Arc::new(chunk));
+        }
+        Self {
+            chunks: Arc::new(chunks),
+            len,
+        }
+    }
+}
+
+impl<T> Index<usize> for ChunkedIndex<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        assert!(index < self.len, "chunked index out of bounds");
+        &self.chunks[index / INDEX_CHUNK_LEN][index % INDEX_CHUNK_LEN]
+    }
+}
+
+impl<T: Clone> IndexMut<usize> for ChunkedIndex<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        assert!(index < self.len, "chunked index out of bounds");
+        let chunks = Arc::make_mut(&mut self.chunks);
+        &mut Arc::make_mut(&mut chunks[index / INDEX_CHUNK_LEN])[index % INDEX_CHUNK_LEN]
+    }
+}
 
 fn pack_timestamp_span(span: std::ops::Range<usize>) -> u32 {
     let len = span.end.saturating_sub(span.start);
@@ -120,26 +254,26 @@ pub struct LogDocument {
     /// Byte offset where each line starts; last element is the file size.
     #[doc(hidden)]
     file_handle: Arc<File>, // Keep the file handle to maintain the lock
-    pub line_offsets: Vec<u64>,
+    pub line_offsets: ChunkedIndex<u64>,
     /// Forward-filled timestamps: untimestamped lines (stack traces, etc.)
     /// inherit the previous line's time. -1 before the first known timestamp.
     /// Indexed by *original* (untrimmed) line index. Use `ts_at` for
     /// trim-relative access.
-    ts_ff: Vec<i64>,
+    ts_ff: ChunkedIndex<i64>,
     /// Compact bitset of physical lines that contained an explicit timestamp.
     /// It lets viewport analyzers recover the start/end of multiline records
     /// without retaining a second timestamp array (one bit per source line).
-    record_starts: Vec<u64>,
+    record_starts: ChunkedIndex<u64>,
     /// Packed exact timestamp source spans, indexed by original line. The high
     /// 16 bits store the byte start and the low 16 bits store the byte length;
     /// zero means the line has no representable explicit timestamp. This keeps
     /// annotation lookup allocation-free without rerunning parsers while the
     /// UI paints.
-    timestamp_spans: Vec<u32>,
+    timestamp_spans: ChunkedIndex<u32>,
     /// Per-line Drain template cluster ID.
     /// Indexed by *original* (untrimmed) line index. Use `template_at` for
     /// trim-relative access.
-    template_ids: Vec<u32>,
+    template_ids: ChunkedIndex<u32>,
     /// The Drain instance used for template mining.
     #[doc(hidden)]
     drain: Arc<Mutex<Drain>>,
@@ -171,10 +305,9 @@ pub struct LogDocument {
     pub trim_end: usize,
 }
 
-// A copy-on-write document must not share its mutable Drain state. Sharing it
-// makes an appended background copy alter clustering behind the still-rendered
-// document's back. The mmap/file handle remain cheap shared Arcs; per-line
-// indexes and mutable mining state are independent.
+// A staged document shares immutable mmap data and completed index chunks, but
+// must not share its mutable Drain state. Appending copy-on-writes only the
+// final partial index chunks while mining remains isolated from the renderer.
 impl Clone for LogDocument {
     fn clone(&self) -> Self {
         Self {
@@ -396,7 +529,7 @@ impl LogDocument {
         // Recalculate time_range from trimmed timestamps.
         let mut min_ts = i64::MAX;
         let mut max_ts = i64::MIN;
-        for &t in &self.ts_ff[self.trim_start..self.trim_end] {
+        for &t in self.ts_ff.iter_range(self.trim_start..self.trim_end) {
             if t >= 0 {
                 min_ts = min_ts.min(t);
                 max_ts = max_ts.max(t);
@@ -481,6 +614,9 @@ impl LogDocument {
             self.line_offsets.push(new_size);
         }
         let new_line_count = self.total_lines_untrimmed();
+        if new_line_count > u32::MAX as usize {
+            return Err("log has more than the supported 4,294,967,295 lines".to_string());
+        }
 
         // Create dummy progress reporters since this is not a background load with UI.
         let (tx, _) = crossbeam_channel::unbounded();
@@ -736,6 +872,9 @@ impl LogDocument {
         }
         offsets.push(total);
         let n_lines = offsets.len() - 1;
+        if n_lines > u32::MAX as usize {
+            return Err("log has more than the supported 4,294,967,295 lines".to_string());
+        }
 
         // ---- Format + timestamp detection on a sample ----
         let line_at = |i: usize| -> Cow<'_, str> {
@@ -806,11 +945,11 @@ impl LogDocument {
             file_name,
             data: Arc::new(mmap),
             file_handle: file_arc,
-            line_offsets: offsets,
-            ts_ff: Vec::with_capacity(n_lines),
-            record_starts: Vec::with_capacity(n_lines.div_ceil(64)),
-            timestamp_spans: Vec::with_capacity(n_lines),
-            template_ids: Vec::with_capacity(n_lines),
+            line_offsets: offsets.into(),
+            ts_ff: ChunkedIndex::default(),
+            record_starts: ChunkedIndex::default(),
+            timestamp_spans: ChunkedIndex::default(),
+            template_ids: ChunkedIndex::default(),
             drain: Arc::new(Mutex::new(Drain::new(
                 config.drain_depth,
                 config.sim_threshold,
@@ -1875,6 +2014,22 @@ mod tests {
         assert_eq!(doc.total_lines(), 1);
         assert_eq!(staged.total_lines(), 2);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn chunked_indexes_share_completed_chunks_and_copy_only_the_tail() {
+        let values: Vec<u32> = (0..INDEX_CHUNK_LEN as u32 + 2).collect();
+        let original: ChunkedIndex<u32> = values.into();
+        let mut staged = original.clone();
+        assert!(original.shares_chunk_with(&staged, 0));
+        assert!(original.shares_chunk_with(&staged, INDEX_CHUNK_LEN));
+
+        staged.push(u32::MAX);
+        assert!(original.shares_chunk_with(&staged, 0));
+        assert!(!original.shares_chunk_with(&staged, INDEX_CHUNK_LEN));
+        assert_eq!(original.len(), INDEX_CHUNK_LEN + 2);
+        assert_eq!(staged.len(), INDEX_CHUNK_LEN + 3);
+        assert_eq!(staged[INDEX_CHUNK_LEN + 2], u32::MAX);
     }
 
     // On Windows, shrinking a file requires SetEndOfFile, which the OS refuses

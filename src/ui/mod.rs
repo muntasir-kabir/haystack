@@ -7,5 +7,8 @@ pub mod instance;
 mod log_view;
 mod pin_viewer;
 mod settings;
+pub mod template_view;
 pub mod theme;
 mod timeline;
+pub mod util;
+mod worker_pool;

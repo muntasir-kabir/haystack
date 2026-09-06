@@ -69,7 +69,7 @@
 //! instead of scanning the file — pass `with_filtered_log=false` for full-file
 //! traversal or add a filter first.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -86,7 +86,10 @@ use crate::core::search;
 use crate::core::time::{format_ms, parse_time_param};
 
 mod bridge;
+mod search_api;
 pub mod session;
+pub use search_api::GuiSearch;
+use search_api::{matcher_from_args, search_schema, tool_search};
 
 pub use bridge::run_gui_bridge;
 use bridge::GuiClient;
@@ -103,6 +106,19 @@ const MAX_LINE_TEXT: usize = 1000;
 const HARD_MAX_LINES: usize = 2000;
 /// Cap on the per-log filter keyword set (mirrors the GUI's MAX_FILTERS).
 const MAX_FILTERS: usize = 20;
+/// Bounds retained keyword results even when an MCP client issues many unique
+/// searches. Dense results are also byte-limited so one large log cannot keep
+/// an arbitrary amount of match-index memory alive.
+const MATCH_CACHE_MAX_ENTRIES: usize = 128;
+const MATCH_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+type MatchCacheKey = (String, String, bool, bool, Option<u32>);
+
+struct FilteredUnionCacheEntry {
+    filters: Vec<search::FilterSpec>,
+    join: search::FilterJoin,
+    lines: Arc<Vec<usize>>,
+}
 
 /// A user-visible analysis card in the GUI's Pin tab. `lines` uses zero-based
 /// document indices internally; MCP request/response payloads use one-based
@@ -264,7 +280,12 @@ pub struct ServerState {
     pub logs: HashMap<String, Arc<LogDocument>>,
     pub next_id: u64,
     /// (log_id, keyword, case_sensitive) → sorted matching line indices.
-    pub match_cache: HashMap<(String, String, bool), Arc<Vec<usize>>>,
+    pub match_cache: HashMap<MatchCacheKey, Arc<Vec<usize>>>,
+    match_cache_lru: VecDeque<MatchCacheKey>,
+    match_cache_bytes: usize,
+    /// One derived filtered union per loaded log. Filter mutations and
+    /// document replacement invalidate only the affected entry.
+    filtered_union_cache: HashMap<String, FilteredUnionCacheEntry>,
     /// Single active document for GUI mode. When set, the server operates in
     /// simplified mode (no load_log/list_logs/close_log, no log_id parameter).
     pub active_doc: Option<Arc<LogDocument>>,
@@ -283,7 +304,10 @@ pub struct ServerState {
     /// (union of each filter's matching lines). The GUI's "Everything Else"
     /// lane is never part of MCP arithmetic — filtered tools only ever see
     /// lines that match at least one real filter keyword.
-    pub filters: HashMap<String, Vec<String>>,
+    pub filters: HashMap<String, Vec<search::FilterSpec>>,
+    filter_joins: HashMap<String, search::FilterJoin>,
+    /// Latest successful GUI search, consumed by the UI on its next frame.
+    pub pending_search: Option<GuiSearch>,
     /// Set to true when the `_active` filter set changed (MCP→GUI direction).
     /// The GUI polls this flag to re-apply MCP-originated filter edits to the
     /// served tab. GUI-originated filter edits flow the other way (see
@@ -303,10 +327,15 @@ impl Default for ServerState {
             logs: HashMap::new(),
             next_id: 0,
             match_cache: HashMap::new(),
+            match_cache_lru: VecDeque::new(),
+            match_cache_bytes: 0,
+            filtered_union_cache: HashMap::new(),
             active_doc: None,
             gui_mode: false,
             active_doc_dirty: Arc::new(AtomicBool::new(false)),
             filters: HashMap::new(),
+            filter_joins: HashMap::new(),
+            pending_search: None,
             filters_dirty: Arc::new(AtomicBool::new(false)),
             analyses: Vec::new(),
             analyses_dirty: Arc::new(AtomicBool::new(false)),
@@ -315,6 +344,61 @@ impl Default for ServerState {
 }
 
 impl ServerState {
+    fn touch_match_cache_key(&mut self, key: &MatchCacheKey) {
+        if let Some(position) = self.match_cache_lru.iter().position(|entry| entry == key) {
+            self.match_cache_lru.remove(position);
+        }
+        self.match_cache_lru.push_back(key.clone());
+    }
+
+    fn insert_match_cache(&mut self, key: MatchCacheKey, matches: Arc<Vec<usize>>) {
+        let bytes = matches
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>());
+        if bytes > MATCH_CACHE_MAX_BYTES {
+            return;
+        }
+        while self.match_cache.len() >= MATCH_CACHE_MAX_ENTRIES
+            || self.match_cache_bytes.saturating_add(bytes) > MATCH_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = self.match_cache_lru.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.match_cache.remove(&oldest) {
+                self.match_cache_bytes = self.match_cache_bytes.saturating_sub(
+                    removed
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+            }
+        }
+        self.match_cache_bytes = self.match_cache_bytes.saturating_add(bytes);
+        self.match_cache.insert(key.clone(), matches);
+        self.touch_match_cache_key(&key);
+    }
+
+    fn invalidate_log_caches(&mut self, log_id: &str) {
+        let keys: Vec<_> = self
+            .match_cache
+            .keys()
+            .filter(|(id, ..)| id == log_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(removed) = self.match_cache.remove(&key) {
+                self.match_cache_bytes = self.match_cache_bytes.saturating_sub(
+                    removed
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+            }
+            if let Some(position) = self.match_cache_lru.iter().position(|entry| entry == &key) {
+                self.match_cache_lru.remove(position);
+            }
+        }
+        self.filtered_union_cache.remove(log_id);
+    }
+
     pub fn get_doc(&self, log_id: &str) -> Result<Arc<LogDocument>, String> {
         self.logs
             .get(log_id)
@@ -328,24 +412,35 @@ impl ServerState {
         keyword: &str,
         case_sensitive: bool,
     ) -> Result<Arc<Vec<usize>>, String> {
-        let key = (log_id.to_string(), keyword.to_string(), case_sensitive);
-        if let Some(m) = self.match_cache.get(&key) {
-            return Ok(Arc::clone(m));
+        let mut spec = search::FilterSpec::phrase(keyword);
+        spec.case_sensitive = case_sensitive;
+        self.matches_for_spec(log_id, &spec)
+    }
+
+    fn matches_for_spec(
+        &mut self,
+        log_id: &str,
+        spec: &search::FilterSpec,
+    ) -> Result<Arc<Vec<usize>>, String> {
+        let key = (
+            log_id.to_string(),
+            spec.text.clone(),
+            spec.case_sensitive,
+            spec.regex,
+            spec.template_id,
+        );
+        if let Some(matches) = self.match_cache.get(&key).cloned() {
+            self.touch_match_cache_key(&key);
+            return Ok(matches);
         }
         let doc = if log_id == "_active" {
             self.get_active_doc()?
         } else {
             self.get_doc(log_id)?
         };
-        let matches = search::find_lines(
-            doc.as_ref(),
-            None,
-            keyword,
-            !case_sensitive,
-            &AtomicBool::new(false),
-        );
-        let matches = Arc::new(matches);
-        self.match_cache.insert(key, Arc::clone(&matches));
+        let matches = search::find_advanced_u32(doc.as_ref(), None, spec, &AtomicBool::new(false))?;
+        let matches = Arc::new(matches.into_iter().map(|line| line as usize).collect());
+        self.insert_match_cache(key, Arc::clone(&matches));
         Ok(matches)
     }
 
@@ -383,17 +478,20 @@ impl ServerState {
     /// Set the active document for GUI mode. Switches the server to simplified
     /// tool set (no log_id, no load/list/close).
     pub fn set_active_doc(&mut self, doc: Arc<LogDocument>) {
+        self.pending_search = None;
         self.gui_mode = true;
         self.active_doc = Some(doc);
-        self.match_cache.retain(|(id, _, _), _| id != "_active"); // drop stale matches
+        self.invalidate_log_caches("_active");
         self.active_doc_dirty.store(true, Ordering::Relaxed);
     }
 
     /// Clear the active document while retaining the GUI tool surface.
     pub fn clear_active_doc(&mut self) {
+        self.pending_search = None;
         self.active_doc = None;
-        self.match_cache.retain(|(id, _, _), _| id != "_active");
+        self.invalidate_log_caches("_active");
         self.filters.remove("_active");
+        self.filter_joins.remove("_active");
         self.analyses.clear();
         self.analyses_dirty.store(false, Ordering::Relaxed);
     }
@@ -420,13 +518,41 @@ impl ServerState {
 
     /// Current filter keyword list for a log (empty when none are set).
     pub fn get_filters(&self, log_id: &str) -> Vec<String> {
+        self.get_filter_specs(log_id)
+            .into_iter()
+            .map(|spec| spec.text)
+            .collect()
+    }
+
+    pub fn get_filter_specs(&self, log_id: &str) -> Vec<search::FilterSpec> {
         self.filters.get(log_id).cloned().unwrap_or_default()
+    }
+
+    pub fn filter_join(&self, log_id: &str) -> search::FilterJoin {
+        self.filter_joins.get(log_id).copied().unwrap_or_default()
     }
 
     /// Replace the filter set wholesale (used by GUI-originated sync).
     /// Marks the MCP→GUI `filters_dirty` flag for the active document,
     /// mirroring `set_active_doc`.
     pub fn set_filters(&mut self, log_id: &str, filters: Vec<String>) {
+        self.set_filter_specs(
+            log_id,
+            filters
+                .into_iter()
+                .map(search::FilterSpec::phrase)
+                .collect(),
+            search::FilterJoin::Any,
+        );
+    }
+
+    pub fn set_filter_specs(
+        &mut self,
+        log_id: &str,
+        filters: Vec<search::FilterSpec>,
+        join: search::FilterJoin,
+    ) {
+        self.filter_joins.insert(log_id.to_string(), join);
         if filters.is_empty() {
             self.filters.remove(log_id);
         } else {
@@ -435,27 +561,33 @@ impl ServerState {
         if log_id == "_active" {
             self.filters_dirty.store(true, Ordering::Relaxed);
         }
+        self.filtered_union_cache.remove(log_id);
     }
 
     /// Add a keyword filter (trimmed, case-sensitive dedupe, `MAX_FILTERS`
     /// cap). Returns the full updated filter list.
     pub fn add_filter(&mut self, log_id: &str, text: &str) -> Result<Vec<String>, String> {
-        let text = text.trim();
-        if text.is_empty() {
+        self.add_filter_spec(log_id, search::FilterSpec::phrase(text.trim()))?;
+        Ok(self.get_filters(log_id))
+    }
+
+    fn add_filter_spec(&mut self, log_id: &str, spec: search::FilterSpec) -> Result<(), String> {
+        if spec.text.is_empty() {
             return Err("filter_text must not be empty".to_string());
         }
         let list = self.filters.entry(log_id.to_string()).or_default();
         if list.len() >= MAX_FILTERS {
             return Err(format!("filter cap reached ({MAX_FILTERS} filters)"));
         }
-        if list.iter().any(|f| f == text) {
-            return Err(format!("filter '{text}' already exists"));
+        if list.contains(&spec) {
+            return Err(format!("filter '{}' already exists", spec.text));
         }
-        list.push(text.to_string());
+        list.push(spec);
         if log_id == "_active" {
             self.filters_dirty.store(true, Ordering::Relaxed);
         }
-        Ok(list.clone())
+        self.filtered_union_cache.remove(log_id);
+        Ok(())
     }
 
     /// Remove a filter by its `id` (position, as returned by `filters_get`).
@@ -469,7 +601,8 @@ impl ServerState {
         if log_id == "_active" {
             self.filters_dirty.store(true, Ordering::Relaxed);
         }
-        Ok(list.clone())
+        self.filtered_union_cache.remove(log_id);
+        Ok(list.iter().map(|spec| spec.text.clone()).collect())
     }
 
     // ----------------------------------------------------------- analyses
@@ -492,18 +625,40 @@ impl ServerState {
     /// then apply no restriction. "Everything Else" lines (matching no filter)
     /// are never included.
     pub fn visible_lines_for(&mut self, log_id: &str) -> Result<Option<Arc<Vec<usize>>>, String> {
-        let filters = self.get_filters(log_id);
+        let filters = self.get_filter_specs(log_id);
+        let join = self.filter_join(log_id);
         if filters.is_empty() {
             return Ok(None);
         }
-        let mut all: Vec<usize> = Vec::new();
-        for kw in &filters {
-            let m = self.matches_for(log_id, kw, true)?;
-            all.extend_from_slice(m.as_slice());
+        if let Some(cached) = self.filtered_union_cache.get(log_id) {
+            if cached.filters == filters && cached.join == join {
+                return Ok(Some(Arc::clone(&cached.lines)));
+            }
         }
-        all.sort_unstable();
-        all.dedup();
-        Ok(Some(Arc::new(all)))
+        let mut lanes = Vec::with_capacity(filters.len());
+        for spec in &filters {
+            let matches = self.matches_for_spec(log_id, spec)?;
+            lanes.push(matches.iter().map(|&line| line as u32).collect());
+        }
+        let doc = if log_id == "_active" {
+            self.get_active_doc()?
+        } else {
+            self.get_doc(log_id)?
+        };
+        let all = search::combine_filter_matches(doc.total_lines(), &filters, &lanes, join)
+            .into_iter()
+            .map(|line| line as usize)
+            .collect();
+        let lines = Arc::new(all);
+        self.filtered_union_cache.insert(
+            log_id.to_string(),
+            FilteredUnionCacheEntry {
+                filters,
+                join,
+                lines: Arc::clone(&lines),
+            },
+        );
+        Ok(Some(lines))
     }
 }
 
@@ -817,7 +972,7 @@ fn server_discover_result(state: &ServerState) -> Value {
 }
 
 fn mode_instructions(_state: &ServerState) -> &'static str {
-    "Call session_info first. Logotomy starts in standalone mode: call load_log with an absolute path and retain its log_id. To analyze the log selected in a running Logotomy GUI, call attach_gui_session with the temporary session ID copied from the GUI. In GUI-attached mode, the GUI already supplies the open log: load_log, list_logs, and close_log are unavailable, and log_id is not needed. Suggested approach: understand the user's problem and Pin-tab findings with get_analysis; explore the log shape with summarize_log (with_filtered_log=false for full-log orientation) and targeted find_occurrences; then use filters (filters_add) and trim when a hypothesis merits a narrower scope. Request bounded raw_log only for exact evidence, and add useful evidence-backed root-cause conclusions with add_analysis."
+    "Call session_info first. Logotomy starts in standalone mode: call load_log with an absolute path and retain its log_id. To analyze the log selected in a running Logotomy GUI, call attach_gui_session with the temporary session ID copied from the GUI. In GUI-attached mode, the GUI already supplies the open log: load_log, list_logs, and close_log are unavailable, and log_id is not needed. Suggested approach: understand the user's problem and Pin-tab findings with get_analysis; explore the log shape with summarize_log (with_filtered_log=false for full-log orientation) and targeted search; then use filters (filters_add) and trim when a hypothesis merits a narrower scope. Request bounded raw_log only for exact evidence, and add useful evidence-backed root-cause conclusions with add_analysis."
 }
 
 fn session_info_payload(state: &ServerState) -> Value {
@@ -884,7 +1039,7 @@ fn resource_read(params: &Value, state: &ServerState) -> Result<Value, String> {
         ),
         "logotomy://guide" => (
             "text/markdown",
-            "# Logotomy investigation guide\n\nCall `session_info` first. In `standalone` mode, call `load_log` and retain its `log_id`. In `gui_attached` mode, the GUI already provides the open log: `load_log`, `list_logs`, and `close_log` are unavailable, and `log_id` is not needed.\n\nSuggested approach, not a required checklist: understand the user's question and Pin-tab findings with `get_analysis`; explore the log shape with `summarize_log` (`with_filtered_log=false` for full-log orientation) and targeted `find_occurrences`; then use filters (`filters_add`), anomalies, histograms, templates, sequences, and `trim` as they help test a hypothesis and narrow the scope. Request bounded `raw_log` only for exact evidence, honor pagination and `truncated`, and add useful evidence-backed root-cause conclusions with `add_analysis`.\n".to_string(),
+            "# Logotomy investigation guide\n\nCall `session_info` first. In `standalone` mode, call `load_log` and retain its `log_id`. In `gui_attached` mode, the GUI already provides the open log: `load_log`, `list_logs`, and `close_log` are unavailable, and `log_id` is not needed.\n\nSuggested approach, not a required checklist: understand the user's question and Pin-tab findings with `get_analysis`; explore the log shape with `summarize_log` (`with_filtered_log=false` for full-log orientation) and targeted `search`; then use filters (`filters_add`), anomalies, histograms, templates, sequences, and `trim` as they help test a hypothesis and narrow the scope. Request bounded `raw_log` only for exact evidence, honor pagination and `truncated`, and add useful evidence-backed root-cause conclusions with `add_analysis`.\n".to_string(),
         ),
         _ => return Err(format!("unknown resource uri '{uri}'")),
     };
@@ -1030,6 +1185,7 @@ fn dispatch(name: &str, args: &Value, state: &mut ServerState) -> Result<Value, 
         "filters_get" => return tool_filters_get(args, state),
         "filters_add" => return tool_filters_add(args, state),
         "filters_remove" => return tool_filters_remove(args, state),
+        "search" => return tool_search(args, state),
         _ => {}
     }
     if state.is_gui_mode() {
@@ -1137,8 +1293,9 @@ fn tool_close_log(args: &Value, state: &mut ServerState) -> Result<Value, String
     if state.logs.remove(log_id).is_none() {
         return Err(format!("unknown log_id '{log_id}'"));
     }
-    state.match_cache.retain(|(id, _, _), _| id != log_id);
+    state.invalidate_log_caches(log_id);
     state.filters.remove(log_id);
+    state.filter_joins.remove(log_id);
     Ok(json!({ "closed": log_id }))
 }
 
@@ -1162,18 +1319,25 @@ fn resolve_filter_log(state: &ServerState, args: &Value) -> Result<String, Strin
 
 /// Render the filter list as `[{id, filter_text}, …]` where `id` is the
 /// filter's position in the list.
-fn filters_payload(filters: &[String]) -> Vec<Value> {
+fn filters_payload(filters: &[search::FilterSpec]) -> Vec<Value> {
     filters
         .iter()
         .enumerate()
-        .map(|(id, text)| json!({ "id": id, "filter_text": text }))
+        .map(|(id, spec)| {
+            json!({ "id": id, "filter_text": spec.text,
+            "case_sensitive": spec.case_sensitive, "regex": spec.regex,
+            "template_id": spec.template_id,
+            "exclude": spec.polarity == search::FilterPolarity::Exclude })
+        })
         .collect()
 }
 
-fn filters_out(log_id: &str, filters: &[String]) -> Value {
+fn filters_out(log_id: &str, state: &ServerState) -> Value {
+    let filters = state.get_filter_specs(log_id);
     let mut out = json!({
-        "filters": filters_payload(filters),
+        "filters": filters_payload(&filters),
         "filter_count": filters.len(),
+        "join": if state.filter_join(log_id) == search::FilterJoin::All { "all" } else { "any" },
     });
     if log_id != "_active" {
         out["log_id"] = json!(log_id);
@@ -1184,16 +1348,27 @@ fn filters_out(log_id: &str, filters: &[String]) -> Value {
 /// List the current filter set for the target log.
 fn tool_filters_get(args: &Value, state: &mut ServerState) -> Result<Value, String> {
     let log_id = resolve_filter_log(state, args)?;
-    let filters = state.get_filters(&log_id);
-    Ok(filters_out(&log_id, &filters))
+    Ok(filters_out(&log_id, state))
 }
 
 /// Add a keyword filter; returns the full updated filter list.
 fn tool_filters_add(args: &Value, state: &mut ServerState) -> Result<Value, String> {
     let log_id = resolve_filter_log(state, args)?;
-    let text = arg_str(args, "filter_text")?;
-    let filters = state.add_filter(&log_id, text)?;
-    Ok(filters_out(&log_id, &filters))
+    let mut spec = matcher_from_args(args, "filter_text")?;
+    spec.polarity = if arg_bool(args, "exclude", false)? {
+        search::FilterPolarity::Exclude
+    } else {
+        search::FilterPolarity::Include
+    };
+    let join = match args.get("join") {
+        None => state.filter_join(&log_id),
+        Some(Value::String(value)) if value == "any" => search::FilterJoin::Any,
+        Some(Value::String(value)) if value == "all" => search::FilterJoin::All,
+        _ => return Err("join must be 'any' or 'all'".into()),
+    };
+    state.add_filter_spec(&log_id, spec)?;
+    state.filter_joins.insert(log_id.clone(), join);
+    Ok(filters_out(&log_id, state))
 }
 
 /// Remove a filter by id; returns the full updated filter list.
@@ -1204,8 +1379,8 @@ fn tool_filters_remove(args: &Value, state: &mut ServerState) -> Result<Value, S
         .and_then(Value::as_u64)
         .ok_or_else(|| "missing or invalid argument 'id' (integer expected)".to_string())?
         as usize;
-    let filters = state.remove_filter(&log_id, id)?;
-    Ok(filters_out(&log_id, &filters))
+    state.remove_filter(&log_id, id)?;
+    Ok(filters_out(&log_id, state))
 }
 
 // ------------------------------------------------------------------- tools
@@ -2577,6 +2752,7 @@ fn tools(_state: &ServerState) -> Value {
                     | "trim"
                     | "attach_gui_session"
                     | "detach_gui_session"
+                    | "search"
             );
             let idempotent = matches!(
                 name,
@@ -2589,6 +2765,7 @@ fn tools(_state: &ServerState) -> Value {
                     | "log_sequence"
                     | "raw_log"
                     | "find_occurrences"
+                    | "search"
                     | "get_analysis"
                     | "session_info"
                     | "attach_gui_session"
@@ -2714,7 +2891,7 @@ fn compression_tool_schemas(log_id_prop: Option<Value>) -> Vec<Value> {
     };
     let filter_prop = json!({
         "type": "boolean",
-        "description": "When true (default), operate on the filtered log — only lines matching the current filter set (the union of filters_get matches; the 'Everything Else' lane is never included). With zero filters the tool replies {comment: 'no log'} instead of scanning — set false for the full log or add a filter first (filters_add)."
+        "description": "When true (default), operate on the filtered log — only lines matching the current filter set (include/exclude and Any/All composition from filters_get; the 'Everything Else' lane is never included). With zero filters the tool replies {comment: 'no log'} instead of scanning — set false for the full log or add a filter first (filters_add)."
     });
     vec![
         json!({
@@ -2789,15 +2966,23 @@ fn compression_tool_schemas(log_id_prop: Option<Value>) -> Vec<Value> {
         }),
         json!({
             "name": "filters_get",
-            "description": "List the log's current filter set (keyword terms) as [{id, filter_text}]. Other tools running with with_filtered_log=true (the default) restrict their results to the union of these filters' matches; the 'Everything Else' lane is never included.",
+            "description": "List full matcher settings (filter_text, case_sensitive, regex, template_id, exclude) and the set's join (any/all). IDs are positions and renumber after removal. Filtered tools apply include/exclude and join; lane visibility is GUI-only.",
             "inputSchema": schema(json!({}), vec![]),
         }),
         json!({
             "name": "filters_add",
-            "description": "Add a keyword filter to the log's filter set. Returns the full updated [{id, filter_text}] list. Enforces the 20-filter cap and case-sensitive dedupe.",
-            "inputSchema": schema(json!({
-                "filter_text": { "type": "string", "description": "Exact phrase to match (case-sensitive)" }
-            }), vec!["filter_text"]),
+            "description": "Add a text, regex or template-ID filter using the same matcher as search and the GUI. Supports case_sensitive, exclude, and optional set-wide join (any/all). Returns all matcher settings. Maximum 20 filters; exact duplicate specs rejected. In GUI mode updates the filter lanes.",
+            "inputSchema": ({
+                let mut props = search_api::matcher_properties("filter_text");
+                props["exclude"] = json!({"type": "boolean", "default": false});
+                props["join"] = json!({"type": "string", "enum": ["any", "all"], "description": "Composition for the entire filter set; omitted preserves current join."});
+                let mut result = schema(props, vec![]);
+                result["oneOf"] = json!([
+                    {"required": ["filter_text"], "not": {"required": ["template_id"]}},
+                    {"required": ["template_id"], "not": {"required": ["filter_text"]}}
+                ]);
+                result
+            }),
         }),
         json!({
             "name": "filters_remove",
@@ -2810,18 +2995,7 @@ fn compression_tool_schemas(log_id_prop: Option<Value>) -> Vec<Value> {
 }
 
 fn headless_tools() -> Value {
-    let time_prop = |desc: &str| {
-        json!({
-            "type": "string",
-            "description": format!("{desc} (RFC3339, 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD', or epoch millis)")
-        })
-    };
     let log_id_prop = json!({ "type": "string", "description": "ID returned by load_log" });
-    let keyword_prop = json!({ "type": "string", "description": "Exact phrase to search for" });
-    let filter_prop = json!({
-        "type": "boolean",
-        "description": "When true (default), operate on the filtered log — only lines matching the current filter set (the union of filters_get matches; the 'Everything Else' lane is never included). With zero filters the tool replies {comment: 'no log'} instead of scanning — set false for the full log or add a filter first (filters_add)."
-    });
 
     let base = json!([
         {
@@ -2849,26 +3023,9 @@ fn headless_tools() -> Value {
                 "required": ["log_id"]
             }
         },
-        {
-            "name": "find_occurrences",
-            "description": "Find log lines containing this exact phrase. Returns paginated [one_based_line_number, epoch_ms|null] tuples only. Set case_sensitive=false for ASCII case-insensitive matching; with_filtered_log restricts results to the active filter union.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "log_id": log_id_prop,
-                    "keyword": keyword_prop,
-                    "after": time_prop("Only include occurrences at or after this time"),
-                    "before": time_prop("Only include occurrences at or before this time"),
-                    "max_results": { "type": "integer", "description": "Max results to return (default 50, max 2000)" },
-                    "offset": { "type": "integer", "description": "Skip this many matches (default 0)" },
-                    "case_sensitive": { "type": "boolean", "description": "Match ASCII letter case exactly (default true); false folds ASCII case" },
-                    "with_filtered_log": filter_prop.clone()
-                },
-                "required": ["log_id", "keyword"]
-            }
-        }
     ]);
     let mut list = base;
+    list.as_array_mut().unwrap().push(search_schema(true));
     list.as_array_mut()
         .unwrap()
         .extend(compression_tool_schemas(Some(log_id_prop)));
@@ -2876,36 +3033,7 @@ fn headless_tools() -> Value {
 }
 
 fn gui_tools() -> Value {
-    let time_prop = |desc: &str| {
-        json!({
-            "type": "string",
-            "description": format!("{desc} (RFC3339, 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD', or epoch millis)")
-        })
-    };
-    let keyword_prop = json!({ "type": "string", "description": "Exact phrase to search for" });
-    let filter_prop = json!({
-        "type": "boolean",
-        "description": "When true (default), operate on the filtered log — only lines matching the current filter set (the union of filters_get matches; the 'Everything Else' lane is never included). With zero filters the tool replies {comment: 'no log'} instead of scanning — set false for the full log or add a filter first (filters_add)."
-    });
-
     let base = json!([
-        {
-            "name": "find_occurrences",
-            "description": "Find log lines containing this exact phrase in the currently open log. Returns paginated [one_based_line_number, epoch_ms|null] tuples only. Set case_sensitive=false for ASCII case-insensitive matching; with_filtered_log restricts results to the active filter union.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "keyword": keyword_prop,
-                    "after": time_prop("Only include occurrences at or after this time"),
-                    "before": time_prop("Only include occurrences at or before this time"),
-                    "max_results": { "type": "integer", "description": "Max results to return (default 50, max 2000)" },
-                    "offset": { "type": "integer", "description": "Skip this many matches (default 0)" },
-                    "case_sensitive": { "type": "boolean", "description": "Match ASCII letter case exactly (default true); false folds ASCII case" },
-                    "with_filtered_log": filter_prop.clone()
-                },
-                "required": ["keyword"]
-            }
-        },
         {
             "name": "trim",
             "description": "Focus the currently open log's visible window to a line- or time-bounded range (both bounds optional; omit both to reset to the full file). Returns the remaining visible line count.",
@@ -2919,6 +3047,7 @@ fn gui_tools() -> Value {
         }
     ]);
     let mut list = base;
+    list.as_array_mut().unwrap().push(search_schema(false));
     list.as_array_mut()
         .unwrap()
         .extend(compression_tool_schemas(None));
@@ -2948,7 +3077,7 @@ mod tests {
         assert!(gui_instructions.contains("list_logs, and close_log are unavailable"));
         assert!(gui_instructions.contains("Suggested approach"));
         assert!(gui_instructions.contains("with_filtered_log=false"));
-        assert!(gui_instructions.contains("targeted find_occurrences"));
+        assert!(gui_instructions.contains("targeted search"));
         assert!(gui_instructions.contains("filters (filters_add) and trim"));
         assert!(gui_instructions.contains("root-cause"));
     }
@@ -3000,7 +3129,7 @@ mod tests {
         let guide = guide["contents"][0]["text"].as_str().unwrap();
         assert!(guide.contains("get_analysis"));
         assert!(guide.contains("not a required checklist"));
-        assert!(guide.contains("find_occurrences"));
+        assert!(guide.contains("search"));
         assert!(guide.contains("trim"));
         assert!(guide.contains("root-cause"));
     }
@@ -3304,10 +3433,54 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[test]
+    fn keyword_match_cache_is_lru_bounded() {
+        let mut state = gui_state("2026-01-01T00:00:00Z INFO retained\n");
+        for index in 0..(MATCH_CACHE_MAX_ENTRIES + 16) {
+            state
+                .matches_for("_active", &format!("missing-{index}"), true)
+                .unwrap();
+        }
+        assert_eq!(state.match_cache.len(), MATCH_CACHE_MAX_ENTRIES);
+        assert!(!state.match_cache.contains_key(&(
+            "_active".to_string(),
+            "missing-0".to_string(),
+            true,
+            false,
+            None
+        )));
+        assert!(state.match_cache.contains_key(&(
+            "_active".to_string(),
+            format!("missing-{}", MATCH_CACHE_MAX_ENTRIES + 15),
+            true,
+            false,
+            None,
+        )));
+        assert!(state.match_cache_bytes <= MATCH_CACHE_MAX_BYTES);
+    }
+
+    #[test]
+    fn filtered_union_cache_reuses_results_and_invalidates_on_filter_change() {
+        let mut state = gui_state(
+            "2026-01-01T00:00:00Z INFO alpha\n\
+             2026-01-01T00:00:01Z ERROR beta\n\
+             2026-01-01T00:00:02Z INFO alpha beta\n",
+        );
+        state.set_filters("_active", vec!["alpha".to_string()]);
+        let first = state.visible_lines_for("_active").unwrap().unwrap();
+        let second = state.visible_lines_for("_active").unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        state.add_filter("_active", "beta").unwrap();
+        let expanded = state.visible_lines_for("_active").unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &expanded));
+        assert_eq!(expanded.as_slice(), &[0, 1, 2]);
+    }
+
     // ---- compression-first tool tests ----
 
     /// Build a GUI-mode ServerState with `content` as the active document.
-    fn gui_state(content: &str) -> ServerState {
+    pub(super) fn gui_state(content: &str) -> ServerState {
         let path = write_temp(content);
         let doc = LogDocument::open(&path).unwrap();
         std::fs::remove_file(path).ok();
@@ -4019,7 +4192,7 @@ mod tests {
         assert!(list.iter().any(|tool| tool["name"] == "trim"));
         assert!(list.iter().any(|tool| tool["name"] == "get_analysis"));
         assert!(list.iter().any(|tool| tool["name"] == "add_analysis"));
-        for name in ["find_occurrences", "summarize_log", "filters_get"] {
+        for name in ["search", "summarize_log", "filters_get"] {
             let tool = list.iter().find(|tool| tool["name"] == name).unwrap();
             let required = tool["inputSchema"]["required"]
                 .as_array()
@@ -4306,7 +4479,7 @@ mod tests {
                 assert!(arr.iter().any(|t| t["name"] == n), "missing {n}");
             }
             for n in [
-                "find_occurrences",
+                "search",
                 "raw_log",
                 "log_sequence",
                 "summarize_log",

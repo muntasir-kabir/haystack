@@ -8,6 +8,7 @@ High-performance Rust log analyzer & visualizer (GUI + MCP server for AI assista
 3. **Tests** — run `cargo test` after code changes; all must pass. Always add test for new feature or bug changes
 4. **No Python** — template mining is native Rust (Drain). Never shell out.
 5. **Releases** — before creating or pushing a `vX.Y.Z` tag, set both `package.version` and `[package.metadata.packager].version` in `Cargo.toml` to the same `X.Y.Z`, let Cargo refresh the matching `Cargo.lock` package version, and run the exact **Validate release version** step from `.github/workflows/release.yml` locally. It checks the Cargo metadata package version and the packager-table version independently against the tag before tagging.
+6. **Popup dismissal** — transient popups must close immediately on Escape or an outside click. Apply this consistently to new popup surfaces; modal editors may keep explicit Cancel actions but should still honor Escape where practical.
 
 ## Try to follow
 - Focus on code quality & maintainence 
@@ -38,7 +39,7 @@ High-performance Rust log analyzer & visualizer (GUI + MCP server for AI assista
 - `src/mcp.rs` + `src/mcp/` — stdio MCP server, secure GUI-session manifest, and authenticated private IPC routing · `src/main.rs` — CLI dispatcher (`--mcp`, deprecated `--mcp-gui`, else GUI)
 
 ## Commands
-- `cargo test` — 402 tests
+- `cargo test` — 500+ tests
 - `cargo run --release` — GUI
 - `cargo run --release --example bench -- [logfile] [filters...]` — benchmark (no args → 64MB/787k-line synthetic log; pass a path to bench a real file, e.g. an iOS log)
 - `cargo run --release --example gen_ios_logs -- [SIZES...] [--all] [--seed N]` — generate deterministic iOS test logs (seeded PCG64; iOS-1K/10K/100K/1M; `--all` for all, `--seed N` to override the fixed RNG)

@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use aho_corasick::AhoCorasick;
 use crossbeam_channel::Receiver;
@@ -10,13 +10,20 @@ use eframe::egui;
 use egui::Color32;
 use egui_dock::DockState;
 use log::{error, info};
+use serde::{Deserialize, Serialize};
 
+use crate::ui::template_view::TemplateBrowserState;
 use crate::ui::{icons, theme::Theme};
 use logotomy::core::document::{FileChange, LoadProgress, LoadStage, LogDocument, ParsingConfig};
 use logotomy::core::embedded_data::{AnalysisLimits, Detection, EmbeddedDataEngine, SourceSpan};
 use logotomy::core::saved_filter::SavedFilter;
 use logotomy::core::search;
-use logotomy::core::settings::Settings;
+use logotomy::core::search::FilterJoin;
+use logotomy::core::settings::{LogLineDisplayMode, RecentFilter, Settings};
+use logotomy::core::sidecar::{
+    self, InvestigationState, LineAnchor, LineRange, LoadedState, MatchStatus, PinState,
+    ScrollState, SearchState, SourceIdentity, TimelineZoomState,
+};
 use logotomy::core::time::{CustomDateFormat, CustomTimeFormat};
 use logotomy::core::timeline::{Timeline, DEFAULT_BUCKETS};
 use logotomy::mcp::PinAnalysis;
@@ -43,6 +50,71 @@ pub struct PinEntry {
     pub unanchored: bool,
 }
 
+impl PinEntry {
+    /// Build an anchored pin from its real selected rows. Pin endpoints always
+    /// refer to the first and last selected rows, rather than the bounds of a
+    /// drag range that may include hidden rows.
+    pub fn anchored(
+        doc: &LogDocument,
+        mut line_numbers: Vec<usize>,
+        comment: String,
+    ) -> Option<Self> {
+        line_numbers.retain(|&line| line < doc.total_lines());
+        line_numbers.sort_unstable();
+        line_numbers.dedup();
+        let start_line = *line_numbers.first()?;
+        let end_line = *line_numbers.last()?;
+        Some(Self {
+            start_line,
+            start_ts: doc.ts_at_opt(start_line).unwrap_or(-1),
+            end_ts: doc.ts_at_opt(end_line).unwrap_or(-1),
+            line_numbers,
+            comment,
+            unanchored: false,
+        })
+    }
+
+    /// Current first/last selected rows, excluding anchors outside the active
+    /// trim window. These are the only rows a timeline marker can represent.
+    pub fn visible_bounds(&self, total_lines: usize) -> Option<(usize, usize)> {
+        if self.unanchored {
+            return None;
+        }
+        let mut lines = self
+            .line_numbers
+            .iter()
+            .copied()
+            .filter(|&line| line < total_lines);
+        let first = lines.next()?;
+        let last = lines.last().unwrap_or(first);
+        Some((first, last))
+    }
+}
+
+/// The two transient surfaces shown while creating a line/range analysis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnalysisPopupMode {
+    Actions,
+    Editor,
+}
+
+/// Where an analysis popup was opened from. Selection-originated popups own
+/// the transient range highlight; context-menu popups only own their anchor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnalysisPopupState {
+    pub(crate) range: (usize, usize),
+    /// The current arrow target. Action bubbles use the release cursor while
+    /// the editor uses the full selected-line bounds.
+    pub(crate) anchor_rect: egui::Rect,
+    /// The full source range geometry, retained when the action bubble
+    /// switches into the editor.
+    pub(crate) selected_rect: egui::Rect,
+    pub(crate) mode: AnalysisPopupMode,
+    pub(crate) from_selection: bool,
+    pub(crate) id: u64,
+    pub(crate) ignore_outside_click: bool,
+}
+
 fn pin_analyses(pins: &[PinEntry]) -> Vec<PinAnalysis> {
     pins.iter()
         .map(|pin| PinAnalysis {
@@ -56,24 +128,14 @@ fn pins_from_analyses(doc: &LogDocument, analyses: Vec<PinAnalysis>) -> Vec<PinE
     analyses
         .into_iter()
         .map(|analysis| {
-            let unanchored = analysis.lines.is_empty();
-            let start_line = analysis.lines.first().copied().unwrap_or(0);
-            PinEntry {
-                start_line,
-                start_ts: analysis
-                    .lines
-                    .first()
-                    .and_then(|line| doc.ts_at_opt(*line))
-                    .unwrap_or(-1),
-                end_ts: analysis
-                    .lines
-                    .last()
-                    .and_then(|line| doc.ts_at_opt(*line))
-                    .unwrap_or(-1),
+            PinEntry::anchored(doc, analysis.lines, analysis.text.clone()).unwrap_or(PinEntry {
+                start_line: 0,
+                line_numbers: Vec::new(),
+                start_ts: -1,
+                end_ts: -1,
                 comment: analysis.text,
-                line_numbers: analysis.lines,
-                unanchored,
-            }
+                unanchored: true,
+            })
         })
         .collect()
 }
@@ -82,31 +144,99 @@ fn pins_from_analyses(doc: &LogDocument, analyses: Vec<PinAnalysis>) -> Vec<PinE
 /// the "Everything Else" lane). The filter input is disabled at this cap.
 pub const MAX_FILTERS: usize = 20;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ViewTab {
     Timeline,
     Log,
     Pinned,
+    Templates,
 }
 
+#[derive(Clone)]
 pub struct Filter {
     pub text: String,
     pub color: Color32,
+}
+
+/// One in-memory, per-tab deletion which can be restored with Cmd/Ctrl+Z.
+/// It is deliberately not persisted: reopening a file should not resurrect a
+/// deletion the user already allowed the sidecar to save.
+#[derive(Clone)]
+pub enum UndoDelete {
+    Filter {
+        index: usize,
+        filter: Filter,
+        active: bool,
+        case_sensitive: bool,
+        exclude: bool,
+        regex: bool,
+        template_id: Option<u32>,
+    },
+    Pin {
+        index: usize,
+        pin: PinEntry,
+    },
+    Pins {
+        pins: Vec<PinEntry>,
+        bottom_panel_open: bool,
+    },
+    Trim {
+        start: usize,
+        end_exclusive: usize,
+    },
 }
 
 /// Complete output of the background filter worker. Building timeline density
 /// and filter-point indexes walks the document, so it belongs beside the
 /// already-background Aho-Corasick scan rather than on the next UI frame.
 pub(crate) struct FilterScanResult {
-    matches: Arc<Vec<Vec<u32>>>,
+    matches: Arc<Vec<Arc<Vec<u32>>>>,
     timeline: Timeline,
+    specs: Arc<Vec<search::FilterSpec>>,
+    scope: Option<(i64, i64)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilterDocumentKey {
+    path: PathBuf,
+    file_size: u64,
+    file_mtime: std::time::SystemTime,
+    trim_start: usize,
+    trim_end: usize,
+    total_lines: usize,
+}
+
+impl FilterDocumentKey {
+    fn of(doc: &LogDocument) -> Self {
+        Self {
+            path: doc.path.clone(),
+            file_size: doc.file_size,
+            file_mtime: doc.file_mtime,
+            trim_start: doc.trim_start,
+            trim_end: doc.trim_end,
+            total_lines: doc.total_lines(),
+        }
+    }
 }
 
 /// Completed filtered-line index, built without holding up the UI after a
 /// lane visibility change.
 pub(crate) struct VisibleLinesResult {
-    visible_lines: Option<Arc<Vec<usize>>>,
+    visible_lines: Option<Arc<Vec<u32>>>,
     preserve_anchor: Option<usize>,
+}
+
+/// Estimated cumulative visual heights for the Wrap Log View mode. The cache
+/// is rebuilt only when its width, font, or visible-line identity changes,
+/// allowing wrapped logs to remain virtualized while scrolling.
+pub(crate) struct WrapLayout {
+    pub content_width: f32,
+    pub font_size: f32,
+    pub visible_len: usize,
+    pub visible_identity: usize,
+    pub first_line: Option<usize>,
+    pub last_line: Option<usize>,
+    pub offsets: Arc<Vec<f32>>,
 }
 
 struct TailUpdateResult {
@@ -194,14 +324,36 @@ impl EmbeddedInspectorMode {
 pub struct LogTab {
     pub doc: Arc<LogDocument>,
     pub filters: Vec<Filter>,
+    /// Advanced options parallel to `filters`. Kept separate from the visual
+    /// filter so old in-memory and MCP callers retain their simple text shape.
+    pub filter_case_sensitive: Vec<bool>,
+    pub filter_exclude: Vec<bool>,
+    pub filter_regex: Vec<bool>,
+    /// Optional Drain template ID matcher for each visual filter lane.
+    /// `None` retains ordinary text/regex matching.
+    pub filter_template_ids: Vec<Option<u32>>,
+    pub filter_join: FilterJoin,
+    /// Most-recent-first entries offered when the Add Filter field is focused
+    /// and empty. Entries retain their matching mode so choosing one can run
+    /// immediately.
+    pub filter_history: Vec<RecentFilter>,
+    /// Restrict new filter scans to the current timeline zoom (the document
+    /// trim is always respected by `LogDocument`).
+    pub filter_current_range: bool,
     /// Per-filter sorted matching line indices.
-    pub matches: Arc<Vec<Vec<u32>>>,
+    pub matches: Arc<Vec<Arc<Vec<u32>>>>,
+    /// Filter specifications and scope represented by `matches`.
+    matched_filter_specs: Arc<Vec<search::FilterSpec>>,
+    matched_filter_scope: Option<(i64, i64)>,
+    matched_filter_doc: Weak<LogDocument>,
+    matched_filter_doc_key: FilterDocumentKey,
     pub timeline: Timeline,
     /// Line shown in the bottom context panel.
     pub context_line: Option<usize>,
     /// One-shot scroll request for the central log view.
     pub pending_scroll: Option<usize>,
-    pub show_templates: bool,
+    /// Cached, per-tab state for the docked Templates browser.
+    pub template_browser: TemplateBrowserState,
     /// Zoom window on the timeline: (start_x, end_x) in epoch ms or line index.
     /// None = auto (full range).
     pub timeline_zoom: Option<(i64, i64)>,
@@ -211,13 +363,34 @@ pub struct LogTab {
     pub timeline_brush_start: Option<f32>,
     /// The filter lane currently selected for left/right occurrence navigation.
     pub selected_lane: Option<usize>,
+    /// Pin card selected for keyboard deletion. This is UI-only state.
+    pub selected_pin: Option<usize>,
+    /// A card that the Pinned view should reveal after a timeline marker click.
+    pub pending_pin_scroll: Option<usize>,
+    /// Defers activating Pinned until the Log View has consumed its scroll
+    /// request. This preserves the marker-click navigation order in dock
+    /// layouts where Log and Pinned share a leaf.
+    pub pending_pin_activation: bool,
+    /// Latest reversible deletion in this tab.
+    pub undo_delete: Option<UndoDelete>,
     /// One-shot UI message queued by a tab view and drained by the app toast.
     pub pending_toast: Option<String>,
     pub filter_input: String,
+    /// Options applied to the text currently in the Add filter field.
+    pub filter_input_case_sensitive: bool,
+    pub filter_input_regex: bool,
+    /// Selects Drain template IDs rather than text. The input accepts `42`, `T42`, or `T{42}`.
+    pub filter_input_template_id: bool,
+    /// Debounced validation state for the Add Filter regex or Template ID input.
+    pub filter_input_regex_validate_at: Option<Instant>,
+    pub filter_input_regex_error: Option<String>,
+    pub filter_input_regex_error_dismissed: bool,
     /// Automaton used for cheap per-line highlight of visible rows.
-    pub highlighter: Option<Arc<AhoCorasick>>,
+    pub highlighter: Option<Arc<search::FilterHighlighter>>,
     /// In-flight background filter scan: result channel + cancel flag.
     pub search_rx: Option<(Receiver<FilterScanResult>, Arc<AtomicBool>)>,
+    /// Shared worker counter shown by the filter strip while scanning.
+    pub filter_scan_progress: Option<Arc<logotomy::core::search::ScanProgress>>,
     /// In-flight visible-lines rebuild caused by toggling timeline lanes.
     pub visible_rx: Option<(Receiver<VisibleLinesResult>, Arc<AtomicBool>)>,
     /// In-flight staged append. The worker owns a detached document copy, so
@@ -236,9 +409,13 @@ pub struct LogTab {
     /// When true, the fixed top panel is hidden and a detached viewport shows.
     pub timeline_detached: bool,
     /// Filtered visible line indices. None = all lines visible.
-    pub visible_lines: Option<Arc<Vec<usize>>>,
+    pub visible_lines: Option<Arc<Vec<u32>>>,
     /// Font size for log view and context panel (points).
     pub log_font_size: f32,
+    /// Runtime copy of the global long-line preference; keeping it on the tab
+    /// lets detached Log View windows render without borrowing the app shell.
+    pub log_line_display_mode: LogLineDisplayMode,
+    pub(crate) wrap_layout: Option<WrapLayout>,
     /// Saved pin entries.
     pub pins: Vec<PinEntry>,
     /// Whether the bottom panel is expanded.
@@ -258,9 +435,21 @@ pub struct LogTab {
     pub drag_current_line: Option<usize>,
     pub drag_start_pos: Option<egui::Pos2>,
     pub selection_popup_pos: Option<egui::Pos2>,
-    pub selection_popup_opened_at: Option<std::time::Instant>,
-    /// First and last *real* line index visible in the log viewport.
+    /// Active movable/resizable analysis bubble for a context-menu pin or a
+    /// drag-selected range.
+    pub(crate) analysis_popup: Option<AnalysisPopupState>,
+    pub(crate) next_analysis_popup_id: u64,
+    /// First and last *real* line index fully visible in the log viewport.
     pub viewport_range: Option<(usize, usize)>,
+    /// Actual Log View viewport height from the most recent layout pass.
+    /// This differs from the available panel height when a horizontal
+    /// scrollbar consumes part of the viewport.
+    pub(crate) log_viewport_height: Option<f32>,
+    /// Logical scroll position captured from the virtualized log view.
+    pub scroll_top_line: Option<usize>,
+    pub scroll_fraction: f32,
+    /// One-shot logical scroll position restored from a sidecar.
+    pub pending_scroll_restore: Option<(usize, f32)>,
     /// Real line index to place at the top of the log viewport after a
     /// filter change (set by rebuild_visible_lines, consumed by log_view).
     pub preserve_anchor: Option<usize>,
@@ -268,12 +457,39 @@ pub struct LogTab {
 
     pub find_input: String,
     pub find_query: String,
-    /// Whether Log View find matches must use the exact ASCII letter case.
+    /// Whether Log View text/regex matches must use the exact ASCII letter case.
     pub find_case_sensitive: bool,
-    pub find_matches: Vec<usize>,
+    /// Search using the shared Rust-regex matcher instead of a literal phrase.
+    pub find_regex: bool,
+    /// Search mined Drain template IDs. The input accepts `42`, `T42`, or `T{42}`.
+    pub find_template_id_mode: bool,
+    /// Parsed ID of the active Template ID search, if any.
+    pub find_template_id: Option<u32>,
+    /// Matcher used by the completed/in-flight search. It is separate from
+    /// the input controls so changing the dropdown cannot reinterpret results
+    /// before the user runs the revised query.
+    pub find_active_spec: Option<search::FilterSpec>,
+    /// Debounced validation state for Regex and Template ID search input.
+    pub find_validate_at: Option<Instant>,
+    pub find_error: Option<String>,
+    pub find_error_dismissed: bool,
+    pub find_matches: Vec<u32>,
     pub find_pos: Option<usize>,
-    pub find_automaton: Option<Arc<AhoCorasick>>,
-    pub find_rx: Option<(Receiver<Vec<usize>>, Arc<AtomicBool>)>,
+    /// One-matcher highlighter shared with filter text/regex highlighting.
+    pub find_highlighter: Option<Arc<search::FilterHighlighter>>,
+    pub find_rx: Option<(Receiver<Vec<u32>>, Arc<AtomicBool>)>,
+    /// Most-recent-first executed find queries, seeded from Settings.
+    pub search_history: Vec<String>,
+    /// A search that the app should persist to Settings after this frame.
+    pub pending_recent_search: Option<String>,
+    /// A filter that the app should persist to Settings after this frame.
+    pub pending_recent_filter: Option<RecentFilter>,
+    /// Popup lifetimes are independent from text-input focus so a click on a
+    /// suggestion is delivered before the popup disappears.
+    pub search_suggestions_open: bool,
+    pub filter_suggestions_open: bool,
+    /// Raw full-line inspector opened from a Log View row.
+    pub full_line_inspector: Option<usize>,
     pub keyword_highlight: Option<String>,
     pub keyword_automaton: Option<Arc<AhoCorasick>>,
 
@@ -321,6 +537,11 @@ pub struct LogTab {
     /// Whether the file on disk has changed in-place (not appended), making
     /// the document's indexes invalid until a full reload.
     pub stale: bool,
+    /// Sidecar state whose line anchors are waiting for user confirmation
+    /// because the source file changed since the last saved snapshot.
+    pub pending_sidecar_restore: Option<InvestigationState>,
+    /// Last successfully persisted snapshot, used for dirty detection.
+    pub last_sidecar_snapshot: Option<InvestigationState>,
 }
 
 pub struct FileLoader {
@@ -330,15 +551,105 @@ pub struct FileLoader {
     pub cancel: Arc<AtomicBool>,
     pub stage: LoadStage,
     pub progress: f32,
+    pub sidecar: Option<LoadedState>,
 }
 
 fn nearest_occurrence<I>(occurrences: I, line: usize) -> Option<(usize, usize)>
 where
-    I: Iterator<Item = usize>,
+    I: Iterator<Item = u32>,
 {
     occurrences
+        .map(|occurrence| occurrence as usize)
         .enumerate()
         .min_by_key(|&(_, occurrence)| (occurrence.abs_diff(line), occurrence))
+}
+
+fn stable_line_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a is small, deterministic, and sufficient as a candidate key. A
+    // hash match is only used after the line bounds and timestamp are checked.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn resolve_anchor(tab: &LogTab, anchor: &LineAnchor) -> Option<usize> {
+    let candidate = anchor.line.checked_sub(tab.doc.trim_start)?;
+    if anchor_matches(tab, candidate, anchor) {
+        return Some(candidate);
+    }
+
+    // A changed log may have gained or lost lines before the old anchor. Keep
+    // remapping bounded so restoring a large investigation never scans the
+    // entire document on the UI thread.
+    const SEARCH_RADIUS: usize = 4096;
+    for distance in 1..=SEARCH_RADIUS {
+        if let Some(before) = candidate.checked_sub(distance) {
+            if anchor_matches(tab, before, anchor) {
+                return Some(before);
+            }
+        }
+        if let Some(after) = candidate.checked_add(distance) {
+            if anchor_matches(tab, after, anchor) {
+                return Some(after);
+            }
+        }
+    }
+    None
+}
+
+fn anchor_matches(tab: &LogTab, line: usize, anchor: &LineAnchor) -> bool {
+    if line >= tab.doc.total_lines() {
+        return false;
+    }
+    if let Some(hash) = anchor.line_hash {
+        if stable_line_hash(tab.doc.line_bytes(line)) != hash {
+            return false;
+        }
+    }
+    anchor
+        .timestamp
+        .is_none_or(|timestamp| tab.doc.ts_at_opt(line) == Some(timestamp))
+}
+
+fn restore_pin(tab: &LogTab, pin: &PinState) -> PinEntry {
+    let lines: Vec<usize> = pin
+        .line_numbers
+        .iter()
+        .filter_map(|anchor| resolve_anchor(tab, anchor))
+        .collect();
+    let start_line = pin
+        .start_line
+        .as_ref()
+        .and_then(|anchor| resolve_anchor(tab, anchor))
+        .or_else(|| lines.first().copied())
+        .unwrap_or(0);
+    let anchored =
+        !pin.unanchored && !pin.line_numbers.is_empty() && lines.len() == pin.line_numbers.len();
+    if anchored {
+        // Recompute timestamps from the resolved rows. A changed source can
+        // remap line anchors, so persisted timestamps are only a fallback for
+        // text-only analyses, never the timeline position of an anchored pin.
+        PinEntry::anchored(&tab.doc, lines, pin.comment.clone()).unwrap_or(PinEntry {
+            start_line,
+            line_numbers: Vec::new(),
+            start_ts: pin.start_timestamp.unwrap_or(-1),
+            end_ts: pin.end_timestamp.unwrap_or(-1),
+            comment: pin.comment.clone(),
+            unanchored: true,
+        })
+    } else {
+        PinEntry {
+            start_line,
+            line_numbers: Vec::new(),
+            start_ts: pin.start_timestamp.unwrap_or(-1),
+            end_ts: pin.end_timestamp.unwrap_or(-1),
+            comment: pin.comment.clone(),
+            unanchored: true,
+        }
+    }
 }
 
 pub struct LogotomyApp {
@@ -349,6 +660,7 @@ pub struct LogotomyApp {
     pub active_loader: Option<usize>,
     pub loaders: Vec<FileLoader>,
     pub status: String,
+    pub(super) zip_imports: super::zip_import::ZipImports,
 
     pub theme: Theme,
     pub dark_mode: bool,
@@ -375,9 +687,17 @@ pub struct LogotomyApp {
     // Integration guide popup (opened from settings)
     pub show_integrate_popup: bool,
 
+    // Compact AI Assistant controls anchored from the application toolbar.
+    pub show_ai_assistant_popup: bool,
+    pub ai_assistant_button_rect: Option<egui::Rect>,
+
     // Recent files popup
     pub recent_show_dropdown: bool,
     pub recent_button_rect: Option<egui::Rect>,
+
+    // Views menu (commands and templates)
+    pub views_show_dropdown: bool,
+    pub views_button_rect: Option<egui::Rect>,
 
     // SavedFilter management
     pub available_filters: Vec<String>,
@@ -394,6 +714,16 @@ pub struct LogotomyApp {
 
     pub show_settings_popup: bool,
     pub settings_button_rect: Option<egui::Rect>,
+
+    // Discoverability and navigation overlays.
+    pub show_command_palette: bool,
+    pub command_palette_query: String,
+    pub show_cheat_sheet: bool,
+    pub show_goto_popup: bool,
+    pub goto_input: String,
+    pub goto_error: Option<String>,
+    /// A close was requested but the investigation sidecar could not be saved.
+    pub close_save_error: Option<usize>,
 
     // ---- Custom date recognizers ----
     /// User-defined custom date formats (persisted to
@@ -412,59 +742,121 @@ pub struct LogotomyApp {
     /// Paths sent by a later `logotomy <file>` launch while this instance is
     /// already running.
     pub open_requests: Receiver<Vec<PathBuf>>,
+
+    /// Tab waiting for changed-file anchor confirmation.
+    pub pending_restore_tab: Option<usize>,
+    pub sidecar_save_deadline: Option<Instant>,
+    pub last_sidecar_autosave: Instant,
+    pub requested_active_file: Option<PathBuf>,
+}
+
+const SIDECAR_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
+
+fn probe_all_file_updates(tabs: &mut [LogTab]) -> Vec<(usize, String, Result<FileChange, String>)> {
+    tabs.iter_mut()
+        .enumerate()
+        .map(|(index, tab)| {
+            let file_name = tab.doc.file_name.clone();
+            let change = tab.doc.file_change();
+            if matches!(change, Ok(FileChange::Appended)) {
+                tab.start_tail_update();
+            }
+            (index, file_name, change)
+        })
+        .collect()
+}
+
+fn sidecar_autosave_due(last_save: Instant, now: Instant) -> bool {
+    now.duration_since(last_save) >= SIDECAR_AUTOSAVE_INTERVAL
 }
 
 /// Build the real-line index selected by timeline lanes. `None` is the compact
 /// all-lines representation. Cancellation is checked during every large walk.
 fn build_visible_lines(
     n: usize,
-    matches: &[Vec<u32>],
+    matches: &[Arc<Vec<u32>>],
     lane_active: &[bool],
+    filter_exclude: &[bool],
+    join: FilterJoin,
     everything_else_active: bool,
     cancel: Option<&AtomicBool>,
-) -> Option<Arc<Vec<usize>>> {
-    if n == 0 || (everything_else_active && lane_active.iter().all(|&a| a)) {
+) -> Option<Arc<Vec<u32>>> {
+    if n == 0 {
         return None;
     }
-    let cancelled =
-        |i: usize| i % 16_384 == 0 && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
-    let mut included = vec![everything_else_active; n];
-    if everything_else_active {
-        for filter_matches in matches {
-            for (i, &line) in filter_matches.iter().enumerate() {
-                if cancelled(i) {
-                    return None;
-                }
-                let line = line as usize;
-                if line < n {
-                    included[line] = false;
-                }
-            }
-        }
-    }
-    for (filter_idx, &active) in lane_active.iter().enumerate() {
-        if !active {
+    debug_assert!(matches.len() <= 64, "lane mask is limited to 64 filters");
+    let mut include_mask = 0u64;
+    let mut exclude_mask = 0u64;
+    for lane in 0..matches.len().min(64) {
+        if !lane_active.get(lane).copied().unwrap_or(true) {
             continue;
         }
-        if let Some(filter_matches) = matches.get(filter_idx) {
-            for (i, &line) in filter_matches.iter().enumerate() {
-                if cancelled(i) {
-                    return None;
-                }
-                let line = line as usize;
-                if line < n {
-                    included[line] = true;
-                }
-            }
+        let bit = 1u64 << lane;
+        if filter_exclude.get(lane).copied().unwrap_or(false) {
+            exclude_mask |= bit;
+        } else {
+            include_mask |= bit;
         }
     }
-    let mut visible = Vec::with_capacity(n);
-    for (line, &is_included) in included.iter().enumerate() {
-        if cancelled(line) {
+
+    // Match vectors are sorted. Merge them by line so lane changes need only
+    // one cursor per filter and the compact output itself—never a byte (or a
+    // byte per lane) for every line in the document.
+    let mut cursors = vec![0usize; matches.len()];
+    let mut visible = Vec::new();
+    let mut next_gap_line = 0usize;
+    let mut processed = 0usize;
+    loop {
+        if processed % 16_384 == 0 && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return None;
         }
-        if is_included {
-            visible.push(line);
+        let next = matches
+            .iter()
+            .zip(&cursors)
+            .filter_map(|(lane, &cursor)| lane.get(cursor).copied())
+            .min();
+        let Some(line) = next else { break };
+        let line_usize = line as usize;
+        if everything_else_active && next_gap_line < line_usize.min(n) {
+            for gap_line in next_gap_line..line_usize.min(n) {
+                if gap_line % 16_384 == 0 && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    return None;
+                }
+                visible.push(gap_line as u32);
+            }
+        }
+
+        let mut event_mask = 0u64;
+        for (lane_index, (lane, cursor)) in matches.iter().zip(&mut cursors).enumerate() {
+            while lane.get(*cursor).copied() == Some(line) {
+                if lane_index < 64 {
+                    event_mask |= 1u64 << lane_index;
+                }
+                *cursor += 1;
+                processed += 1;
+            }
+        }
+        if line_usize < n {
+            let include_match = include_mask != 0
+                && if join == FilterJoin::All {
+                    event_mask & include_mask == include_mask
+                } else {
+                    event_mask & include_mask != 0
+                };
+            let excluded = event_mask & exclude_mask != 0;
+            if include_match && !excluded {
+                visible.push(line);
+            }
+            next_gap_line = line_usize.saturating_add(1);
+        }
+    }
+    if everything_else_active && next_gap_line < n {
+        for gap_line in next_gap_line..n {
+            if gap_line % 16_384 == 0 && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return None;
+            }
+            visible.push(gap_line as u32);
         }
     }
     (visible.len() != n).then(|| Arc::new(visible))
@@ -481,6 +873,446 @@ fn doc_format_summary(doc: &LogDocument) -> String {
 }
 
 impl LogotomyApp {
+    /// Persist UI-originated query history without making Log View depend on
+    /// the application shell. Tabs queue entries as users execute them.
+    pub(crate) fn drain_recent_query_updates(&mut self) {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            if let Some(query) = tab.pending_recent_search.take() {
+                self.settings.add_recent_search(query);
+                changed = true;
+            }
+            if let Some(filter) = tab.pending_recent_filter.take() {
+                self.settings.add_recent_filter(filter);
+                changed = true;
+            }
+        }
+        if changed {
+            self.settings.save();
+        }
+    }
+
+    fn remember_open_path(&mut self, path: &PathBuf) {
+        if !self.settings.open_files.iter().any(|saved| saved == path) {
+            self.settings.open_files.push(path.clone());
+        }
+    }
+
+    fn forget_open_path(&mut self, path: &PathBuf) {
+        self.settings.open_files.retain(|saved| saved != path);
+        if self.settings.active_file.as_ref() == Some(path) {
+            self.settings.active_file = None;
+        }
+    }
+
+    pub(crate) fn save_workspace(&mut self) {
+        self.settings.open_files = self
+            .tabs
+            .iter()
+            .map(|tab| tab.doc.path.clone())
+            .chain(self.loaders.iter().map(|loader| loader.path.clone()))
+            .collect();
+        self.settings.active_file = self
+            .active
+            .and_then(|idx| self.tabs.get(idx))
+            .map(|tab| tab.doc.path.clone())
+            .or_else(|| {
+                self.active_loader
+                    .and_then(|idx| self.loaders.get(idx))
+                    .map(|loader| loader.path.clone())
+            });
+        self.settings.save();
+    }
+}
+
+impl LogTab {
+    fn document_identity(tab: &LogTab) -> SourceIdentity {
+        SourceIdentity {
+            canonical_path: tab.doc.path.clone(),
+            file_size: tab.doc.file_size,
+            mtime_unix_nanos: tab
+                .doc
+                .file_mtime
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        }
+    }
+
+    fn line_anchor(tab: &LogTab, line: usize) -> LineAnchor {
+        let original = tab.doc.trim_start.saturating_add(line);
+        LineAnchor {
+            line: original,
+            timestamp: tab.doc.ts_at_opt(line),
+            line_hash: (original < tab.doc.total_lines_untrimmed())
+                .then(|| stable_line_hash(tab.doc.line_bytes_untrimmed(original))),
+        }
+    }
+
+    fn pin_state(tab: &LogTab, pin: &PinEntry) -> PinState {
+        let anchor = |line| {
+            let original = if line > usize::MAX / 2 {
+                usize::MAX - line
+            } else {
+                tab.doc.trim_start.saturating_add(line)
+            };
+            LineAnchor {
+                line: original,
+                timestamp: (original < tab.doc.total_lines_untrimmed())
+                    .then(|| {
+                        tab.doc
+                            .ts_at_opt(original.saturating_sub(tab.doc.trim_start))
+                    })
+                    .flatten()
+                    .filter(|timestamp| *timestamp >= 0),
+                line_hash: (original < tab.doc.total_lines_untrimmed())
+                    .then(|| stable_line_hash(tab.doc.line_bytes_untrimmed(original))),
+            }
+        };
+        PinState {
+            start_line: Some(anchor(pin.start_line)),
+            end_line: pin.line_numbers.last().copied().map(anchor),
+            line_numbers: pin
+                .line_numbers
+                .iter()
+                .copied()
+                .map(|line| Self::line_anchor(tab, line))
+                .collect(),
+            comment: pin.comment.clone(),
+            start_timestamp: (pin.start_ts >= 0).then_some(pin.start_ts),
+            end_timestamp: (pin.end_ts >= 0).then_some(pin.end_ts),
+            unanchored: pin.unanchored,
+        }
+    }
+
+    pub(crate) fn investigation_state(&self) -> InvestigationState {
+        let filters = self
+            .filters
+            .iter()
+            .enumerate()
+            .map(|(idx, filter)| logotomy::core::sidecar::FilterState {
+                text: filter.text.clone(),
+                active: self.lane_active.get(idx).copied().unwrap_or(true),
+                case_sensitive: self.filter_case_sensitive.get(idx).copied().unwrap_or(true),
+                exclude: self.filter_exclude.get(idx).copied().unwrap_or(false),
+                regex: self.filter_regex.get(idx).copied().unwrap_or(false),
+                template_id: self.filter_template_ids.get(idx).copied().flatten(),
+            })
+            .collect();
+        let timeline_zoom = self.timeline_zoom.map(|(start, end)| {
+            let sequence = matches!(
+                self.timeline.domain,
+                logotomy::core::timeline::TimelineDomain::Sequence
+            );
+            TimelineZoomState {
+                domain: if sequence { "sequence" } else { "time" }.to_string(),
+                start: if sequence {
+                    start.saturating_add(self.doc.trim_start as i64)
+                } else {
+                    start
+                },
+                end: if sequence {
+                    end.saturating_add(self.doc.trim_start as i64)
+                } else {
+                    end
+                },
+            }
+        });
+        let selected_line = self.context_line.map(|line| Self::line_anchor(self, line));
+        let search_selected = self
+            .find_pos
+            .and_then(|pos| self.find_matches.get(pos).copied())
+            .map(|line| line as usize)
+            .map(|line| Self::line_anchor(self, line));
+        let scroll_top_line = self
+            .scroll_top_line
+            .map(|line| Self::line_anchor(self, line));
+
+        InvestigationState {
+            schema_version: sidecar::CURRENT_SCHEMA_VERSION,
+            source: Self::document_identity(self),
+            filters,
+            everything_else_active: self.everything_else_active,
+            selected_filter: self
+                .selected_lane
+                .and_then(|idx| self.filters.get(idx))
+                .map(|filter| filter.text.clone()),
+            applied_filter: self.applied_filter.clone(),
+            search: SearchState {
+                input: self.find_input.clone(),
+                query: self.find_query.clone(),
+                case_sensitive: self.find_case_sensitive,
+                regex: self.find_regex,
+                template_id_mode: self.find_template_id_mode,
+                selected_line: search_selected,
+            },
+            selected_line,
+            scroll: ScrollState {
+                top_line: scroll_top_line,
+                fraction: self.scroll_fraction.clamp(0.0, 1.0),
+            },
+            timeline_zoom,
+            pins: self
+                .pins
+                .iter()
+                .map(|pin| Self::pin_state(self, pin))
+                .collect(),
+            trim: self.doc.is_trimmed().then_some(LineRange {
+                start: self.doc.trim_start,
+                end_exclusive: self.doc.trim_end,
+            }),
+            // Kept in the sidecar format so older releases can still read the
+            // file. Templates is now represented by the dock layout instead.
+            show_templates: true,
+            templates_panel_width: 320.0,
+            bottom_panel_open: self.bottom_panel_open,
+            log_font_size: self.log_font_size,
+            dock_layout: serde_json::to_value(&self.dock_state).ok(),
+            pre_detach_dock_layout: self
+                .saved_dock_state
+                .as_ref()
+                .and_then(|dock| serde_json::to_value(dock).ok()),
+            detached_views: self
+                .detached_views
+                .iter()
+                .map(|view| format!("{view:?}"))
+                .collect(),
+            timeline_detached: self.timeline_detached,
+        }
+    }
+
+    pub(crate) fn restore_sidecar(&mut self, loaded: LoadedState, theme: &Theme) {
+        let state = loaded.state;
+        self.apply_sidecar_safe(&state, theme);
+        match loaded.status {
+            MatchStatus::Exact => self.apply_sidecar_anchors(&state),
+            MatchStatus::Changed => {
+                self.pins = state
+                    .pins
+                    .iter()
+                    .map(|pin| PinEntry {
+                        start_line: 0,
+                        line_numbers: Vec::new(),
+                        start_ts: pin.start_timestamp.unwrap_or(-1),
+                        end_ts: pin.end_timestamp.unwrap_or(-1),
+                        comment: pin.comment.clone(),
+                        unanchored: true,
+                    })
+                    .collect();
+                self.pending_sidecar_restore = Some(state);
+            }
+        }
+    }
+
+    fn apply_sidecar_safe(&mut self, state: &InvestigationState, theme: &Theme) {
+        self.filters = state
+            .filters
+            .iter()
+            .take(MAX_FILTERS)
+            .enumerate()
+            .map(|(idx, filter)| Filter {
+                text: filter.text.clone(),
+                color: theme.filter_colors[idx % theme.filter_colors.len()],
+            })
+            .collect();
+        self.lane_active = state
+            .filters
+            .iter()
+            .take(MAX_FILTERS)
+            .map(|filter| filter.active)
+            .collect();
+        self.filter_case_sensitive = state
+            .filters
+            .iter()
+            .take(MAX_FILTERS)
+            .map(|filter| filter.case_sensitive)
+            .collect();
+        self.filter_exclude = state
+            .filters
+            .iter()
+            .take(MAX_FILTERS)
+            .map(|filter| filter.exclude)
+            .collect();
+        self.filter_regex = state
+            .filters
+            .iter()
+            .take(MAX_FILTERS)
+            .map(|filter| filter.regex)
+            .collect();
+        self.filter_template_ids = state
+            .filters
+            .iter()
+            .take(MAX_FILTERS)
+            .map(|filter| filter.template_id)
+            .collect();
+        self.everything_else_active = state.everything_else_active;
+        self.selected_lane = state.selected_filter.as_ref().and_then(|selected| {
+            self.filters
+                .iter()
+                .position(|filter| &filter.text == selected)
+        });
+        self.applied_filter = state.applied_filter.clone();
+        self.find_case_sensitive = state.search.case_sensitive;
+        self.find_regex = state.search.regex;
+        self.find_template_id_mode = state.search.template_id_mode;
+        self.find_template_id = None;
+        self.find_active_spec = None;
+        self.find_input = state.search.input.clone();
+        self.find_query = state.search.query.clone();
+        self.find_matches.clear();
+        self.find_pos = None;
+        self.bottom_panel_open = state.bottom_panel_open;
+        self.log_font_size = state.log_font_size.clamp(8.0, 24.0);
+
+        if let Some(layout) = &state.dock_layout {
+            if let Ok(dock) = serde_json::from_value(layout.clone()) {
+                self.dock_state = dock;
+            }
+        }
+        // Old sidecars predate the Templates dock tab. Keep their saved layout
+        // but add the new always-available view instead of silently hiding it.
+        if self.dock_state.find_tab(&ViewTab::Templates).is_none() {
+            self.dock_state
+                .main_surface_mut()
+                .push_to_focused_leaf(ViewTab::Templates);
+        }
+        self.saved_dock_state = state
+            .pre_detach_dock_layout
+            .as_ref()
+            .and_then(|layout| serde_json::from_value(layout.clone()).ok());
+        self.detached_views = state
+            .detached_views
+            .iter()
+            .filter_map(|view| match view.as_str() {
+                "Log" => Some(ViewTab::Log),
+                "Pinned" => Some(ViewTab::Pinned),
+                "Templates" => Some(ViewTab::Templates),
+                "Timeline" => Some(ViewTab::Timeline),
+                _ => None,
+            })
+            .collect();
+        self.timeline_detached = state.timeline_detached;
+        if !self.find_query.is_empty() {
+            self.start_find(self.find_query.clone());
+        }
+        self.rescan_filters();
+    }
+
+    pub(crate) fn confirm_sidecar_restore(&mut self, apply_anchors: bool) {
+        let Some(state) = self.pending_sidecar_restore.take() else {
+            return;
+        };
+        if apply_anchors {
+            self.apply_sidecar_anchors(&state);
+        }
+        self.last_sidecar_snapshot = None;
+    }
+
+    fn apply_sidecar_anchors(&mut self, state: &InvestigationState) {
+        if let Some(trim) = &state.trim {
+            let total = self.doc.total_lines_untrimmed();
+            if trim.start < trim.end_exclusive && trim.end_exclusive <= total {
+                Arc::make_mut(&mut self.doc)
+                    .trim_range(trim.start, trim.end_exclusive.saturating_sub(1));
+            }
+        }
+        self.timeline_zoom = state.timeline_zoom.as_ref().and_then(|zoom| {
+            let (mut start, mut end) = (zoom.start, zoom.end);
+            if zoom.domain == "sequence" {
+                start = start.saturating_sub(self.doc.trim_start as i64);
+                end = end.saturating_sub(self.doc.trim_start as i64);
+            }
+            (start < end).then_some((start, end))
+        });
+        self.context_line = state
+            .selected_line
+            .as_ref()
+            .and_then(|anchor| resolve_anchor(self, anchor));
+        self.pending_scroll_restore = state.scroll.top_line.as_ref().and_then(|anchor| {
+            resolve_anchor(self, anchor).map(|line| (line, state.scroll.fraction.clamp(0.0, 1.0)))
+        });
+        self.pins = state
+            .pins
+            .iter()
+            .map(|pin| restore_pin(self, pin))
+            .collect();
+        if let Some(selected_line) = state.search.selected_line.as_ref() {
+            if let Some(line) = resolve_anchor(self, selected_line) {
+                self.context_line = Some(line);
+            }
+        }
+        self.find_input = state.search.input.clone();
+        self.find_query.clear();
+        if !state.search.query.is_empty() {
+            self.start_find(state.search.query.clone());
+        }
+        self.rescan_filters();
+    }
+}
+
+impl LogotomyApp {
+    pub(crate) fn save_tab_sidecar(&mut self, idx: usize) -> bool {
+        let Some(tab) = self.tabs.get(idx) else {
+            return true;
+        };
+        if tab.pending_sidecar_restore.is_some() || tab.stale {
+            return true;
+        }
+        let path = tab.doc.path.clone();
+        let state = tab.investigation_state();
+        match sidecar::save_for(&path, &state) {
+            Ok(()) => {
+                if let Some(tab) = self.tabs.get_mut(idx) {
+                    tab.last_sidecar_snapshot = Some(state);
+                }
+                true
+            }
+            Err(error) => {
+                error!(
+                    "failed to save investigation sidecar for {}: {error}",
+                    path.display()
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) fn poll_sidecar_saves(&mut self) {
+        let dirty = self.tabs.iter().any(|tab| {
+            tab.pending_sidecar_restore.is_none()
+                && tab
+                    .last_sidecar_snapshot
+                    .as_ref()
+                    .is_none_or(|saved| saved != &tab.investigation_state())
+        });
+        if dirty {
+            self.sidecar_save_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_millis(400));
+        }
+        let periodic_save_due = sidecar_autosave_due(self.last_sidecar_autosave, Instant::now());
+        if periodic_save_due
+            || self
+                .sidecar_save_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            for idx in 0..self.tabs.len() {
+                let _ = self.save_tab_sidecar(idx);
+            }
+            self.sidecar_save_deadline = None;
+            if periodic_save_due {
+                self.last_sidecar_autosave = Instant::now();
+            }
+        }
+    }
+
+    pub(crate) fn flush_sidecars(&mut self) {
+        for idx in 0..self.tabs.len() {
+            let _ = self.save_tab_sidecar(idx);
+        }
+        self.sidecar_save_deadline = None;
+        self.last_sidecar_autosave = Instant::now();
+    }
+
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial_paths: Vec<PathBuf>,
@@ -491,7 +1323,17 @@ impl LogotomyApp {
         // every viewport renders log lines with it from the first frame.
         crate::ui::fonts::install(&cc.egui_ctx);
         let settings = Settings::load();
-        let dark_mode = settings.dark_mode;
+        let restore_workspace = initial_paths.is_empty();
+        let requested_active_file = restore_workspace
+            .then(|| settings.active_file.clone())
+            .flatten();
+        // The optional override is used by the tracked-screenshot workflow;
+        // it never mutates the user's persisted theme preference.
+        let dark_mode = match std::env::var("LOGOTOMY_SCREENSHOT_THEME").as_deref() {
+            Ok("dark") => true,
+            Ok("light") => false,
+            _ => settings.dark_mode,
+        };
 
         // Ensure filter directory exists
         let filters_dir = Settings::filters_dir();
@@ -510,7 +1352,8 @@ impl LogotomyApp {
             active: None,
             active_loader: None,
             loaders: Vec::new(),
-            status: "Drop a log file anywhere. Go on.".to_string(),
+            status: "Drop a .log, .txt, or .zip file anywhere.".to_string(),
+            zip_imports: Default::default(),
             theme: if dark_mode {
                 Theme::dark()
             } else {
@@ -529,8 +1372,12 @@ impl LogotomyApp {
             toast_message: None,
             toast_at: None,
             show_integrate_popup: false,
+            show_ai_assistant_popup: false,
+            ai_assistant_button_rect: None,
             recent_show_dropdown: false,
             recent_button_rect: None,
+            views_show_dropdown: false,
+            views_button_rect: None,
             available_filters,
             show_filter_dropdown: false,
             filter_button_rect: None,
@@ -543,6 +1390,13 @@ impl LogotomyApp {
 
             show_settings_popup: false,
             settings_button_rect: None,
+            show_command_palette: false,
+            command_palette_query: String::new(),
+            show_cheat_sheet: false,
+            show_goto_popup: false,
+            goto_input: String::new(),
+            goto_error: None,
+            close_save_error: None,
             custom_date_formats,
             show_custom_date_popup: false,
             cd_name: String::new(),
@@ -550,8 +1404,17 @@ impl LogotomyApp {
             cd_sample: String::new(),
             last_file_check: Some(Instant::now()),
             open_requests,
+            pending_restore_tab: None,
+            sidecar_save_deadline: None,
+            last_sidecar_autosave: Instant::now(),
+            requested_active_file,
         };
-        for path in initial_paths {
+        let paths = if initial_paths.is_empty() {
+            app.settings.open_files.clone()
+        } else {
+            initial_paths
+        };
+        for path in paths {
             app.open_file(path);
         }
         app
@@ -602,6 +1465,10 @@ impl LogotomyApp {
 
     pub fn open_file(&mut self, path: PathBuf) {
         let path = crate::ui::instance::normalize_path_for_app(path);
+        if super::archive::is_zip(&path) {
+            self.zip_imports.enqueue(path);
+            return;
+        }
         if let Some(i) = self.tabs.iter().position(|t| t.doc.path == path) {
             self.active = Some(i);
             self.status = "That file is already open. Nice try though.".to_string();
@@ -634,7 +1501,7 @@ impl LogotomyApp {
             .iter()
             .filter_map(|d| d.compile().ok())
             .collect();
-        std::thread::spawn(move || {
+        crate::ui::worker_pool::spawn(move || {
             LogDocument::load_with_custom(
                 &path_for_load,
                 parsing,
@@ -643,6 +1510,16 @@ impl LogotomyApp {
                 cancel_worker,
             )
         });
+        let loaded_sidecar = match sidecar::load_for(&path) {
+            Ok(state) => state,
+            Err(error) => {
+                log::warn!(
+                    "ignoring investigation sidecar for {}: {error}",
+                    path.display()
+                );
+                None
+            }
+        };
         self.loaders.push(FileLoader {
             path: path.clone(),
             name,
@@ -650,12 +1527,15 @@ impl LogotomyApp {
             cancel,
             stage: LoadStage::Indexing,
             progress: 0.0,
+            sidecar: loaded_sidecar,
         });
         // The loading file is shown in its own (new) log tab, so focus it.
         self.active_loader = Some(self.loaders.len() - 1);
         self.active = None;
         // Track in recent files
         self.settings.add_recent_file(path);
+        let open_path = self.loaders.last().unwrap().path.clone();
+        self.remember_open_path(&open_path);
         self.settings.save();
     }
 
@@ -697,31 +1577,20 @@ impl LogotomyApp {
     }
 
     pub fn check_for_file_updates(&mut self) {
-        if let Some(active_idx) = self.active {
-            if let Some(tab) = self.tabs.get_mut(active_idx) {
-                // Probe first while the document is still shared. In GUI+MCP
-                // mode the server intentionally holds another Arc, so calling
-                // Arc::make_mut before this check cloned every per-line index
-                // every two seconds even when the file was unchanged.
-                match tab.doc.file_change() {
-                    Ok(FileChange::Unchanged) => {}
-                    Ok(FileChange::Appended) => {
-                        tab.start_tail_update();
-                    }
-                    Ok(FileChange::Shrunk | FileChange::Modified) => {
-                        let file_name = tab.doc.file_name.clone();
-                        log::warn!(
-                            "File {} changed on disk and requires a full reload",
-                            file_name
-                        );
-                        self.status = format!("'{file_name}' changed on disk — only tailing is supported. Close and reopen the file.");
-                        tab.stale = true;
-                    }
-                    Err(e) => {
-                        log::warn!("failed to check {} for updates: {e}", tab.doc.file_name);
-                        self.status =
-                            format!("failed to check '{}' for updates: {e}", tab.doc.file_name);
-                    }
+        // Probe first while documents are still shared. Every open tab tails,
+        // not just the selected one; each tab already coalesces concurrent
+        // appends through its single in-flight staging receiver.
+        for (index, file_name, change) in probe_all_file_updates(&mut self.tabs) {
+            match change {
+                Ok(FileChange::Unchanged | FileChange::Appended) => {}
+                Ok(FileChange::Shrunk | FileChange::Modified) => {
+                    log::warn!("File {file_name} changed on disk and requires a full reload");
+                    self.status = format!("'{file_name}' changed on disk — only tailing is supported. Close and reopen the file.");
+                    self.tabs[index].stale = true;
+                }
+                Err(error) => {
+                    log::warn!("failed to check {file_name} for updates: {error}");
+                    self.status = format!("failed to check '{file_name}' for updates: {error}");
                 }
             }
         }
@@ -763,6 +1632,7 @@ impl LogotomyApp {
                     };
                 }
                 Ok(LoadProgress::Done(doc)) => {
+                    let loaded_sidecar = self.loaders[i].sidecar.take();
                     let n = doc.total_lines();
                     let mb = doc.file_size as f64 / 1e6;
                     info!(
@@ -785,10 +1655,21 @@ impl LogotomyApp {
                             &self.settings.embedded_inspector_mode,
                         ),
                     );
-                    if let Some(filter_name) = self.settings.default_filter.clone() {
+                    new_tab.log_line_display_mode = self.settings.log_line_display_mode;
+                    new_tab.search_history = self.settings.recent_searches.clone();
+                    new_tab.filter_history = self.settings.recent_filters.clone();
+                    if let Some(loaded) = loaded_sidecar {
+                        new_tab.restore_sidecar(loaded, &self.theme);
+                    } else if let Some(filter_name) = self.settings.default_filter.clone() {
                         apply_filter_to_tab(&mut new_tab, &filter_name, &self.theme);
                     }
                     self.tabs.push(new_tab);
+                    let new_idx = self.tabs.len() - 1;
+                    if self.tabs[new_idx].pending_sidecar_restore.is_none() {
+                        let _ = self.save_tab_sidecar(new_idx);
+                    } else {
+                        self.pending_restore_tab = Some(new_idx);
+                    }
 
                     // If MCP is running, share the new file with the MCP server
                     if let Some(ref mcp_state) = self.mcp_state {
@@ -805,8 +1686,16 @@ impl LogotomyApp {
                             }
                         }
                     }
-                    self.active = Some(self.tabs.len() - 1);
-                    self.active_loader = None;
+                    let should_activate = self
+                        .requested_active_file
+                        .as_ref()
+                        .map_or(true, |path| path == &self.tabs[new_idx].doc.path);
+                    if should_activate {
+                        self.active = Some(new_idx);
+                        self.active_loader = None;
+                        self.settings.active_file = Some(self.tabs[new_idx].doc.path.clone());
+                    }
+                    self.save_workspace();
                     remove = true;
                 }
                 Ok(LoadProgress::Error(e)) => {
@@ -917,8 +1806,8 @@ impl LogotomyApp {
 
     /// Push any GUI-originated filter-set changes (toolbar add/remove, saved
     /// filter apply, lane edits) into the MCP server's `_active` filter list.
-    /// Only the filter texts are synced — the "Everything Else" lane and lane
-    /// toggles are GUI-only and never flow into MCP arithmetic.
+    /// Full matcher settings and composition are synced. Lane visibility is
+    /// GUI-only and never changes MCP arithmetic.
     pub fn sync_mcp_filters(&mut self) {
         let Some(ref mcp_state) = self.mcp_state else {
             return;
@@ -927,10 +1816,12 @@ impl LogotomyApp {
             if !tab.mcp_serving {
                 continue;
             }
-            let texts: Vec<String> = tab.filters.iter().map(|f| f.text.clone()).collect();
+            let specs = tab.filter_specs_snapshot();
             let mut guard = mcp_state.lock().unwrap();
-            if guard.get_filters("_active") != texts {
-                guard.set_filters("_active", texts);
+            if guard.get_filter_specs("_active") != specs
+                || guard.filter_join("_active") != tab.filter_join
+            {
+                guard.set_filter_specs("_active", specs, tab.filter_join);
                 // GUI-originated change — the GUI already shows the newest
                 // filter set, so don't trigger the MCP→GUI re-apply.
                 guard.filters_dirty.store(false, Ordering::Relaxed);
@@ -976,22 +1867,37 @@ impl LogotomyApp {
         if !dirty {
             return;
         }
-        let filters: Vec<String> = {
+        let (filters, join) = {
             let guard = mcp_state.lock().unwrap();
             guard.filters_dirty.store(false, Ordering::Relaxed);
-            guard.get_filters("_active")
+            (
+                guard.get_filter_specs("_active"),
+                guard.filter_join("_active"),
+            )
         };
-        if let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) {
-            tab.filters.clear();
-            let colors = &self.theme.filter_colors;
-            for (i, text) in filters.into_iter().take(MAX_FILTERS).enumerate() {
-                tab.filters.push(Filter {
-                    text,
-                    color: colors[i % colors.len()],
-                });
-            }
-            tab.rescan_filters();
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.mcp_serving) {
+            tab.apply_mcp_filters(filters, join, &self.theme.filter_colors);
             info!("MCP: re-applied filters from server state");
+        }
+    }
+
+    /// Consume the latest MCP search only on the tab whose document it searched.
+    pub fn poll_mcp_search(&mut self) {
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.mcp_serving && (tab.search_rx.is_some() || tab.visible_rx.is_some()))
+        {
+            return;
+        }
+        let request = self
+            .mcp_state
+            .as_ref()
+            .and_then(|state| state.lock().unwrap().pending_search.take());
+        if let Some(request) = request {
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.mcp_serving) {
+                tab.apply_mcp_search(request);
+            }
         }
     }
 
@@ -1022,10 +1928,54 @@ impl LogotomyApp {
         }
     }
 
+    /// Persist before closing without interrupting the user's workflow.
+    pub fn request_close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        if self.tabs[idx].pending_sidecar_restore.is_some() {
+            // A changed source file leaves anchor restoration unresolved. On
+            // close, keep the safe notes-only state and persist it silently.
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                tab.confirm_sidecar_restore(false);
+            }
+        }
+        self.close_after_save(idx);
+    }
+
+    fn close_after_save(&mut self, idx: usize) {
+        if self.save_tab_sidecar(idx) {
+            self.close_tab(idx);
+        } else {
+            self.close_save_error = Some(idx);
+        }
+    }
+
+    /// Cycle the ready document tabs. Loading tabs intentionally retain their
+    /// own focus behavior; Ctrl+Tab never interrupts a background load.
+    pub fn cycle_tabs(&mut self, backwards: bool) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let old = self.active;
+        let current = self.active.unwrap_or(0);
+        let len = self.tabs.len();
+        let next = if backwards {
+            (current + len - 1) % len
+        } else {
+            (current + 1) % len
+        };
+        self.active = Some(next);
+        self.active_loader = None;
+        self.on_tab_switched(old, next);
+        self.save_workspace();
+    }
+
     pub fn close_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() {
             return;
         }
+        let closed_path = self.tabs[idx].doc.path.clone();
         info!("closing tab {} ({})", idx, self.tabs[idx].doc.file_name);
         if let Some((_, cancel)) = &self.tabs[idx].search_rx {
             cancel.store(true, Ordering::Relaxed);
@@ -1058,12 +2008,11 @@ impl LogotomyApp {
                         // Seed `_active` filters from the newly served tab
                         // (GUI-originated → clear the MCP→GUI dirty flag).
                         let new_idx = idx.min(self.tabs.len() - 1);
-                        let texts: Vec<String> = self.tabs[new_idx]
-                            .filters
-                            .iter()
-                            .map(|f| f.text.clone())
-                            .collect();
-                        guard.set_filters("_active", texts);
+                        guard.set_filter_specs(
+                            "_active",
+                            self.tabs[new_idx].filter_specs_snapshot(),
+                            self.tabs[new_idx].filter_join,
+                        );
                         guard.filters_dirty.store(false, Ordering::Relaxed);
                         guard.set_analyses(pin_analyses(&self.tabs[new_idx].pins));
                         guard.analyses_dirty.store(false, Ordering::Relaxed);
@@ -1082,6 +2031,8 @@ impl LogotomyApp {
         } else {
             Some(idx.min(self.tabs.len() - 1))
         };
+        self.forget_open_path(&closed_path);
+        self.save_workspace();
     }
 
     /// Temporary session ID used by an already-configured `logotomy --mcp`
@@ -1110,31 +2061,16 @@ impl LogotomyApp {
     /// GUI session. GUI mode already serves the active document, so the agent
     /// must not call `load_log` or pass `log_id`.
     fn build_mcp_instruction(session_id: &str, log_path: &str) -> String {
-        let executable = std::env::current_exe()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|_| "logotomy".to_string());
         format!(
-            "The user has invited you to an interactive Logotomy debugging session.\n\n\
-Shared log: {log_path}\n\
-Temporary session ID: {session_id}\n\n\
-Keep the session ID secret. Do not save it, write it to files, or include it in your response.\n\n\
-If Logotomy MCP (`{executable} --mcp`) is not configured or its tools are unavailable, \
-do not use another transport or workaround. Ask the user to configure it in Logotomy App → \
-Settings → Integrate with AI Assistant, following the guide there. Help with that setup first, \
-then continue only after `attach_gui_session` is available.\n\n\
-Connect by calling `attach_gui_session` with the temporary session ID, then call \
-`session_info` and confirm `mode` is `gui_attached`. Use `detach_gui_session` when you need \
-to leave the session. While attached, the GUI supplies the shared log: `load_log`, \
-`list_logs`, and `close_log` are unavailable, and no `log_id` is required. The connection ends \
-when the user stops MCP or closes the shared log.\n\n\
-Suggested investigation approach: begin with the user's question, Pin-tab analysis \
-(`get_analysis`), and active filters (`filters_get`). Get orientation from `summarize_log` \
-(`with_filtered_log=false` for the full log) and targeted `find_occurrences`. Use \
-`filters_add`, `filters_remove`, and `trim` when they help test a hypothesis or focus the \
-search. Prefer `log_sequence` and `get_template` to investigate many lines efficiently; use \
-bounded `raw_log` only for exact evidence. Add useful, evidence-backed findings or root-cause \
-conclusions to the Pin tab with `add_analysis`.\n\n\
-Read `logotomy://guide` for additional tool guidance when MCP resources are supported."
+            "Logotomy GUI session\n\n\
+Log: {log_path}\n\
+Session ID: {session_id}\n\n\
+Keep the session ID secret; do not save or repeat it.\n\n\
+Call `attach_gui_session`, then confirm `session_info` reports `gui_attached`. The GUI supplies \
+the log: do not call `load_log` or use `log_id`.\n\n\
+Review `get_analysis` and `filters_get`, investigate the user's question, and add evidence-backed \
+findings with `add_analysis`. Call `detach_gui_session` when done.\n\n\
+If MCP is unavailable, ask the user to configure it in Logotomy → Settings → Integrate with AI Assistant."
         )
     }
 
@@ -1172,12 +2108,11 @@ Read `logotomy://guide` for additional tool guidance when MCP resources are supp
                 // filters so `with_filtered_log=true` (the default) starts out
                 // matching what the user is viewing. GUI-originated, so clear
                 // the MCP→GUI dirty flag.
-                let texts: Vec<String> = self.tabs[active_idx]
-                    .filters
-                    .iter()
-                    .map(|f| f.text.clone())
-                    .collect();
-                guard.set_filters("_active", texts);
+                guard.set_filter_specs(
+                    "_active",
+                    self.tabs[active_idx].filter_specs_snapshot(),
+                    self.tabs[active_idx].filter_join,
+                );
                 guard.filters_dirty.store(false, Ordering::Relaxed);
                 guard.set_analyses(pin_analyses(&self.tabs[active_idx].pins));
                 guard.analyses_dirty.store(false, Ordering::Relaxed);
@@ -1324,12 +2259,11 @@ Read `logotomy://guide` for additional tool guidance when MCP resources are supp
                 guard.set_active_doc(Arc::clone(&self.tabs[new_idx].doc));
                 // Seed `_active` filters from the newly served tab
                 // (GUI-originated → clear the MCP→GUI dirty flag).
-                let texts: Vec<String> = self.tabs[new_idx]
-                    .filters
-                    .iter()
-                    .map(|f| f.text.clone())
-                    .collect();
-                guard.set_filters("_active", texts);
+                guard.set_filter_specs(
+                    "_active",
+                    self.tabs[new_idx].filter_specs_snapshot(),
+                    self.tabs[new_idx].filter_join,
+                );
                 guard.filters_dirty.store(false, Ordering::Relaxed);
                 guard.set_analyses(pin_analyses(&self.tabs[new_idx].pins));
                 guard.analyses_dirty.store(false, Ordering::Relaxed);
@@ -1404,49 +2338,161 @@ mod tests {
 
     #[test]
     fn visible_line_builder_applies_everything_else_and_lane_toggles() {
-        let matches = vec![vec![1, 3, 6], vec![3, 4]];
+        let matches = vec![Arc::new(vec![1, 3, 6]), Arc::new(vec![3, 4])];
 
-        let only_everything_else =
-            build_visible_lines(8, &matches, &[false, false], true, None).unwrap();
+        let only_everything_else = build_visible_lines(
+            8,
+            &matches,
+            &[false, false],
+            &[false, false],
+            FilterJoin::Any,
+            true,
+            None,
+        )
+        .unwrap();
         assert_eq!(&*only_everything_else, &[0, 2, 5, 7]);
 
-        let first_lane_only =
-            build_visible_lines(8, &matches, &[true, false], false, None).unwrap();
+        let first_lane_only = build_visible_lines(
+            8,
+            &matches,
+            &[true, false],
+            &[false, false],
+            FilterJoin::Any,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(&*first_lane_only, &[1, 3, 6]);
 
-        assert!(build_visible_lines(8, &matches, &[true, true], true, None).is_none());
+        assert!(build_visible_lines(
+            8,
+            &matches,
+            &[true, true],
+            &[false, false],
+            FilterJoin::Any,
+            true,
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn visible_line_builder_intersects_includes_and_subtracts_excludes() {
+        let matches = vec![
+            Arc::new(vec![0, 1]),
+            Arc::new(vec![1, 2]),
+            Arc::new(vec![2]),
+        ];
+        let all = build_visible_lines(
+            4,
+            &matches,
+            &[true, true, false],
+            &[false, false, true],
+            FilterJoin::All,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(&*all, &[1]);
+        let any = build_visible_lines(
+            4,
+            &matches,
+            &[true, true, true],
+            &[false, false, true],
+            FilterJoin::Any,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(&*any, &[0, 1]);
+    }
+
+    #[test]
+    fn sorted_lane_merge_matches_reference_for_all_toggle_combinations() {
+        let matches = vec![
+            Arc::new(vec![0, 2, 5, 9]),
+            Arc::new(vec![1, 2, 7]),
+            Arc::new(vec![2, 4, 8]),
+        ];
+        let excludes = [false, false, true];
+        for active_bits in 0u8..8 {
+            let active = [
+                active_bits & 1 != 0,
+                active_bits & 2 != 0,
+                active_bits & 4 != 0,
+            ];
+            for join in [FilterJoin::Any, FilterJoin::All] {
+                for everything_else in [false, true] {
+                    let expected: Vec<u32> = (0u32..10)
+                        .filter(|line| {
+                            let lane_hits = matches
+                                .iter()
+                                .map(|lane| lane.binary_search(line).is_ok())
+                                .collect::<Vec<_>>();
+                            let includes = (0..3)
+                                .filter(|&lane| active[lane] && !excludes[lane])
+                                .collect::<Vec<_>>();
+                            let include_match = !includes.is_empty()
+                                && if join == FilterJoin::All {
+                                    includes.iter().all(|&lane| lane_hits[lane])
+                                } else {
+                                    includes.iter().any(|&lane| lane_hits[lane])
+                                };
+                            let excluded = (0..3)
+                                .any(|lane| active[lane] && excludes[lane] && lane_hits[lane]);
+                            (include_match
+                                || (everything_else && !lane_hits.iter().any(|&hit| hit)))
+                                && !excluded
+                        })
+                        .collect();
+                    let actual = build_visible_lines(
+                        10,
+                        &matches,
+                        &active,
+                        &excludes,
+                        join,
+                        everything_else,
+                        None,
+                    );
+                    if expected.len() == 10 {
+                        assert!(actual.is_none());
+                    } else {
+                        assert_eq!(actual.unwrap().as_slice(), expected.as_slice());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn periodic_sidecar_autosave_is_due_after_one_minute() {
+        let last_save = Instant::now();
+        assert!(!sidecar_autosave_due(
+            last_save,
+            last_save + Duration::from_secs(59)
+        ));
+        assert!(sidecar_autosave_due(
+            last_save,
+            last_save + Duration::from_secs(60)
+        ));
     }
 
     #[test]
     fn gui_mcp_instruction_is_actionable_and_safe() {
         let prompt = LogotomyApp::build_mcp_instruction("123456", "/tmp/example.log");
-        let executable = std::env::current_exe().unwrap().display().to_string();
         assert!(prompt.contains("attach_gui_session"));
         assert!(prompt.contains("123456"));
-        assert!(prompt.contains("Shared log: /tmp/example.log"));
-        assert!(prompt.contains("Temporary session ID: 123456"));
-        assert!(prompt.contains("interactive Logotomy debugging session"));
+        assert!(prompt.contains("Log: /tmp/example.log"));
+        assert!(prompt.contains("Session ID: 123456"));
+        assert!(prompt.contains("Logotomy GUI session"));
         assert!(prompt.contains("gui_attached"));
-        assert!(prompt.contains("`load_log`, `list_logs`, and `close_log` are unavailable"));
-        assert!(prompt.contains("no `log_id` is required"));
-        assert!(prompt.contains("Suggested investigation approach"));
-        assert!(prompt.contains("with_filtered_log=false"));
+        assert!(prompt.contains("do not call `load_log` or use `log_id`"));
         assert!(prompt.contains("get_analysis"));
         assert!(prompt.contains("filters_get"));
-        assert!(prompt.contains("find_occurrences"));
-        assert!(prompt.contains("`filters_add`, `filters_remove`, and `trim`"));
-        assert!(prompt.contains("log_sequence"));
-        assert!(prompt.contains("get_template"));
-        assert!(prompt.contains("bounded `raw_log`"));
         assert!(prompt.contains("add_analysis"));
-        assert!(prompt.contains("root-cause conclusions"));
-        assert!(
-            prompt.contains("Do not save it, write it to files, or include it in your response")
-        );
-        assert!(prompt.contains(&format!("`{executable} --mcp`")));
+        assert!(prompt.contains("do not save or repeat it"));
         assert!(prompt.contains("session_info"));
-        assert!(prompt.contains("Logotomy App → Settings → Integrate with AI Assistant"));
-        assert!(prompt.contains("Help with that setup first"));
+        assert!(prompt.contains("Logotomy → Settings → Integrate with AI Assistant"));
         assert!(prompt.contains("detach_gui_session"));
         assert!(!prompt.contains("http://"));
         assert!(!prompt.contains("Authorization"));
@@ -1490,6 +2536,229 @@ mod tests {
         ));
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn anchored_pin_uses_sorted_selected_rows_for_endpoints() {
+        let path = write_temp(
+            "2026-07-19T10:00:00.000Z zero\n\
+             2026-07-19T10:00:01.000Z one\n\
+             2026-07-19T10:00:02.000Z two\n\
+             2026-07-19T10:00:03.000Z three\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let pin = PinEntry::anchored(&doc, vec![3, 1, 3], "note".into()).unwrap();
+
+        assert_eq!(pin.line_numbers, vec![1, 3]);
+        assert_eq!(pin.start_line, 1);
+        assert_eq!(pin.start_ts, doc.ts_at(1));
+        assert_eq!(pin.end_ts, doc.ts_at(3));
+        assert_eq!(pin.visible_bounds(doc.total_lines()), Some((1, 3)));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pin_navigation_reveals_hidden_start_and_queues_card_focus() {
+        let path = write_temp(
+            "2026-07-19T10:00:00.000Z zero\n\
+             2026-07-19T10:00:01.000Z one\n\
+             2026-07-19T10:00:02.000Z two\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.pins
+            .push(PinEntry::anchored(&tab.doc, vec![1, 2], "evidence".into()).unwrap());
+        tab.visible_lines = Some(Arc::new(vec![0, 2]));
+
+        assert!(tab.navigate_to_pin(0));
+        assert_eq!(tab.context_line, Some(1));
+        assert_eq!(tab.pending_scroll, Some(1));
+        assert_eq!(tab.selected_pin, Some(0));
+        assert_eq!(tab.pending_pin_scroll, Some(0));
+        assert!(tab.pending_pin_activation);
+        assert_eq!(tab.visible_lines.as_deref().unwrap().as_slice(), &[0, 1, 2]);
+        std::fs::remove_file(path).ok();
+    }
+
+    fn finish_filter_work(tab: &mut LogTab) {
+        for _ in 0..200 {
+            let scanning = tab.poll_search();
+            let rebuilding = tab.poll_visible_lines();
+            if !scanning && !rebuilding {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for filter work");
+    }
+
+    #[test]
+    fn filter_deletion_undo_restores_position_and_lane_state() {
+        let path = write_temp("alpha\nbeta\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.filters = vec![
+            Filter {
+                text: "alpha".into(),
+                color: Color32::RED,
+            },
+            Filter {
+                text: "beta".into(),
+                color: Color32::BLUE,
+            },
+        ];
+        tab.lane_active = vec![true, false];
+        tab.selected_lane = Some(1);
+
+        tab.remove_filter_with_undo(1);
+        assert_eq!(tab.filters.len(), 1);
+        assert_eq!(tab.selected_lane, None);
+        assert!(tab.undo_delete());
+        assert_eq!(
+            tab.filters
+                .iter()
+                .map(|filter| filter.text.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(tab.lane_active, vec![true, false]);
+        assert_eq!(tab.selected_lane, Some(1));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn template_filter_input_creates_a_typed_timeline_lane() {
+        let path = write_temp("INFO connected user=1\nINFO connected user=2\nERROR disk full\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let template_id = doc.template_at(0);
+        let mut tab = LogTab::new(doc);
+
+        assert!(tab
+            .push_template_filter_input(&format!("T{{{template_id}}}"), Color32::RED)
+            .is_some());
+        assert_eq!(tab.filters[0].text, format!("T{{{template_id}}}"));
+        assert_eq!(tab.filter_template_ids, vec![Some(template_id)]);
+
+        for _ in 0..100 {
+            if !tab.poll_search() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(&*tab.matches[0], &[0, 1]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pin_deletion_undo_restores_selected_card() {
+        let path = write_temp("line\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.pins.push(PinEntry {
+            start_line: 0,
+            line_numbers: vec![0],
+            start_ts: -1,
+            end_ts: -1,
+            comment: "keep me".into(),
+            unanchored: false,
+        });
+        tab.selected_pin = Some(0);
+
+        tab.remove_selected_pin_with_undo();
+        assert!(tab.pins.is_empty());
+        assert!(tab.undo_delete());
+        assert_eq!(tab.pins[0].comment, "keep me");
+        assert_eq!(tab.selected_pin, Some(0));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn visible_boundary_obeys_the_filtered_view() {
+        let path = write_temp("zero\none\ntwo\nthree\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.visible_lines = Some(Arc::new(vec![1, 3]));
+        tab.viewport_range = Some((1, 1));
+        assert_eq!(tab.visible_boundary(false), Some(1));
+        assert_eq!(tab.visible_boundary(true), Some(3));
+        assert_eq!(tab.viewport_boundary(false), Some(1));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn investigation_state_uses_original_lines_and_restores_trimmed_view() {
+        let path = write_temp(
+            "2026-08-23T10:00:00Z zero\n2026-08-23T10:00:01Z one\n2026-08-23T10:00:02Z two\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        Arc::make_mut(&mut tab.doc).trim_range(1, 2);
+        tab.context_line = Some(1);
+        tab.scroll_top_line = Some(0);
+        tab.scroll_fraction = 0.25;
+        tab.pins.push(PinEntry {
+            start_line: 1,
+            line_numbers: vec![1],
+            start_ts: tab.doc.ts_at(1),
+            end_ts: tab.doc.ts_at(1),
+            comment: "important".into(),
+            unanchored: false,
+        });
+        let state = tab.investigation_state();
+        assert_eq!(state.trim.as_ref().unwrap().start, 1);
+        assert_eq!(state.selected_line.as_ref().unwrap().line, 2);
+        assert_eq!(state.pins[0].line_numbers[0].line, 2);
+
+        let doc = LogDocument::open(&path).unwrap();
+        let mut restored = LogTab::new(doc);
+        restored.restore_sidecar(
+            LoadedState {
+                state,
+                status: MatchStatus::Exact,
+            },
+            &Theme::dark(),
+        );
+        assert_eq!(restored.doc.trim_start, 1);
+        assert_eq!(restored.context_line, Some(1));
+        assert_eq!(restored.pins.len(), 1);
+        assert_eq!(restored.pins[0].line_numbers, vec![1]);
+        assert!(!restored.pins[0].unanchored);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn changed_sidecar_restores_notes_before_anchors() {
+        let path = write_temp("2026-08-23T10:00:00Z zero\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut source_tab = LogTab::new(doc);
+        source_tab.pins.push(PinEntry {
+            start_line: 0,
+            line_numbers: vec![0],
+            start_ts: source_tab.doc.ts_at(0),
+            end_ts: source_tab.doc.ts_at(0),
+            comment: "keep this hypothesis".into(),
+            unanchored: false,
+        });
+        let mut state = source_tab.investigation_state();
+        state.source.file_size += 1;
+
+        let doc = LogDocument::open(&path).unwrap();
+        let mut restored = LogTab::new(doc);
+        restored.restore_sidecar(
+            LoadedState {
+                state,
+                status: MatchStatus::Changed,
+            },
+            &Theme::dark(),
+        );
+        assert_eq!(restored.pins[0].comment, "keep this hypothesis");
+        assert!(restored.pins[0].unanchored);
+        assert!(restored.pending_sidecar_restore.is_some());
+
+        restored.confirm_sidecar_restore(false);
+        assert!(restored.pending_sidecar_restore.is_none());
+        assert!(restored.pins[0].unanchored);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -1567,6 +2836,71 @@ mod tests {
         assert_eq!(tab.matches.len(), 1);
         assert_eq!(tab.matches[0].len(), 1);
 
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn filter_edits_retain_unchanged_match_lane_allocations() {
+        let path = write_temp(
+            "2026-07-19T10:00:00.000Z INFO alpha\n\
+             2026-07-19T10:00:01.000Z WARN beta\n\
+             2026-07-19T10:00:02.000Z INFO alpha gamma\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        assert_eq!(
+            tab.push_filter("alpha", Theme::light().filter_colors[0]),
+            Some(0)
+        );
+        for _ in 0..100 {
+            if !tab.poll_search() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let alpha_matches = Arc::clone(&tab.matches[0]);
+
+        assert_eq!(
+            tab.push_filter("gamma", Theme::light().filter_colors[1]),
+            Some(1)
+        );
+        for _ in 0..100 {
+            if !tab.poll_search() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Arc::ptr_eq(&alpha_matches, &tab.matches[0]));
+        assert_eq!(tab.matches[1].as_slice(), &[2]);
+
+        tab.filter_exclude[0] = true;
+        tab.rescan_filters();
+        for _ in 0..100 {
+            if !tab.poll_search() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Arc::ptr_eq(&alpha_matches, &tab.matches[0]));
+
+        tab.remove_filter(1);
+        for _ in 0..100 {
+            if !tab.poll_search() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Arc::ptr_eq(&alpha_matches, &tab.matches[0]));
+
+        tab.handle_trim(TrimAction::TrimLeft(1));
+        for _ in 0..100 {
+            if !tab.poll_search() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!Arc::ptr_eq(&alpha_matches, &tab.matches[0]));
+        assert_eq!(tab.matches[0].as_slice(), &[1]);
         std::fs::remove_file(path).ok();
     }
 
@@ -1701,7 +3035,7 @@ mod tests {
                 color: Theme::light().filter_colors[1],
             },
         ];
-        tab.matches = Arc::new(vec![vec![0, 2], vec![1, 2]]);
+        tab.matches = Arc::new(vec![Arc::new(vec![0, 2]), Arc::new(vec![1, 2])]);
         tab.lane_active = vec![true, false];
         tab.everything_else_active = false;
         tab.rebuild_visible_lines_background();
@@ -1727,7 +3061,7 @@ mod tests {
         }];
         // The old viewport begins at line 5. The new filter leaves 3 and 8
         // around it; 3 is the nearest remaining real line.
-        tab.matches = Arc::new(vec![vec![1, 3, 8]]);
+        tab.matches = Arc::new(vec![Arc::new(vec![1, 3, 8])]);
         tab.lane_active = vec![true];
         tab.everything_else_active = false;
         tab.viewport_range = Some((5, 7));
@@ -1741,6 +3075,154 @@ mod tests {
         assert_eq!(tab.visible_lines.as_deref(), Some(&vec![1, 3, 8]));
         assert_eq!(tab.pending_scroll, Some(3));
         assert_eq!(tab.preserve_anchor, None);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn background_visible_rebuild_keeps_selected_line_over_viewport_anchor() {
+        let path = write_temp("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.filters = vec![Filter {
+            text: "match".into(),
+            color: Theme::light().filter_colors[0],
+        }];
+        tab.matches = Arc::new(vec![Arc::new(vec![1, 3, 8])]);
+        tab.lane_active = vec![true];
+        tab.everything_else_active = false;
+        tab.context_line = Some(8);
+        tab.viewport_range = Some((2, 4));
+        tab.rebuild_visible_lines_background();
+        for _ in 0..100 {
+            if !tab.poll_visible_lines() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(tab.context_line, Some(8));
+        assert_eq!(tab.pending_scroll, Some(8));
+        assert_eq!(tab.preserve_anchor, None);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn background_visible_rebuild_selects_nearest_line_when_selection_removed() {
+        let path = write_temp("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.filters = vec![Filter {
+            text: "match".into(),
+            color: Theme::light().filter_colors[0],
+        }];
+        tab.matches = Arc::new(vec![Arc::new(vec![1, 3, 8])]);
+        tab.lane_active = vec![true];
+        tab.everything_else_active = false;
+        tab.context_line = Some(5);
+        tab.viewport_range = Some((1, 3));
+        tab.rebuild_visible_lines_background();
+        for _ in 0..100 {
+            if !tab.poll_visible_lines() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(tab.context_line, Some(3));
+        assert_eq!(tab.pending_scroll, Some(3));
+        assert_eq!(tab.preserve_anchor, None);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn filter_visibility_reconciles_selection_before_requesting_scroll() {
+        let path = write_temp("other\nalpha\nselected\nbeta\nother\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.push_filter("alpha", Color32::RED);
+        tab.push_filter("beta", Color32::BLUE);
+        finish_filter_work(&mut tab);
+
+        // Adding filters does not move a selection that is still rendered by
+        // Everything Else, and an already-visible selection must not scroll.
+        tab.context_line = Some(2);
+        tab.viewport_range = Some((1, 3));
+        tab.pending_scroll = None;
+        tab.set_everything_else_active(true);
+        assert_eq!(tab.context_line, Some(2));
+        assert_eq!(tab.pending_scroll, None);
+
+        // Hiding Everything Else removes line 2. The closest visible lines
+        // are 1 and 3, so the deterministic tie-break selects the earlier
+        // line and only then asks the Log View to reveal that final line.
+        tab.set_everything_else_active(false);
+        finish_filter_work(&mut tab);
+        assert_eq!(tab.context_line, Some(1));
+        assert_eq!(tab.pending_scroll, Some(1));
+
+        // Re-enabling a lane must not replace the current selection merely
+        // because more rows become visible; nor should it scroll when that
+        // selected line is already inside the viewport.
+        tab.viewport_range = Some((0, 2));
+        tab.pending_scroll = None;
+        tab.set_everything_else_active(true);
+        finish_filter_work(&mut tab);
+        assert_eq!(tab.context_line, Some(1));
+        assert_eq!(tab.pending_scroll, None);
+
+        // The individual filter eye control uses the same reconciliation
+        // path: with Everything Else hidden, disabling alpha filters out the
+        // selected alpha row and selects beta before requesting a reveal.
+        tab.set_everything_else_active(false);
+        finish_filter_work(&mut tab);
+        tab.viewport_range = Some((0, 2));
+        tab.pending_scroll = None;
+        assert!(tab.set_lane_active(0, false));
+        finish_filter_work(&mut tab);
+        assert_eq!(tab.context_line, Some(3));
+        assert_eq!(tab.pending_scroll, Some(3));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn filter_add_remove_undo_and_clear_preserve_visible_selection() {
+        let path = write_temp("other\nalpha\nother\nbeta\nother\nalpha\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+
+        tab.context_line = Some(1);
+        tab.viewport_range = Some((0, 2));
+        assert_eq!(tab.push_filter("alpha", Color32::RED), Some(0));
+        finish_filter_work(&mut tab);
+        assert_eq!(
+            tab.context_line,
+            Some(1),
+            "adding must retain a visible line"
+        );
+        assert_eq!(tab.pending_scroll, None);
+
+        // With Everything Else hidden, removing beta leaves alpha selected;
+        // undo and clearing filters likewise expand visibility without moving
+        // an already-visible real log line.
+        assert_eq!(tab.push_filter("beta", Color32::BLUE), Some(1));
+        finish_filter_work(&mut tab);
+        tab.set_everything_else_active(false);
+        finish_filter_work(&mut tab);
+        tab.viewport_range = Some((0, 2));
+        tab.pending_scroll = None;
+
+        tab.remove_filter_with_undo(1);
+        finish_filter_work(&mut tab);
+        assert_eq!(tab.context_line, Some(1));
+        assert_eq!(tab.pending_scroll, None);
+
+        assert!(tab.undo_delete());
+        finish_filter_work(&mut tab);
+        assert_eq!(tab.context_line, Some(1));
+        assert_eq!(tab.pending_scroll, None);
+
+        tab.clear_all_filters();
+        finish_filter_work(&mut tab);
+        assert_eq!(tab.context_line, Some(1));
+        assert_eq!(tab.pending_scroll, None);
         std::fs::remove_file(path).ok();
     }
 
@@ -1773,6 +3255,86 @@ mod tests {
         assert_eq!(tab.doc.total_lines(), 2);
         assert!(tab.tail_rx.is_none());
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn background_tail_update_extends_completed_filter_lanes() {
+        use std::io::Write;
+
+        let path = write_temp("alpha old\nbeta\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.push_filter("alpha", Theme::light().filter_colors[0]);
+        for _ in 0..100 {
+            if !tab.poll_search() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(tab.matches[0].as_slice(), &[0]);
+
+        std::fs::File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"alpha new\ngamma\n")
+            .unwrap();
+        tab.start_tail_update();
+        for _ in 0..100 {
+            if tab.poll_tail_update().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..100 {
+            if !tab.poll_search() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(tab.doc.total_lines(), 4);
+        assert_eq!(tab.matches[0].as_slice(), &[0, 2]);
+        assert_eq!(tab.timeline.density.iter().sum::<u32>(), 4);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn file_update_probe_schedules_every_open_tab() {
+        use std::io::Write;
+
+        let first_path = write_temp("first\n");
+        let second_path = write_temp("second\n");
+        let mut tabs = vec![
+            LogTab::new(LogDocument::open(&first_path).unwrap()),
+            LogTab::new(LogDocument::open(&second_path).unwrap()),
+        ];
+        for path in [&first_path, &second_path] {
+            std::fs::File::options()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(b"appended\n")
+                .unwrap();
+        }
+
+        let changes = probe_all_file_updates(&mut tabs);
+        assert_eq!(changes.len(), 2);
+        assert!(changes
+            .iter()
+            .all(|(_, _, change)| matches!(change, Ok(FileChange::Appended))));
+        assert!(tabs.iter().all(|tab| tab.tail_rx.is_some()));
+
+        for tab in &mut tabs {
+            for _ in 0..100 {
+                if tab.poll_tail_update().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(tab.doc.total_lines(), 2);
+        }
+        std::fs::remove_file(first_path).ok();
+        std::fs::remove_file(second_path).ok();
     }
 
     #[test]
@@ -2068,7 +3630,7 @@ mod tests {
             text: "error".to_string(),
             color: Color32::RED,
         });
-        tab.matches = Arc::new(vec![vec![1, 3]]);
+        tab.matches = Arc::new(vec![Arc::new(vec![1, 3])]);
         tab.find_matches = vec![0, 2];
         tab.find_pos = Some(0);
 
@@ -2101,7 +3663,8 @@ mod tests {
 
         // Occurrence state derives from the selected lane and current log
         // line; another lane matching the line never changes the selection.
-        tab.matches = Arc::new(vec![vec![1, 3], vec![1, 4]]);
+        tab.matches = Arc::new(vec![Arc::new(vec![1, 3]), Arc::new(vec![1, 4])]);
+        tab.lane_active = vec![true, true];
         tab.selected_lane = Some(1);
         tab.context_line = Some(1);
         assert_eq!(tab.selected_occurrence(), Some((1, 1)));
@@ -2120,6 +3683,14 @@ mod tests {
         assert_eq!(tab.selected_occurrence(), None);
         tab.select_timeline_line(4, Some(1));
         assert_eq!(tab.selected_occurrence(), Some((1, 4)));
+
+        // A disabled lane remains navigable, but clicking it must not select
+        // the disabled filter for occurrence navigation.
+        tab.lane_active[1] = false;
+        tab.select_timeline_line(2, Some(1));
+        assert_eq!(tab.context_line, Some(2));
+        assert_eq!(tab.selected_lane, None);
+        assert_eq!(tab.selected_occurrence(), None);
 
         std::fs::remove_file(path).ok();
     }
@@ -2191,9 +3762,99 @@ mod tests {
         }
 
         assert_eq!(tab.find_matches, vec![1]);
-        assert!(tab.find_automaton.as_ref().unwrap().is_match("error"));
-        assert!(!tab.find_automaton.as_ref().unwrap().is_match("ERROR"));
+        let highlighter = tab.find_highlighter.as_ref().unwrap();
+        assert!(!highlighter.spans("error").is_empty());
+        assert!(highlighter.spans("ERROR").is_empty());
 
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn template_action_starts_a_typed_log_search() {
+        let path = write_temp(
+            "2026-07-19T10:00:00.000Z INFO connected user=1\n\
+             2026-07-19T10:00:01.000Z INFO connected user=2\n\
+             2026-07-19T10:00:02.000Z WARN disconnected\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let template_id = tab.doc.template_at(0);
+
+        tab.start_template_id_search(template_id);
+        for _ in 0..200 {
+            if !tab.poll_find() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(tab.find_template_id_mode);
+        assert_eq!(tab.find_input, format!("T{{{template_id}}}"));
+        assert_eq!(tab.find_template_id, Some(template_id));
+        assert_eq!(tab.find_matches, vec![0, 1]);
+        assert!(tab.search_focus_requested);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn mcp_filter_sync_preserves_matcher_settings_and_lane_identity() {
+        let path = write_temp("ERROR api timeout\nerror api ok\nINFO api timeout\n");
+        let mut tab = LogTab::new(LogDocument::open(&path).unwrap());
+        let theme = Theme::dark();
+        let mut regex = search::FilterSpec::phrase("time.*");
+        regex.regex = true;
+        regex.case_sensitive = false;
+        let mut exclude = search::FilterSpec::phrase("INFO");
+        exclude.polarity = search::FilterPolarity::Exclude;
+        tab.apply_mcp_filters(
+            vec![regex.clone(), exclude.clone()],
+            FilterJoin::All,
+            &theme.filter_colors,
+        );
+        tab.lane_active = vec![false, true];
+        tab.apply_mcp_filters(vec![exclude.clone()], FilterJoin::Any, &theme.filter_colors);
+        assert_eq!(tab.filter_specs_snapshot(), vec![exclude]);
+        assert_eq!(tab.filter_join, FilterJoin::Any);
+        assert_eq!(tab.lane_active, vec![true]);
+        assert_eq!(tab.filter_regex, vec![false]);
+        assert_eq!(tab.filter_exclude, vec![true]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn mcp_search_installs_exact_scope_reveals_hits_and_rejects_stale_documents() {
+        let path = write_temp("ERROR one\nerror two\nother three\n");
+        let mut tab = LogTab::new(LogDocument::open(&path).unwrap());
+        tab.visible_lines = Some(Arc::new(vec![2]));
+        tab.start_find("other".into());
+        let cancel = tab.find_rx.as_ref().unwrap().1.clone();
+        let mut spec = search::FilterSpec::phrase("err.*");
+        spec.regex = true;
+        spec.case_sensitive = false;
+        let old_doc = Arc::clone(&tab.doc);
+        tab.apply_mcp_search(logotomy::mcp::GuiSearch {
+            doc: Arc::clone(&tab.doc),
+            spec: spec.clone(),
+            matches: vec![1],
+            first_page_line: Some(1),
+        });
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(tab.find_rx.is_none());
+        assert_eq!(tab.find_input, "err.*");
+        assert!(tab.find_regex);
+        assert!(!tab.find_case_sensitive);
+        assert_eq!(tab.find_matches, vec![1]);
+        assert_eq!(tab.visible_lines.as_ref().unwrap().as_slice(), &[1, 2]);
+        assert_eq!(tab.context_line, Some(1));
+        assert!(tab.search_focus_requested);
+        Arc::make_mut(&mut tab.doc).trim_left(1);
+        tab.apply_mcp_search(logotomy::mcp::GuiSearch {
+            doc: old_doc,
+            spec,
+            matches: vec![0],
+            first_page_line: Some(0),
+        });
+        assert_eq!(tab.find_matches, vec![1]);
         std::fs::remove_file(path).ok();
     }
 
@@ -2277,6 +3938,55 @@ mod tests {
         assert_eq!(tab.embedded_detections.len(), 1);
         assert_eq!(tab.embedded_detections[0].span.start.line, 30);
         assert_eq!(tab.embedded_detections[0].span.end.line, 112);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn trim_preserves_pins_and_undo_restores_the_window() {
+        let path = write_temp("one\ntwo\nthree\nfour\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.pins.push(PinEntry {
+            start_line: 0,
+            line_numbers: vec![0, 3],
+            start_ts: -1,
+            end_ts: -1,
+            comment: "keep this".into(),
+            unanchored: false,
+        });
+        tab.find_input = "three".into();
+        tab.find_query = "three".into();
+
+        tab.handle_trim(TrimAction::TrimLeft(2));
+        assert_eq!(tab.doc.trim_start, 2);
+        assert_eq!(tab.pins.len(), 1);
+        assert_eq!(tab.pins[0].line_numbers, vec![usize::MAX, 1]);
+        assert_eq!(tab.find_query, "three");
+
+        assert!(tab.undo_delete());
+        assert_eq!(tab.doc.trim_start, 0);
+        assert_eq!(tab.doc.trim_end, 4);
+        assert_eq!(tab.pins[0].line_numbers, vec![0, 3]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn clear_pins_is_undoable() {
+        let path = write_temp("one\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.pins.push(PinEntry {
+            start_line: 0,
+            line_numbers: vec![0],
+            start_ts: -1,
+            end_ts: -1,
+            comment: String::new(),
+            unanchored: false,
+        });
+        tab.clear_pins_with_undo();
+        assert!(tab.pins.is_empty());
+        assert!(tab.undo_delete());
+        assert_eq!(tab.pins.len(), 1);
         std::fs::remove_file(path).ok();
     }
 }
