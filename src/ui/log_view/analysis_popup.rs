@@ -374,15 +374,29 @@ mod tests {
     use super::*;
     use logotomy::core::document::LogDocument;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn test_tab() -> (LogTab, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
+    static NEXT_TEST_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
             "logotomy-analysis-popup-{}-{}.log",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn test_tab() -> (LogTab, PathBuf) {
+        let path = test_path();
         std::fs::write(&path, "first\nsecond\n").unwrap();
         (LogTab::new(LogDocument::open(&path).unwrap()), path)
+    }
+
+    #[test]
+    fn test_fixture_path_is_windows_safe() {
+        let path = test_path();
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        assert!(!file_name.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*']));
     }
 
     #[test]

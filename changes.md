@@ -1,3 +1,7 @@
+# Fix Windows analysis-popup tests
+
+Analysis-popup test fixtures now use an atomic numeric suffix rather than Rust test thread names, whose `::` separators are invalid in Windows filenames. A regression check keeps those fixture paths Windows-safe.
+
 # Prepare v0.1.4 release
 
 Set the application and native installer metadata to `0.1.4` so the release workflow can validate and package the consolidated feature set under the `v0.1.4` tag.
