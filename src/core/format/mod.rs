@@ -21,6 +21,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::core::masking::{LogMasker, MaskCache};
+use crate::core::record::{HeaderTime, RecordClassification};
 use crate::core::time::{CustomTimeFormat, TimeDetector, TimeFormat, TimeFormatKind};
 
 pub use cef::Cef;
@@ -31,6 +32,9 @@ pub use oslog_console::OsLogConsole;
 pub use plain::Plain;
 pub use rfc5424::Rfc5424;
 
+pub(crate) use json::{
+    classify_value_with_time_key, detect_time_key, normalize_value as normalize_json_value,
+};
 pub(crate) use plain::learn_header_slots;
 
 /// Per-document state shared with every format's `normalize` call.
@@ -65,6 +69,38 @@ pub trait LogFormat: Send + Sync {
     /// Whether this format uses the generic learned-header masking path.
     fn uses_learned_header(&self) -> bool {
         false
+    }
+
+    /// Classify an anchored record header independently from normalization.
+    /// Structured adapters with a non-leading/field timestamp override this;
+    /// timeless adapters use the default missing-time header result.
+    fn classify_header(
+        &self,
+        line: &str,
+        time_format: Option<&TimeFormatKind>,
+    ) -> Option<RecordClassification> {
+        if !self.matches(line) {
+            return None;
+        }
+        let time = if self.time_formats().is_empty() {
+            HeaderTime::Missing
+        } else {
+            let parser = time_format?;
+            match parser.recognize(line) {
+                Some(span) => match parser.extract(line) {
+                    Some((value, extracted)) if extracted == span => {
+                        HeaderTime::Known { value, span }
+                    }
+                    _ => HeaderTime::Invalid { span: Some(span) },
+                },
+                None => HeaderTime::Missing,
+            }
+        };
+        Some(RecordClassification::Header {
+            time,
+            header_span: 0..0,
+            message_span: 0..line.len(),
+        })
     }
 
     /// Normalize one line into (timestamp, Drain content).
@@ -106,6 +142,38 @@ impl FormatDetector {
         let needed = (lines.len() / 4).max(2).min(lines.len());
         if hits >= needed {
             fmt
+        } else {
+            &Plain
+        }
+    }
+
+    /// Detect a structured format from independent anchored header evidence.
+    /// Two matching headers are sufficient regardless of continuation count;
+    /// an equal top score is intentionally left unresolved as plain text.
+    pub fn detect_sparse<S: AsRef<str>>(sample: impl Iterator<Item = S>) -> &'static dyn LogFormat {
+        let lines: Vec<S> = sample.take(8_192).collect();
+        if lines.is_empty() {
+            return &Plain;
+        }
+        let mut scores = FORMATS
+            .iter()
+            .map(|format| {
+                let hits = lines
+                    .iter()
+                    .filter(|line| format.matches(line.as_ref()))
+                    .count();
+                (*format, hits)
+            })
+            .filter(|(_, hits)| *hits > 0)
+            .collect::<Vec<_>>();
+        scores.sort_by(|left, right| right.1.cmp(&left.1));
+        let Some((winner, hits)) = scores.first().copied() else {
+            return &Plain;
+        };
+        let tied = scores.get(1).is_some_and(|(_, other)| *other == hits);
+        let enough = hits >= 2 || (lines.len() <= 4 && hits == 1);
+        if enough && !tied {
+            winner
         } else {
             &Plain
         }

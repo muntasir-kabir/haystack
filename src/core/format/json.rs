@@ -5,7 +5,8 @@ use std::ops::Range;
 
 use serde_json::Value;
 
-use crate::core::time::{parse_time_param, TimeFormat};
+use crate::core::record::{HeaderTime, RecordClassification};
+use crate::core::time::{parse_time_param, TimeFormat, TimeFormatKind};
 
 use super::{FormatContext, LogFormat, Normalized};
 
@@ -25,13 +26,20 @@ impl LogFormat for Json {
     }
 
     fn matches(&self, line: &str) -> bool {
-        let t = line.trim_start();
-        t.starts_with('{') && t.trim_end().ends_with('}')
+        matches!(serde_json::from_str::<Value>(line), Ok(Value::Object(_)))
     }
 
     fn time_formats(&self) -> &'static [&'static dyn TimeFormat] {
         // Timestamp is a field inside the object, not a positional prefix.
         &[]
+    }
+
+    fn classify_header(
+        &self,
+        line: &str,
+        _time_format: Option<&TimeFormatKind>,
+    ) -> Option<RecordClassification> {
+        classify_header_with_time_key(line, None)
     }
 
     fn normalize<'a>(
@@ -51,6 +59,74 @@ impl LogFormat for Json {
         let ts = extract_ts(&value, line);
         let content = build_content(&value, line, ctx);
         Normalized { ts, content }
+    }
+}
+
+pub(crate) fn detect_time_key<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+    let objects = lines
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| match value {
+            Value::Object(object) => Some(object),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    TIME_KEYS
+        .iter()
+        .find(|key| objects.iter().any(|object| object.contains_key(**key)))
+        .map(|key| (*key).to_string())
+}
+
+pub(crate) fn classify_header_with_time_key(
+    line: &str,
+    selected_key: Option<&str>,
+) -> Option<RecordClassification> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    classify_value_with_time_key(&value, line, selected_key)
+}
+
+pub(crate) fn classify_value_with_time_key(
+    value: &Value,
+    line: &str,
+    selected_key: Option<&str>,
+) -> Option<RecordClassification> {
+    let Value::Object(object) = value else {
+        return None;
+    };
+    let selected = selected_key.or_else(|| {
+        TIME_KEYS
+            .iter()
+            .find(|key| object.contains_key(**key))
+            .copied()
+    });
+    let time = selected
+        .and_then(|key| object.get(key).map(|value| (key, value)))
+        .map_or(HeaderTime::Missing, |(key, value)| {
+            let span = json_field_value_span(line, key);
+            let parsed = match value {
+                Value::String(value) => parse_time_param(value),
+                Value::Number(value) => number_to_ms(value),
+                _ => None,
+            };
+            match (parsed, span) {
+                (Some(value), Some(span)) => HeaderTime::Known { value, span },
+                (_, span) => HeaderTime::Invalid { span },
+            }
+        });
+    Some(RecordClassification::Header {
+        time,
+        header_span: 0..0,
+        message_span: 0..line.len(),
+    })
+}
+
+pub(crate) fn normalize_value<'a>(
+    value: &Value,
+    line: &'a str,
+    ctx: &mut FormatContext<'_>,
+) -> Normalized<'a> {
+    Normalized {
+        ts: extract_ts(value, line),
+        content: build_content(value, line, ctx),
     }
 }
 

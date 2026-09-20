@@ -10,16 +10,16 @@ use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use logotomy::core::document::LogDocument;
-use logotomy::core::search::scan_document;
-use logotomy::core::timeline::{Timeline, TimelineDomain, DEFAULT_BUCKETS};
+use haystack::core::document::LogDocument;
+use haystack::core::search::scan_document;
+use haystack::core::timeline::{Timeline, TimelineDomain, DEFAULT_BUCKETS};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let (path, generated) = match args.next() {
         Some(p) => (std::path::PathBuf::from(p), false),
         None => {
-            let p = std::env::temp_dir().join("logotomy_bench.log");
+            let p = std::env::temp_dir().join("haystack_bench.log");
             generate(&p, 64 * 1024 * 1024);
             (p, true)
         }
@@ -78,13 +78,18 @@ fn main() {
             !toks.is_empty() && toks.iter().filter(|x| **x == "<*>").count() * 10 > toks.len() * 7
         })
         .count();
-    let mut top: Vec<&logotomy::core::document::TemplateInfo> = doc.templates.iter().collect();
+    let mut top: Vec<&haystack::core::document::TemplateInfo> = doc.templates.iter().collect();
     top.sort_by_key(|t| std::cmp::Reverse(t.count));
 
-    println!("┌─ logotomy bench ─────────────────────────────");
+    println!("┌─ haystack bench ─────────────────────────────");
     println!("│ file          : {}", doc.path.display());
     println!("│ size          : {:.1} MB", mb);
     println!("│ lines         : {}", doc.total_lines());
+    println!("│ record marks  : {}", doc.record_count());
+    println!(
+        "│ index payload : {:.2} MiB (logical; excludes capacity/mmap/mining)",
+        doc.index_payload_bytes() as f64 / (1024.0 * 1024.0)
+    );
     println!(
         "│ templates     : {} ({} >70% wildcards)",
         doc.templates.len(),
@@ -101,8 +106,8 @@ fn main() {
     println!(
         "│ time range    : {:?}",
         doc.time_range.map(|(a, b)| (
-            logotomy::core::time::format_ms(a),
-            logotomy::core::time::format_ms(b)
+            haystack::core::time::format_ms(a),
+            haystack::core::time::format_ms(b)
         ))
     );
     println!("│");

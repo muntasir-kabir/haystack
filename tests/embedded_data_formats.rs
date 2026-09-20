@@ -4,11 +4,11 @@
 
 use std::sync::atomic::AtomicBool;
 
-use logotomy::{AnalysisLimits, EmbeddedDataEngine, LogDocument};
+use haystack::{AnalysisLimits, EmbeddedDataEngine, LogDocument};
 
-fn detect(input: &str) -> Vec<logotomy::Detection> {
+fn detect(input: &str) -> Vec<haystack::Detection> {
     let path = std::env::temp_dir().join(format!(
-        "logotomy_embedded_format_{}_{}.log",
+        "haystack_embedded_format_{}_{}.log",
         std::process::id(),
         input.len()
     ));

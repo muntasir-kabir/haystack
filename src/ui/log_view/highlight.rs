@@ -1,13 +1,15 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use aho_corasick::AhoCorasick;
 use eframe::egui;
-use egui::{Color32, FontId, Stroke};
+use egui::{Color32, FontId};
 
-use logotomy::core::document::LogDocument;
-use logotomy::core::embedded_data::Detection;
-use logotomy::core::search::FilterHighlighter;
-use logotomy::core::settings::LogLineDisplayMode;
+use haystack::core::document::LogDocument;
+use haystack::core::embedded_data::Detection;
+use haystack::core::field_query::FieldQuery;
+use haystack::core::search::FilterHighlighter;
+use haystack::core::settings::LogLineDisplayMode;
 
 use crate::ui::app::model::{Filter, LogTab};
 use crate::ui::theme::Theme;
@@ -21,6 +23,10 @@ pub struct Highlights<'a> {
     pub filter_matcher: Option<&'a FilterHighlighter>,
     pub search_matcher: Option<&'a FilterHighlighter>,
     pub search_template_id: Option<u32>,
+    pub search_field: Option<&'a FieldQuery>,
+    pub search_rows: Option<&'a [u32]>,
+    pub filter_fields: Option<&'a [Option<FieldQuery>]>,
+    pub filter_rows: Option<&'a [Arc<Vec<u32>>]>,
     pub keyword_ac: Option<&'a AhoCorasick>,
     pub embedded: Option<&'a [Detection]>,
 }
@@ -32,6 +38,13 @@ impl<'a> Highlights<'a> {
             filter_matcher: tab.highlighter.as_deref(),
             search_matcher: tab.find_highlighter.as_deref(),
             search_template_id: tab.find_template_id,
+            search_field: tab
+                .find_active_spec
+                .as_ref()
+                .and_then(|spec| spec.field_query.as_ref()),
+            search_rows: Some(&tab.find_matches),
+            filter_fields: Some(&tab.filter_field_queries),
+            filter_rows: Some(&tab.matches),
             keyword_ac: tab.keyword_automaton.as_deref(),
             embedded: Some(tab.embedded_detections.as_slice()),
         }
@@ -43,6 +56,10 @@ impl<'a> Highlights<'a> {
             filter_matcher: matcher,
             search_matcher: None,
             search_template_id: None,
+            search_field: None,
+            search_rows: None,
+            filter_fields: None,
+            filter_rows: None,
             keyword_ac: None,
             embedded: None,
         }
@@ -113,30 +130,83 @@ pub fn line_job_for_mode(
             (start < end).then_some(start..end)
         });
 
+    let original = doc.trim_start + idx;
+    let field_range = |field: &str| -> Option<std::ops::Range<usize>> {
+        if !source_is_valid_utf8 {
+            return None;
+        }
+        let span = doc.record_field_span_on_line(original, field)?;
+        let base = doc.line_offsets[original];
+        let start = usize::try_from(span.start.checked_sub(base)?)
+            .ok()?
+            .min(visible_source_len);
+        let end = usize::try_from(span.end.checked_sub(base)?)
+            .ok()?
+            .min(visible_source_len);
+        (start < end).then_some(start..end)
+    };
+    let search_field_hit = highlights.search_field.is_some()
+        && highlights
+            .search_rows
+            .is_some_and(|rows| rows.binary_search(&(idx as u32)).is_ok());
+    let search_field_range = search_field_hit
+        .then(|| {
+            highlights
+                .search_field
+                .and_then(|query| field_range(&query.field))
+        })
+        .flatten();
+    let mut filter_field_ranges = Vec::new();
+    if let (Some(fields), Some(rows)) = (highlights.filter_fields, highlights.filter_rows) {
+        for (index, query) in fields.iter().enumerate() {
+            if let Some(query) = query {
+                if rows
+                    .get(index)
+                    .is_some_and(|rows| rows.binary_search(&(idx as u32)).is_ok())
+                {
+                    filter_field_ranges.push((
+                        index,
+                        field_range(&query.field).unwrap_or(0..visible_source_len),
+                    ));
+                }
+            }
+        }
+    }
+    let search_full_line = highlights
+        .search_template_id
+        .is_some_and(|template_id| doc.template_at(idx) == template_id)
+        || (search_field_hit && search_field_range.is_none());
+
     let base = theme.log_text;
     match (
         highlights.filter_matcher,
         highlights.search_matcher,
         highlights.keyword_ac,
     ) {
-        (None, None, None) => append_segment_with_annotations(
-            &mut job,
-            &text,
-            0..text.len(),
-            fmt(base),
-            &embedded_ranges,
-            timestamp_range.as_ref(),
-            theme.embedded_data,
-            theme.timestamp,
-        ),
+        (None, None, None)
+            if !search_full_line
+                && search_field_range.is_none()
+                && filter_field_ranges.is_empty() =>
+        {
+            append_segment_with_annotations(
+                &mut job,
+                &text,
+                0..text.len(),
+                fmt(base),
+                &embedded_ranges,
+                timestamp_range.as_ref(),
+                theme.embedded_data,
+                theme.timestamp,
+            )
+        }
         (filter_matcher, search_matcher, keyword_ac) => append_highlighted(
             &mut job,
             &text,
             filter_matcher,
             search_matcher,
-            highlights
-                .search_template_id
-                .is_some_and(|template_id| doc.template_at(idx) == template_id),
+            search_full_line,
+            search_field_range,
+            &filter_field_ranges,
             keyword_ac,
             highlights.filters,
             fmt(base),
@@ -255,6 +325,8 @@ fn append_highlighted(
     filter_matcher: Option<&FilterHighlighter>,
     search_matcher: Option<&FilterHighlighter>,
     search_full_line: bool,
+    search_field_range: Option<std::ops::Range<usize>>,
+    filter_field_ranges: &[(usize, std::ops::Range<usize>)],
     keyword_ac: Option<&AhoCorasick>,
     filters: &[Filter],
     base_fmt: egui::text::TextFormat,
@@ -273,6 +345,8 @@ fn append_highlighted(
             0..text.len(),
             HighlightKind::Search,
         );
+    } else if let Some(range) = search_field_range {
+        add_highlight_span(&mut spans, &mut covered, range, HighlightKind::Search);
     } else if let Some(matcher) = search_matcher {
         for (_, range) in matcher.spans(text) {
             add_highlight_span(&mut spans, &mut covered, range, HighlightKind::Search);
@@ -297,6 +371,14 @@ fn append_highlighted(
                 HighlightKind::Filter(filter),
             );
         }
+    }
+    for (filter, range) in filter_field_ranges {
+        add_highlight_span(
+            &mut spans,
+            &mut covered,
+            range.clone(),
+            HighlightKind::Filter(*filter),
+        );
     }
 
     if spans.is_empty() {
@@ -338,21 +420,30 @@ fn append_highlighted(
                     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 51);
                 egui::text::TextFormat {
                     font_id: font_id.clone(),
-                    color,
-                    background,
+                    // Filter colours identify the lane; they are not used as
+                    // foreground text colours because some categorical hues
+                    // do not provide normal-text contrast on light surfaces.
+                    color: base_fmt.color,
+                    background: preserve_selection_background(background, base_fmt.background),
                     ..Default::default()
                 }
             }
             HighlightKind::Search => egui::text::TextFormat {
                 font_id: font_id.clone(),
                 color: base_fmt.color,
-                background: theme.search_highlight_bg,
+                background: preserve_selection_background(
+                    theme.search_highlight_bg,
+                    base_fmt.background,
+                ),
                 ..Default::default()
             },
             HighlightKind::Keyword => egui::text::TextFormat {
                 font_id: font_id.clone(),
                 color: base_fmt.color,
-                background: theme.keyword_highlight_bg,
+                background: preserve_selection_background(
+                    theme.keyword_highlight_bg,
+                    base_fmt.background,
+                ),
                 ..Default::default()
             },
         };
@@ -382,6 +473,26 @@ fn append_highlighted(
     }
 }
 
+/// Blend a translucent local cue over the selected-row fill so a selected row
+/// remains visibly selected even where a search/filter span is painted.
+fn preserve_selection_background(highlight: Color32, selection: Color32) -> Color32 {
+    if selection == Color32::TRANSPARENT || highlight == Color32::TRANSPARENT {
+        return if highlight == Color32::TRANSPARENT {
+            selection
+        } else {
+            highlight
+        };
+    }
+    let alpha = f32::from(highlight.a()) / 255.0;
+    let inverse = 1.0 - alpha;
+    Color32::from_rgba_unmultiplied(
+        (f32::from(highlight.r()) * alpha + f32::from(selection.r()) * inverse).round() as u8,
+        (f32::from(highlight.g()) * alpha + f32::from(selection.g()) * inverse).round() as u8,
+        (f32::from(highlight.b()) * alpha + f32::from(selection.b()) * inverse).round() as u8,
+        255,
+    )
+}
+
 fn append_segment_with_annotations(
     job: &mut egui::text::LayoutJob,
     text: &str,
@@ -389,8 +500,8 @@ fn append_segment_with_annotations(
     format: egui::text::TextFormat,
     embedded_ranges: &[std::ops::Range<usize>],
     timestamp_range: Option<&std::ops::Range<usize>>,
-    embedded_color: Color32,
-    timestamp_color: Color32,
+    _embedded_color: Color32,
+    _timestamp_color: Color32,
 ) {
     if range.is_empty() {
         return;
@@ -415,18 +526,11 @@ fn append_segment_with_annotations(
         if segment.is_empty() {
             continue;
         }
-        let mut segment_format = format.clone();
-        let is_timestamp = timestamp_range.is_some_and(|timestamp| {
-            timestamp.start < segment.end && timestamp.end > segment.start
-        });
-        if is_timestamp {
-            segment_format.underline = Stroke::new(1.0, timestamp_color);
-        } else if embedded_ranges
-            .iter()
-            .any(|embedded| embedded.start < segment.end && embedded.end > segment.start)
-        {
-            segment_format.underline = Stroke::new(1.0, embedded_color);
-        }
+        let segment_format = format.clone();
+        // Inspectable source values use a local dotted cue painted by the row
+        // renderer. Keeping that cue out of every text span avoids persistent
+        // timestamp and payload underlines while preserving a keyboard/context
+        // menu path and a stronger hover state.
         job.append(&text[segment], 0.0, segment_format);
     }
 }

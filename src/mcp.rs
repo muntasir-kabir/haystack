@@ -1,6 +1,6 @@
-//! logotomy MCP server — embedded mode (no separate binary needed).
+//! haystack MCP server — embedded mode (no separate binary needed).
 //!
-//! Run either via the CLI (`logotomy --mcp`) or in-process from the GUI.
+//! Run either via the CLI (`haystack --mcp`) or in-process from the GUI.
 //! Provides an MCP (Model Context Protocol) server over stdio, allowing AI
 //! assistants to load, search, and query log files.
 //!
@@ -11,7 +11,7 @@
 //!
 //! The server has two modes:
 //!   - **Headless** (default): load_log, list_logs, close_log (with `log_id`)
-//!     plus the shared analysis tools. Used via `logotomy --mcp`.
+//!     plus the shared analysis tools. Used via `haystack --mcp`.
 //!   - **GUI** (via `set_active_doc`): the shared analysis tools plus `trim`,
 //!     operating on a single active document without `log_id` or
 //!     load/list/close. Used when the MCP server is started from within the GUI.
@@ -84,6 +84,7 @@ use serde_json::{json, Value};
 use crate::core::document::LogDocument;
 use crate::core::search;
 use crate::core::time::{format_ms, parse_time_param};
+use crate::core::time_query::{select_source_order, TimeBounds};
 
 mod bridge;
 mod search_api;
@@ -130,7 +131,7 @@ pub struct PinAnalysis {
 }
 
 // ---------------------------------------------------------------------------
-// File logger — implements the `log::Log` trait to write to logotomy.log
+// File logger — implements the `log::Log` trait to write to haystack.log
 // ---------------------------------------------------------------------------
 
 use log::{Level, Metadata, Record};
@@ -184,12 +185,12 @@ impl log::Log for FileLogger {
 fn log_init() -> String {
     let dir = crate::core::settings::Settings::log_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("logotomy.log");
+    let path = dir.join("haystack.log");
     let path_str = path.to_string_lossy().to_string();
 
     // Write header (append-only; never truncate).
     let header = format!(
-        "=== logotomy-mcp started (PID {}) ===\n",
+        "=== haystack-mcp started (PID {}) ===\n",
         std::process::id()
     );
     let _ = std::fs::OpenOptions::new()
@@ -297,7 +298,7 @@ pub struct ServerState {
     /// polls this flag to keep the UI in sync with MCP-originated changes.
     /// GUI-originated mutations (trim/append) flow the other way: the GUI
     /// pushes the mutated Arc back via `set_active_doc` (see
-    /// `LogotomyApp::sync_mcp_active_doc`) and clears this flag itself.
+    /// `HaystackApp::sync_mcp_active_doc`) and clears this flag itself.
     pub active_doc_dirty: Arc<AtomicBool>,
     /// Per-log keyword filter list; keyed by `log_id` in headless mode and by
     /// `"_active"` in GUI mode. Drives the `with_filtered_log` filtered view
@@ -311,7 +312,7 @@ pub struct ServerState {
     /// Set to true when the `_active` filter set changed (MCP→GUI direction).
     /// The GUI polls this flag to re-apply MCP-originated filter edits to the
     /// served tab. GUI-originated filter edits flow the other way (see
-    /// `LogotomyApp::sync_mcp_filters`) and clear this flag themselves.
+    /// `HaystackApp::sync_mcp_filters`) and clear this flag themselves.
     pub filters_dirty: Arc<AtomicBool>,
     /// Analysis cards for the GUI's currently served Pin tab. This is GUI-only
     /// state: standalone logs deliberately do not retain user annotations.
@@ -471,6 +472,12 @@ impl ServerState {
                 "start_epoch_ms": a, "end_epoch_ms": b,
             })),
             "template_count": doc.templates.len(),
+            "record_profile": doc.record_profile().map(|profile| json!({
+                "id": profile.id,
+                "revision": profile.revision,
+                "name": profile.name,
+            })),
+            "detection": doc.detection,
             "top_templates": top,
         })
     }
@@ -666,7 +673,7 @@ impl ServerState {
 pub fn run_stdio(state: Arc<Mutex<ServerState>>) {
     log_init();
     set_panic_hook();
-    log::info!("logotomy-mcp stdio mode started");
+    log::info!("haystack-mcp stdio mode started");
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -739,7 +746,7 @@ fn route_stdio_request(
     let forward_to_gui = gui_client.is_some()
         && (method == "tools/call"
             || (method == "resources/read"
-                && params.get("uri").and_then(Value::as_str) == Some("logotomy://session")));
+                && params.get("uri").and_then(Value::as_str) == Some("haystack://session")));
     if forward_to_gui {
         let result = gui_client.as_ref().unwrap().request(message);
         return match result {
@@ -799,7 +806,7 @@ where
 }
 
 /// Run the GUI-owned private IPC socket. This is not an MCP transport: agent
-/// clients only connect to `logotomy --mcp` over stdio. Each short-lived local
+/// clients only connect to `haystack --mcp` over stdio. Each short-lived local
 /// connection carries an authenticated JSON envelope containing one JSON-RPC
 /// request, which is dispatched against the GUI's live state.
 pub fn run_gui_ipc(
@@ -920,7 +927,7 @@ fn initialize_result(params: &Value, state: &ServerState) -> Value {
         "protocolVersion": version,
         "capabilities": server_capabilities(),
         "serverInfo": {
-            "name": "logotomy-mcp",
+            "name": "haystack-mcp",
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": mode_instructions(state)
@@ -961,7 +968,7 @@ fn server_discover_result(state: &ServerState) -> Value {
         "capabilities": server_capabilities(),
         "_meta": {
             "io.modelcontextprotocol/serverInfo": {
-                "name": "logotomy-mcp",
+                "name": "haystack-mcp",
                 "version": env!("CARGO_PKG_VERSION")
             }
         },
@@ -972,7 +979,7 @@ fn server_discover_result(state: &ServerState) -> Value {
 }
 
 fn mode_instructions(_state: &ServerState) -> &'static str {
-    "Call session_info first. Logotomy starts in standalone mode: call load_log with an absolute path and retain its log_id. To analyze the log selected in a running Logotomy GUI, call attach_gui_session with the temporary session ID copied from the GUI. In GUI-attached mode, the GUI already supplies the open log: load_log, list_logs, and close_log are unavailable, and log_id is not needed. Suggested approach: understand the user's problem and Pin-tab findings with get_analysis; explore the log shape with summarize_log (with_filtered_log=false for full-log orientation) and targeted search; then use filters (filters_add) and trim when a hypothesis merits a narrower scope. Request bounded raw_log only for exact evidence, and add useful evidence-backed root-cause conclusions with add_analysis."
+    "Call session_info first. Haystack starts in standalone mode: call load_log with an absolute path and retain its log_id. To analyze the log selected in a running Haystack GUI, call attach_gui_session with the temporary session ID copied from the GUI. In GUI-attached mode, the GUI already supplies the open log: load_log, list_logs, and close_log are unavailable, and log_id is not needed. Suggested approach: understand the user's problem and Pin-tab findings with get_analysis; explore the log shape with summarize_log (with_filtered_log=false for full-log orientation) and targeted search; then use filters (filters_add) and trim when a hypothesis merits a narrower scope. Request bounded raw_log only for exact evidence, and add useful evidence-backed root-cause conclusions with add_analysis."
 }
 
 fn session_info_payload(state: &ServerState) -> Value {
@@ -992,7 +999,7 @@ fn session_info_payload(state: &ServerState) -> Value {
             "active_log": active_log,
             "filter_count": state.get_filters("_active").len(),
             "active_log_can_change": true,
-            "lifecycle": "Owned by the running Logotomy GUI; access ends when MCP is stopped or the GUI exits."
+            "lifecycle": "Owned by the running Haystack GUI; access ends when MCP is stopped or the GUI exits."
         })
     } else {
         json!({
@@ -1011,15 +1018,15 @@ fn resources_list() -> Value {
     json!({
         "resources": [
             {
-                "uri": "logotomy://session",
-                "name": "Logotomy MCP session",
+                "uri": "haystack://session",
+                "name": "Haystack MCP session",
                 "description": "Current standalone or GUI-attached target, active log, filters, and temporary-session lifecycle.",
                 "mimeType": "application/json"
             },
             {
-                "uri": "logotomy://guide",
-                "name": "Logotomy investigation guide",
-                "description": "Compact, token-efficient workflow for investigating logs with Logotomy tools.",
+                "uri": "haystack://guide",
+                "name": "Haystack investigation guide",
+                "description": "Compact, token-efficient workflow for investigating logs with Haystack tools.",
                 "mimeType": "text/markdown"
             }
         ]
@@ -1032,14 +1039,14 @@ fn resource_read(params: &Value, state: &ServerState) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "missing or invalid resource uri".to_string())?;
     let (mime_type, text) = match uri {
-        "logotomy://session" => (
+        "haystack://session" => (
             "application/json",
             serde_json::to_string_pretty(&session_info_payload(state))
                 .map_err(|e| format!("failed to encode session resource: {e}"))?,
         ),
-        "logotomy://guide" => (
+        "haystack://guide" => (
             "text/markdown",
-            "# Logotomy investigation guide\n\nCall `session_info` first. In `standalone` mode, call `load_log` and retain its `log_id`. In `gui_attached` mode, the GUI already provides the open log: `load_log`, `list_logs`, and `close_log` are unavailable, and `log_id` is not needed.\n\nSuggested approach, not a required checklist: understand the user's question and Pin-tab findings with `get_analysis`; explore the log shape with `summarize_log` (`with_filtered_log=false` for full-log orientation) and targeted `search`; then use filters (`filters_add`), anomalies, histograms, templates, sequences, and `trim` as they help test a hypothesis and narrow the scope. Request bounded `raw_log` only for exact evidence, honor pagination and `truncated`, and add useful evidence-backed root-cause conclusions with `add_analysis`.\n".to_string(),
+            "# Haystack investigation guide\n\nCall `session_info` first. In `standalone` mode, call `load_log` and retain its `log_id`. In `gui_attached` mode, the GUI already provides the open log: `load_log`, `list_logs`, and `close_log` are unavailable, and `log_id` is not needed.\n\nSuggested approach, not a required checklist: understand the user's question and Pin-tab findings with `get_analysis`; explore the log shape with `summarize_log` (`with_filtered_log=false` for full-log orientation) and targeted `search`; then use filters (`filters_add`), anomalies, histograms, templates, sequences, and `trim` as they help test a hypothesis and narrow the scope. Request bounded `raw_log` only for exact evidence, honor pagination and `truncated`, and add useful evidence-backed root-cause conclusions with `add_analysis`.\n".to_string(),
         ),
         _ => return Err(format!("unknown resource uri '{uri}'")),
     };
@@ -1150,7 +1157,7 @@ fn dispatch(name: &str, args: &Value, state: &mut ServerState) -> Result<Value, 
     }
     if matches!(name, "attach_gui_session" | "detach_gui_session") {
         return Err(format!(
-            "{name} is available only through the public `logotomy --mcp` stdio server"
+            "{name} is available only through the public `haystack --mcp` stdio server"
         ));
     }
     if state.is_gui_mode() && args.get("log_id").is_some() {
@@ -1265,7 +1272,45 @@ fn arg_time(args: &Value, key: &str) -> Result<Option<i64>, String> {
 fn tool_load_log(args: &Value, state: &mut ServerState) -> Result<Value, String> {
     let path = arg_str(args, "path")?;
     log::info!("load_log: {path}");
-    let doc = LogDocument::open(Path::new(path))?;
+    let inline = args.get("record_profile").filter(|value| !value.is_null());
+    let preset_id = args.get("profile_id").and_then(Value::as_str);
+    if inline.is_some() && preset_id.is_some() {
+        return Err("pass either record_profile or profile_id, not both".into());
+    }
+    let profile = if let Some(value) = inline {
+        Some(
+            serde_json::from_value::<crate::core::record::RecordProfile>(value.clone())
+                .map_err(|error| format!("invalid record_profile: {error}"))?,
+        )
+    } else if let Some(id) = preset_id {
+        Some(
+            crate::core::record::load_presets(
+                &crate::core::settings::Settings::record_profiles_path(),
+            )?
+            .into_iter()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| format!("record profile {id:?} is not saved"))?,
+        )
+    } else {
+        None
+    };
+    let doc = if let Some(profile) = profile {
+        let compiled = crate::core::record::CompiledProfile::compile(profile)
+            .map_err(|error| format!("invalid record profile: {error}"))?;
+        let custom = crate::core::settings::Settings::load_custom_date_formats()
+            .into_iter()
+            .filter_map(|definition| definition.compile().ok())
+            .collect::<Vec<_>>();
+        LogDocument::open_with_record_profile(
+            Path::new(path),
+            crate::core::document::ParsingConfig::default(),
+            &custom,
+            compiled,
+            None,
+        )?
+    } else {
+        LogDocument::open(Path::new(path))?
+    };
     let log_id = state.add_doc(doc);
     let stats = state.doc_stats(&*state.get_doc(&log_id)?);
     Ok(json!({
@@ -1644,85 +1689,83 @@ fn seq_runs_to_items(doc: &LogDocument, runs: &[Run], max_entries: usize) -> (Ve
     (items, covered)
 }
 
-/// Resolve an optional `start`/`end` bound into a 0-based, trim-relative line
-/// index. Integers are 1-based line numbers (clamped to the visible window);
-/// strings are parsed as timestamps and binary-searched against the
-/// forward-filled per-line timestamps. `is_end` selects the inclusive end
-/// (last line with ts <= t) vs. the inclusive start (first line with ts >= t).
-/// Returns `Ok(None)` when the argument is absent/null.
-fn resolve_bound(
-    v: Option<&Value>,
+#[derive(Debug)]
+struct QuerySelection {
+    lines: Vec<usize>,
+    source: std::ops::Range<usize>,
+    time_bounds: Option<TimeBounds>,
+}
+
+/// Resolve mixed line/time bounds without assuming event times are monotonic.
+/// Time predicates may yield discontiguous physical lines; their IDs remain in
+/// source order and are intersected with the active filtered view afterward.
+fn resolve_query_selection(
+    args: &Value,
     doc: &LogDocument,
-    is_end: bool,
-) -> Result<Option<usize>, String> {
+    filtered: Option<&[usize]>,
+) -> Result<QuerySelection, String> {
     let n = doc.total_lines();
-    if n == 0 {
-        return Ok(None);
-    }
-    match v {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(num)) => {
-            let line = num
-                .as_u64()
-                .ok_or_else(|| "line bound must be a non-negative integer".to_string())?
-                as usize;
-            if line == 0 {
-                return Err("line numbers are 1-based (0 is invalid)".to_string());
+    let mut source = 0..n;
+    let mut times = TimeBounds::default();
+    let mut has_time = false;
+    let parse = |value: &Value| -> Result<Result<usize, i64>, String> {
+        match value {
+            Value::Number(number) => {
+                let line = number
+                    .as_u64()
+                    .ok_or_else(|| "line bound must be a non-negative integer".to_string())?
+                    as usize;
+                if line == 0 {
+                    return Err("line numbers are 1-based (0 is invalid)".to_string());
+                }
+                Ok(Ok((line - 1).min(n.saturating_sub(1))))
             }
-            Ok(Some((line - 1).min(n - 1)))
+            Value::String(raw) => parse_time_param(raw)
+                .map(Err)
+                .ok_or_else(|| format!("cannot parse '{raw}' as a time")),
+            _ => Err("bound must be an integer (line) or string (time)".to_string()),
         }
-        Some(Value::String(s)) => {
-            let t = parse_time_param(s).ok_or_else(|| format!("cannot parse '{s}' as a time"))?;
-            // ts_at is forward-filled and monotonically non-decreasing, so a
-            // binary search finds the boundary in O(log n).
-            if is_end {
-                // Last visible index whose ts <= t: first index with ts > t, minus 1.
-                let (mut lo, mut hi) = (0usize, n);
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if doc.ts_at(mid) <= t {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                Ok(Some(lo.saturating_sub(1)))
-            } else {
-                // First visible index whose ts >= t.
-                let (mut lo, mut hi) = (0usize, n);
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if doc.ts_at(mid) < t {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                Ok(Some(lo.min(n - 1)))
+    };
+    if let Some(value) = args.get("start").filter(|value| !value.is_null()) {
+        match parse(value)? {
+            Ok(line) => source.start = line,
+            Err(time) => {
+                times.start = Some(time);
+                has_time = true;
             }
         }
-        Some(_) => Err("bound must be an integer (line) or string (time)".to_string()),
     }
-}
-
-/// Resolve an optional `start`/`end` pair into a `(lo, hi)` half-open visible
-/// range, defaulting to the full visible window.
-fn resolve_range(args: &Value, doc: &LogDocument) -> Result<(usize, usize), String> {
-    let n = doc.total_lines();
-    let lo = resolve_bound(args.get("start"), doc, false)?.unwrap_or(0);
-    let hi = resolve_bound(args.get("end"), doc, true)?
-        .map(|e| e + 1)
-        .unwrap_or(n)
-        .min(n);
-    if hi <= lo {
-        return Err("empty range (end is before start)".to_string());
+    if let Some(value) = args.get("end").filter(|value| !value.is_null()) {
+        match parse(value)? {
+            Ok(line) => source.end = line.saturating_add(1).min(n),
+            Err(time) => {
+                times.end = Some(time);
+                has_time = true;
+            }
+        }
     }
-    Ok((lo, hi))
-}
+    if source.end < source.start {
+        return Err("end is before start".to_string());
+    }
+    times.validate()?;
 
-/// (min, max) forward-filled timestamp over the visible range `[lo, hi)`.
-fn range_time(doc: &LogDocument, lo: usize, hi: usize) -> Option<(i64, i64)> {
-    time_range_of_lines(doc, lo..hi)
+    let mut lines = if has_time {
+        select_source_order(doc, source.clone(), times, None)?
+            .lines
+            .into_iter()
+            .map(|line| line as usize)
+            .collect::<Vec<_>>()
+    } else {
+        (source.clone()).collect::<Vec<_>>()
+    };
+    if let Some(filtered) = filtered {
+        lines.retain(|line| filtered.binary_search(line).is_ok());
+    }
+    Ok(QuerySelection {
+        lines,
+        source,
+        time_bounds: has_time.then_some(times),
+    })
 }
 
 /// (min, max) forward-filled timestamp over an arbitrary line-index iterator
@@ -1745,11 +1788,6 @@ fn time_range_of_lines(
     } else {
         None
     }
-}
-
-/// Per-template occurrence counts within the visible range `[lo, hi)`.
-fn template_counts_in_range(doc: &LogDocument, lo: usize, hi: usize) -> HashMap<u32, usize> {
-    template_counts_of(doc, lo..hi)
 }
 
 /// Per-template occurrence counts over an arbitrary line-index iterator (used
@@ -1820,27 +1858,6 @@ struct Run {
     end: usize, // inclusive
     tpl: u32,
     count: usize,
-}
-
-/// Group the lines in `[lo, hi)` into template runs.
-fn build_runs(doc: &LogDocument, lo: usize, hi: usize) -> Vec<Run> {
-    let mut runs = Vec::new();
-    let mut i = lo;
-    while i < hi {
-        let tpl = doc.template_at(i);
-        let mut j = i + 1;
-        while j < hi && doc.template_at(j) == tpl {
-            j += 1;
-        }
-        runs.push(Run {
-            start: i,
-            end: j - 1,
-            tpl,
-            count: j - i,
-        });
-        i = j;
-    }
-    runs
 }
 
 /// Group any sorted line-index list (e.g. the filtered view) into template
@@ -1940,27 +1957,13 @@ fn tool_summarize(args: &Value, state: &mut ServerState) -> Result<Value, String
     if doc.total_lines() == 0 {
         return Err("log is empty".to_string());
     }
-    let (lo, hi) = resolve_range(args, &doc)?;
-    // When filters are set, every metric below is restricted to the union of
-    // their matches; the "Everything Else" lane is never included.
-    let (vis_a, vis_b) = match &vis {
-        Some(v) => (
-            v.partition_point(|&i| i < lo),
-            v.partition_point(|&i| i < hi),
-        ),
-        None => (0, 0),
-    };
-    let m = match &vis {
-        Some(_) => vis_b - vis_a,
-        None => hi - lo,
-    };
+    let selection = resolve_query_selection(args, &doc, vis.as_deref().map(Vec::as_slice))?;
+    let selected = &selection.lines;
+    let m = selected.len();
 
     // Per-template occurrence counts within the analysed (possibly filtered)
     // range.
-    let counts = match &vis {
-        Some(v) => template_counts_of(&doc, v[vis_a..vis_b].iter().copied()),
-        None => template_counts_in_range(&doc, lo, hi),
-    };
+    let counts = template_counts_of(&doc, selected.iter().copied());
 
     // Ranked templates (id, pattern, example_line, range count), count > 0.
     let mut ranked: Vec<(u32, String, usize, usize)> = doc
@@ -2014,22 +2017,10 @@ fn tool_summarize(args: &Value, state: &mut ServerState) -> Result<Value, String
     // Top-3 time gaps between consecutive (forward-filled) timestamps within
     // the analysed (possibly filtered) lines.
     let mut gaps: Vec<(i64, usize)> = Vec::new();
-    match &vis {
-        Some(v) => {
-            for w in v[vis_a..vis_b].windows(2) {
-                let (a, b) = (doc.ts_at(w[0]), doc.ts_at(w[1]));
-                if a >= 0 && b > a {
-                    gaps.push((b - a, w[1]));
-                }
-            }
-        }
-        None => {
-            for i in (lo + 1)..hi {
-                let (a, b) = (doc.ts_at(i - 1), doc.ts_at(i));
-                if a >= 0 && b > a {
-                    gaps.push((b - a, i));
-                }
-            }
+    for window in selected.windows(2) {
+        let (a, b) = (doc.ts_at(window[0]), doc.ts_at(window[1]));
+        if a >= 0 && b > a {
+            gaps.push((b - a, window[1]));
         }
     }
     gaps.sort_by_key(|g| std::cmp::Reverse(g.0));
@@ -2041,10 +2032,7 @@ fn tool_summarize(args: &Value, state: &mut ServerState) -> Result<Value, String
 
     // Densest 60-second window within the analysed (possibly filtered) range.
     let densest = {
-        let base = match &vis {
-            Some(v) => time_range_of_lines(&doc, v[vis_a..vis_b].iter().copied()),
-            None => range_time(&doc, lo, hi),
-        };
+        let base = time_range_of_lines(&doc, selected.iter().copied());
         base.and_then(|(start, _)| {
             let mut buckets: HashMap<i64, usize> = HashMap::new();
             let mut tick = |i: usize| {
@@ -2053,17 +2041,8 @@ fn tool_summarize(args: &Value, state: &mut ServerState) -> Result<Value, String
                     *buckets.entry((t - start) / 60_000).or_default() += 1;
                 }
             };
-            match &vis {
-                Some(v) => {
-                    for &i in &v[vis_a..vis_b] {
-                        tick(i);
-                    }
-                }
-                None => {
-                    for i in lo..hi {
-                        tick(i);
-                    }
-                }
+            for &line in selected {
+                tick(line);
             }
             buckets.into_iter().max_by_key(|(_, c)| *c).map(|(b, c)| {
                 json!({
@@ -2077,17 +2056,14 @@ fn tool_summarize(args: &Value, state: &mut ServerState) -> Result<Value, String
 
     let mut out = state.doc_stats(&doc);
     out["lines"] = json!(m);
-    out["time_range"] = match &vis {
-        Some(v) => time_range_of_lines(&doc, v[vis_a..vis_b].iter().copied()),
-        None => range_time(&doc, lo, hi),
-    }
-    .map(|(a, b)| {
-        json!({
-            "start": format_ms(a), "end": format_ms(b),
-            "start_epoch_ms": a, "end_epoch_ms": b,
+    out["time_range"] = time_range_of_lines(&doc, selected.iter().copied())
+        .map(|(a, b)| {
+            json!({
+                "start": format_ms(a), "end": format_ms(b),
+                "start_epoch_ms": a, "end_epoch_ms": b,
+            })
         })
-    })
-    .unwrap_or(Value::Null);
+        .unwrap_or(Value::Null);
     // Keep template_count consistent with load_log/doc_stats: it describes the
     // indexed document. The number that actually contributed to this analysis
     // is reported separately, which avoids confusing 116-vs-115 results when
@@ -2095,7 +2071,11 @@ fn tool_summarize(args: &Value, state: &mut ServerState) -> Result<Value, String
     out["template_count"] = json!(doc.templates.len());
     out["matched_template_count"] = json!(ranked.len());
     out["top_templates"] = json!(top_templates);
-    out["window"] = json!({ "start_line": lo + 1, "end_line": hi });
+    out["window"] = json!({
+        "start_line": selected.first().map_or(selection.source.start + 1, |line| line + 1),
+        "end_line": selected.last().map_or(selection.source.start, |line| line + 1),
+        "time_filtered": selection.time_bounds.is_some(),
+    });
     out["error_template_count"] = json!(err_tpls.len());
     out["error_line_count"] = json!(error_line_count);
     out["error_templates"] = json!(error_templates);
@@ -2177,54 +2157,27 @@ fn tool_log_sequence(args: &Value, state: &mut ServerState) -> Result<Value, Str
     if doc.total_lines() == 0 {
         return Err("log is empty".to_string());
     }
-    let (lo, hi) = resolve_range(args, &doc)?;
+    let selection = resolve_query_selection(args, &doc, vis.as_deref().map(Vec::as_slice))?;
     let max_entries = arg_usize(args, "max_entries", HARD_MAX_SEQUENCE)?.min(HARD_MAX_SEQUENCE);
     let collapse = args
         .get("collapse")
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    // Runs are built over the filtered lines only when a filtered view is set.
-    let (items, covered, total_entries) = match &vis {
-        Some(v) => {
-            let a = v.partition_point(|&i| i < lo);
-            let b = v.partition_point(|&i| i < hi);
-            let slice = &v[a..b];
-            let total = slice.len();
-            let (items, covered) = if collapse {
-                seq_runs_to_items(&doc, &build_runs_of(&doc, slice), max_entries)
-            } else {
-                let mut items = Vec::new();
-                let mut covered = 0usize;
-                for &i in slice {
-                    if items.len() >= max_entries {
-                        break;
-                    }
-                    items.push(seq_entry(&doc, i));
-                    covered += 1;
-                }
-                (items, covered)
-            };
-            (items, covered, total)
+    let total_entries = selection.lines.len();
+    let (items, covered) = if collapse {
+        seq_runs_to_items(&doc, &build_runs_of(&doc, &selection.lines), max_entries)
+    } else {
+        let mut items = Vec::new();
+        let mut covered = 0usize;
+        for &line in &selection.lines {
+            if items.len() >= max_entries {
+                break;
+            }
+            items.push(seq_entry(&doc, line));
+            covered += 1;
         }
-        None => {
-            let total = hi - lo;
-            let (items, covered) = if collapse {
-                seq_runs_to_items(&doc, &build_runs(&doc, lo, hi), max_entries)
-            } else {
-                let mut items = Vec::new();
-                let mut covered = 0usize;
-                for i in lo..hi {
-                    if items.len() >= max_entries {
-                        break;
-                    }
-                    items.push(seq_entry(&doc, i));
-                    covered += 1;
-                }
-                (items, covered)
-            };
-            (items, covered, total)
-        }
+        (items, covered)
     };
     let truncated = covered < total_entries;
     let size_bytes = serde_json::to_vec(&Value::Array(items.clone()))
@@ -2232,8 +2185,8 @@ fn tool_log_sequence(args: &Value, state: &mut ServerState) -> Result<Value, Str
         .unwrap_or(0);
 
     let mut out = json!({
-        "start_line": lo + 1,
-        "end_line": hi,
+        "start_line": selection.lines.first().map_or(selection.source.start + 1, |line| line + 1),
+        "end_line": selection.lines.last().map_or(selection.source.start, |line| line + 1),
         "total_entries": total_entries,
         "returned": covered,
         "truncated": truncated,
@@ -2259,52 +2212,35 @@ fn tool_raw_log(args: &Value, state: &mut ServerState) -> Result<Value, String> 
     if doc.total_lines() == 0 {
         return Err("log is empty".to_string());
     }
-    let lo = resolve_bound(args.get("start"), &doc, false)?
-        .ok_or_else(|| "argument 'start' is required".to_string())?;
-    let end = resolve_bound(args.get("end"), &doc, true)?
-        .ok_or_else(|| "argument 'end' is required".to_string())?;
-    if end < lo {
-        return Err("end is before start".to_string());
+    if args.get("start").is_none_or(Value::is_null) {
+        return Err("argument 'start' is required".to_string());
     }
-    let hi = (end + 1).min(doc.total_lines());
+    if args.get("end").is_none_or(Value::is_null) {
+        return Err("argument 'end' is required".to_string());
+    }
+    let selection = resolve_query_selection(args, &doc, vis.as_deref().map(Vec::as_slice))?;
     let max_lines = arg_usize(args, "max_lines", HARD_MAX_LINES)?.min(HARD_MAX_LINES);
-    // `total` counts only the filtered lines in the window when a filtered
-    // view is active.
-    let (total, lines): (usize, Vec<Value>) = match &vis {
-        Some(v) => {
-            let a = v.partition_point(|&i| i < lo);
-            let b = v.partition_point(|&i| i < hi);
-            let slice = &v[a..b];
-            let total = slice.len();
-            let mut lines = Vec::new();
-            for &i in slice {
-                if lines.len() >= max_lines {
-                    break;
-                }
-                lines.push(Value::String(truncate(&doc.line(i), MAX_LINE_TEXT)));
-            }
-            (total, lines)
-        }
-        None => {
-            let total = hi - lo;
-            let mut lines = Vec::new();
-            for i in lo..hi {
-                if lines.len() >= max_lines {
-                    break;
-                }
-                lines.push(Value::String(truncate(&doc.line(i), MAX_LINE_TEXT)));
-            }
-            (total, lines)
-        }
-    };
+    let total = selection.lines.len();
+    let returned_ids = selection
+        .lines
+        .iter()
+        .copied()
+        .take(max_lines)
+        .collect::<Vec<_>>();
+    let lines = returned_ids
+        .iter()
+        .map(|&line| Value::String(truncate(&doc.line(line), MAX_LINE_TEXT)))
+        .collect::<Vec<_>>();
     let truncated = lines.len() < total;
     let mut out = json!({
-        "start_line": lo + 1,
-        "end_line": hi,
+        "start_line": returned_ids.first().map_or(selection.source.start + 1, |line| line + 1),
+        "end_line": returned_ids.last().map_or(selection.source.start, |line| line + 1),
         "total": total,
         "returned": lines.len(),
         "truncated": truncated,
         "lines": lines,
+        "line_numbers": returned_ids.iter().map(|line| line + 1).collect::<Vec<_>>(),
+        "time_filtered": selection.time_bounds.is_some(),
     });
     if log_id != "_active" {
         out["log_id"] = json!(log_id);
@@ -2317,27 +2253,40 @@ fn tool_raw_log(args: &Value, state: &mut ServerState) -> Result<Value, String> 
 /// GUI view and the `_active` match cache stay in sync.
 fn tool_trim_gui(args: &Value, state: &mut ServerState) -> Result<Value, String> {
     let doc = state.get_active_doc()?;
-    let full = doc.total_lines_untrimmed();
-    let start = resolve_bound(args.get("start"), &doc, false)?;
-    let end = resolve_bound(args.get("end"), &doc, true)?;
-    let (s_abs, e_abs) = match (start, end) {
-        (None, None) => (0usize, full.saturating_sub(1)),
-        (Some(s), Some(e)) => (doc.trim_start + s, doc.trim_start + e),
-        (Some(s), None) => (doc.trim_start + s, full.saturating_sub(1)),
-        (None, Some(e)) => (0usize, doc.trim_start + e),
-    };
-    if e_abs < s_abs {
-        return Err("end is before start".to_string());
+    if args.get("start").is_none_or(Value::is_null) && args.get("end").is_none_or(Value::is_null) {
+        let mut new_doc = doc;
+        Arc::make_mut(&mut new_doc).reset_trim();
+        state.set_active_doc(new_doc);
+        return Ok(json!({
+            "remaining_lines": state.get_active_doc()?.total_lines(),
+            "matched": true,
+            "included_intervening_lines": 0,
+        }));
     }
+    let selection = resolve_query_selection(args, &doc, None)?;
+    let Some(first) = selection.lines.first().copied() else {
+        return Ok(json!({
+            "remaining_lines": doc.total_lines(),
+            "matched": false,
+            "included_intervening_lines": 0,
+        }));
+    };
+    let last = selection.lines.last().copied().unwrap_or(first);
+    let s_abs = doc.trim_start + first;
+    let e_abs = doc.trim_start + last;
+    let envelope_len = last - first + 1;
     let mut new_doc = doc;
     Arc::make_mut(&mut new_doc).trim_range(s_abs, e_abs);
     state.set_active_doc(new_doc);
-    Ok(json!({ "remaining_lines": state.get_active_doc()?.total_lines() }))
+    Ok(json!({
+        "remaining_lines": state.get_active_doc()?.total_lines(),
+        "matched": true,
+        "included_intervening_lines": envelope_len.saturating_sub(selection.lines.len()),
+    }))
 }
 
-/// get_timeline_histogram: tiny [{x, count}] distribution for the whole log,
-/// a keyword, or a template. Time domain when timestamps exist, else line
-/// index. Lets the caller find the spike/window before fetching any lines.
+/// Analytical histogram. Explicit line mode mirrors the GUI source axis;
+/// omitted/auto mode retains the historical time-when-available behavior.
 fn tool_timeline_histogram(args: &Value, state: &mut ServerState) -> Result<Value, String> {
     let (log_id, doc) = resolve_doc(state, args)?;
     // Short-circuit: with_filtered_log=true (the default) and no filters set →
@@ -2350,7 +2299,10 @@ fn tool_timeline_histogram(args: &Value, state: &mut ServerState) -> Result<Valu
     if n == 0 {
         return Err("log is empty".to_string());
     }
-    let (lo, hi) = resolve_range(args, &doc)?;
+    let selection = resolve_query_selection(args, &doc, vis.as_deref().map(Vec::as_slice))?;
+    let selected = &selection.lines;
+    let lo = selection.source.start;
+    let hi = selection.source.end;
     let nb = arg_usize(args, "buckets", 50)?.clamp(16, 1024);
     let keyword = args.get("keyword").and_then(Value::as_str);
     let template_id = args
@@ -2360,18 +2312,29 @@ fn tool_timeline_histogram(args: &Value, state: &mut ServerState) -> Result<Valu
     if keyword.is_some() && template_id.is_some() {
         return Err("pass either 'keyword' or 'template_id', not both".to_string());
     }
-    // The time-domain decision is then made from the filtered lines when a
-    // filtered view is active.
-    let tr = match &vis {
-        Some(v) => {
-            let a = v.partition_point(|&i| i < lo);
-            let b = v.partition_point(|&i| i < hi);
-            time_range_of_lines(&doc, v[a..b].iter().copied())
+    let requested_domain = args.get("domain").and_then(Value::as_str).unwrap_or("auto");
+    if !matches!(requested_domain, "auto" | "line" | "time") {
+        return Err("domain must be 'auto', 'line', or 'time'".to_string());
+    }
+    let count_unit = args
+        .get("count_unit")
+        .and_then(Value::as_str)
+        .unwrap_or("physical_lines");
+    if !matches!(count_unit, "physical_lines" | "records") {
+        return Err("count_unit must be 'physical_lines' or 'records'".to_string());
+    }
+    let time_range = time_range_of_lines(&doc, selected.iter().copied());
+    let time_domain = match requested_domain {
+        "time" => {
+            if time_range.is_none() {
+                return Err("no valid timestamps in the selected range".to_string());
+            }
+            true
         }
-        None => range_time(&doc, lo, hi),
+        "auto" => matches!(time_range, Some((a, b)) if b > a),
+        _ => false,
     };
-    let time_domain = matches!(tr, Some((a, b)) if b > a);
-    let (ta, tb) = tr.unwrap_or((0, 0));
+    let (ta, tb) = time_range.unwrap_or((0, 0));
     let span = (tb - ta).max(1);
     let x_of = |i: usize| -> i64 {
         if time_domain {
@@ -2394,65 +2357,33 @@ fn tool_timeline_histogram(args: &Value, state: &mut ServerState) -> Result<Valu
         None => None,
     };
     let mut counts = vec![0u64; nb];
-    // `contains_visible` checks membership in the filtered view (already
-    // range-checked by the caller's loop bounds).
-    let filtered = vis.as_deref();
     match (&matches, template_id) {
         (Some(m), _) => {
             for &i in m.iter() {
-                if i < lo || i >= hi {
+                if selected.binary_search(&i).is_err() {
                     continue;
                 }
-                if let Some(v) = filtered {
-                    if v.binary_search(&i).is_err() {
-                        continue;
-                    }
-                }
                 let v = x_of(i);
-                if v >= 0 {
+                if v >= 0 && (count_unit == "physical_lines" || doc.is_record_start_at(i)) {
                     counts[bucket_of(v)] += 1;
                 }
             }
         }
         (None, Some(tid)) => {
-            if let Some(v) = filtered {
-                let a = v.partition_point(|&i| i < lo);
-                let b = v.partition_point(|&i| i < hi);
-                for &i in &v[a..b] {
-                    if doc.template_at(i) == tid {
-                        let x = x_of(i);
-                        if x >= 0 {
-                            counts[bucket_of(x)] += 1;
-                        }
-                    }
-                }
-            } else {
-                for i in lo..hi {
-                    if doc.template_at(i) == tid {
-                        let x = x_of(i);
-                        if x >= 0 {
-                            counts[bucket_of(x)] += 1;
-                        }
+            for &line in selected {
+                if doc.template_at(line) == tid {
+                    let x = x_of(line);
+                    if x >= 0 && (count_unit == "physical_lines" || doc.is_record_start_at(line)) {
+                        counts[bucket_of(x)] += 1;
                     }
                 }
             }
         }
         (None, None) => {
-            if let Some(v) = filtered {
-                let a = v.partition_point(|&i| i < lo);
-                let b = v.partition_point(|&i| i < hi);
-                for &i in &v[a..b] {
-                    let x = x_of(i);
-                    if x >= 0 {
-                        counts[bucket_of(x)] += 1;
-                    }
-                }
-            } else {
-                for i in lo..hi {
-                    let x = x_of(i);
-                    if x >= 0 {
-                        counts[bucket_of(x)] += 1;
-                    }
+            for &line in selected {
+                let x = x_of(line);
+                if x >= 0 && (count_unit == "physical_lines" || doc.is_record_start_at(line)) {
+                    counts[bucket_of(x)] += 1;
                 }
             }
         }
@@ -2463,14 +2394,21 @@ fn tool_timeline_histogram(args: &Value, state: &mut ServerState) -> Result<Valu
             if time_domain {
                 ta + span * i as i64 / (nb as i64 - 1).max(1)
             } else {
-                lo as i64 + ((hi - lo) as i64 - 1).max(1) * i as i64 / (nb as i64 - 1).max(1)
+                let line =
+                    lo as i64 + ((hi - lo) as i64 - 1).max(1) * i as i64 / (nb as i64 - 1).max(1);
+                if requested_domain == "line" {
+                    line + doc.trim_start as i64 + 1
+                } else {
+                    line
+                }
             }
         })
         .collect();
     let total: u64 = counts.iter().sum();
     let mut out = json!({
-        "domain": if time_domain { "time" } else { "sequence" },
-        "x_unit": if time_domain { "epoch_ms" } else { "line_index" },
+        "domain": if time_domain { "time" } else if requested_domain == "line" { "line" } else { "sequence" },
+        "x_unit": if time_domain { "epoch_ms" } else if requested_domain == "line" { "source_line_1_based" } else { "line_index" },
+        "count_unit": count_unit,
         "buckets": nb,
         "x": xs,
         "counts": counts,
@@ -2502,21 +2440,10 @@ fn tool_template_anomalies(args: &Value, state: &mut ServerState) -> Result<Valu
     if n == 0 {
         return Err("log is empty".to_string());
     }
-    let (lo, hi) = resolve_range(args, &doc)?;
+    let selection = resolve_query_selection(args, &doc, vis.as_deref().map(Vec::as_slice))?;
+    let selected = &selection.lines;
     let limit = arg_usize(args, "limit", 50)?;
-
-    // The analysis window below spans only the filtered lines.
-    let (vis_a, vis_b) = match &vis {
-        Some(v) => (
-            v.partition_point(|&i| i < lo),
-            v.partition_point(|&i| i < hi),
-        ),
-        None => (0, 0),
-    };
-    let m = match &vis {
-        Some(_) => vis_b - vis_a,
-        None => hi - lo,
-    };
+    let m = selected.len();
     if m == 0 {
         return Ok(json!({
             "total_lines": 0,
@@ -2528,42 +2455,26 @@ fn tool_template_anomalies(args: &Value, state: &mut ServerState) -> Result<Valu
 
     // Per-template occurrence counts within the analysed (possibly filtered)
     // range, used for rare/bursty thresholds instead of the full-window count.
-    let counts = match &vis {
-        Some(v) => template_counts_of(&doc, v[vis_a..vis_b].iter().copied()),
-        None => template_counts_in_range(&doc, lo, hi),
-    };
+    let counts = template_counts_of(&doc, selected.iter().copied());
 
     // Single pass: first-seen line (absolute index) per template +
     // per-template line-index histograms (only for templates frequent enough
     // to burst). Buckets are physical positions within `[lo, hi)`.
     let mut first_seen: HashMap<u32, usize> = HashMap::new();
+    let mut first_position: HashMap<u32, usize> = HashMap::new();
     let mut hists: HashMap<u32, Vec<u32>> = doc
         .templates
         .iter()
         .filter(|t| counts.get(&t.id).copied().unwrap_or(0) >= 10)
         .map(|t| (t.id, vec![0u32; ANOMALY_BUCKETS]))
         .collect();
-    let range_len = (hi - lo).max(1);
-    match &vis {
-        Some(v) => {
-            for &i in &v[vis_a..vis_b] {
-                let tid = doc.template_at(i);
-                first_seen.entry(tid).or_insert(i);
-                if let Some(h) = hists.get_mut(&tid) {
-                    let b = ((i - lo) * ANOMALY_BUCKETS / range_len).min(ANOMALY_BUCKETS - 1);
-                    h[b] += 1;
-                }
-            }
-        }
-        None => {
-            for i in lo..hi {
-                let tid = doc.template_at(i);
-                first_seen.entry(tid).or_insert(i);
-                if let Some(h) = hists.get_mut(&tid) {
-                    let b = ((i - lo) * ANOMALY_BUCKETS / range_len).min(ANOMALY_BUCKETS - 1);
-                    h[b] += 1;
-                }
-            }
+    for (position, &line) in selected.iter().enumerate() {
+        let tid = doc.template_at(line);
+        first_seen.entry(tid).or_insert(line);
+        first_position.entry(tid).or_insert(position);
+        if let Some(histogram) = hists.get_mut(&tid) {
+            let bucket = (position * ANOMALY_BUCKETS / m.max(1)).min(ANOMALY_BUCKETS - 1);
+            histogram[bucket] += 1;
         }
     }
 
@@ -2580,7 +2491,7 @@ fn tool_template_anomalies(args: &Value, state: &mut ServerState) -> Result<Valu
             reasons.push("rare");
         }
         let first = first_seen.get(&t.id).copied().unwrap_or(0);
-        if first >= late_from {
+        if first_position.get(&t.id).copied().unwrap_or(0) >= late_from {
             reasons.push("first_seen_late");
         }
         if let Some(h) = hists.get(&t.id) {
@@ -2797,7 +2708,7 @@ fn unified_tools() -> Value {
         0,
         json!({
             "name": "detach_gui_session",
-            "description": "Detach this stdio MCP process from the temporary Logotomy GUI session and return to its preserved standalone state.",
+            "description": "Detach this stdio MCP process from the temporary Haystack GUI session and return to its preserved standalone state.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
     );
@@ -2805,13 +2716,13 @@ fn unified_tools() -> Value {
         0,
         json!({
             "name": "attach_gui_session",
-            "description": "Attach this stdio MCP process to the log currently selected in the Logotomy GUI using the temporary 12-character hexadecimal session ID copied from the GUI. The ID is never persisted. While attached, omit log_id and do not call load_log.",
+            "description": "Attach this stdio MCP process to the log currently selected in the Haystack GUI using the temporary 12-character hexadecimal session ID copied from the GUI. The ID is never persisted. While attached, omit log_id and do not call load_log.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": {
                         "type": "string",
-                        "description": "Temporary 12-character hexadecimal GUI session ID copied from Logotomy"
+                        "description": "Temporary 12-character hexadecimal GUI session ID copied from Haystack"
                     }
                 },
                 "required": ["session_id"]
@@ -2886,7 +2797,7 @@ fn compression_tool_schemas(log_id_prop: Option<Value>) -> Vec<Value> {
     let bound_prop = |desc: &str| {
         json!({
             "type": ["integer", "string"],
-            "description": format!("{desc} — a 1-based line number (integer) or a time (string: RFC3339, 'YYYY-MM-DD HH:MM:SS', or epoch millis)")
+            "description": format!("{desc} — a 1-based source line (integer) or inclusive event-time predicate (string: RFC3339, 'YYYY-MM-DD HH:MM:SS', or epoch millis). Time-filtered results can be discontiguous and remain in source order")
         })
     };
     let filter_prop = json!({
@@ -2905,10 +2816,12 @@ fn compression_tool_schemas(log_id_prop: Option<Value>) -> Vec<Value> {
         }),
         json!({
             "name": "get_timeline_histogram",
-            "description": "Tiny distribution histogram ({x, counts}) over an optional line/time range, for the whole log, a keyword, or a template. Time domain (epoch ms) when the log has timestamps, else line-index domain. Use this to find the spike/window BEFORE fetching any lines.",
+            "description": "Tiny histogram ({x, counts}) over an optional line/time selection. Explicit domain=line mirrors the GUI source axis; domain=time gives an analytical clock distribution; omitted/auto retains the legacy time-when-available behavior. count_unit defaults to physical_lines; records counts only record starts. Use this to find a region BEFORE fetching lines.",
             "inputSchema": schema(json!({
                 "start": bound_prop("Range start"),
                 "end": bound_prop("Range end"),
+                "domain": { "type": "string", "enum": ["auto", "line", "time"], "description": "Histogram x axis (default auto for legacy clients; line for GUI-equivalent source order)" },
+                "count_unit": { "type": "string", "enum": ["physical_lines", "records"], "description": "Bucket count unit (default physical_lines; records counts only classified record starts)" },
                 "buckets": { "type": "integer", "description": "Number of buckets (default 50, 16-1024)" },
                 "keyword": { "type": "string", "description": "Restrict to lines containing this exact phrase (case-sensitive)" },
                 "template_id": { "type": "integer", "description": "Restrict to lines of this template (see get_template)" },
@@ -2945,7 +2858,7 @@ fn compression_tool_schemas(log_id_prop: Option<Value>) -> Vec<Value> {
         }),
         json!({
             "name": "log_sequence",
-            "description": "Dense [[epoch_ms|null, line, template_id], ...] over a line- or time-bounded range (the filtered set when with_filtered_log=true). Optional 'collapse' folds long same-template runs into one entry. Returns total_entries/returned/truncated so the caller can narrow start/end when truncated.",
+            "description": "Dense [[epoch_ms|null, line, template_id], ...] over a line- or inclusive event-time-bounded selection (the filtered set when with_filtered_log=true). Disordered clock matches remain in source order and can be discontiguous. Optional 'collapse' folds long same-template runs into one entry. Returns total_entries/returned/truncated so the caller can narrow start/end when truncated.",
             "inputSchema": schema(json!({
                 "start": bound_prop("Range start"),
                 "end": bound_prop("Range end"),
@@ -2956,7 +2869,7 @@ fn compression_tool_schemas(log_id_prop: Option<Value>) -> Vec<Value> {
         }),
         json!({
             "name": "raw_log",
-            "description": "Raw log lines over a range bounded by line numbers or timestamps (restricted to the filtered set when with_filtered_log=true). Truncated to max_lines with a 'truncated' flag.",
+            "description": "Raw log lines over a selection bounded by source line numbers or inclusive event times (restricted to the filtered set when with_filtered_log=true). Disordered time matches stay in source order; line_numbers maps every returned text row back to its source. Truncated to max_lines with a 'truncated' flag.",
             "inputSchema": schema(json!({
                 "start": bound_prop("Range start (required)"),
                 "end": bound_prop("Range end (required)"),
@@ -3000,11 +2913,13 @@ fn headless_tools() -> Value {
     let base = json!([
         {
             "name": "load_log",
-            "description": "Load and index a log file (any text file). Returns a log_id used by all other tools, plus stats (lines, time range, top templates).",
+            "description": "Load and index a log file. Optionally select a saved profile_id or provide a versioned record_profile object; invalid/missing choices fail explicitly. Returns a log_id and stats with the resolved profile and detection diagnostics.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Absolute path to the log file" }
+                    "path": { "type": "string", "description": "Absolute path to the log file" },
+                    "profile_id": { "type": "string", "description": "ID of a saved log-format preset" },
+                    "record_profile": { "type": "object", "description": "Inline versioned RecordProfile definition (mutually exclusive with profile_id)" }
                 },
                 "required": ["path"]
             }
@@ -3036,7 +2951,7 @@ fn gui_tools() -> Value {
     let base = json!([
         {
             "name": "trim",
-            "description": "Focus the currently open log's visible window to a line- or time-bounded range (both bounds optional; omit both to reset to the full file). Returns the remaining visible line count.",
+            "description": "Focus the currently open log by source lines or by the contiguous source envelope of inclusive event-time matches (both bounds optional; omit both to reset). A time envelope can include intervening nonmatches, which are reported.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3122,10 +3037,10 @@ mod tests {
 
         let listed = resources_list();
         assert_eq!(listed["resources"].as_array().unwrap().len(), 2);
-        let session = resource_read(&json!({"uri": "logotomy://session"}), &gui).unwrap();
+        let session = resource_read(&json!({"uri": "haystack://session"}), &gui).unwrap();
         let text = session["contents"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"temporary\": true"));
-        let guide = resource_read(&json!({"uri": "logotomy://guide"}), &gui).unwrap();
+        let guide = resource_read(&json!({"uri": "haystack://guide"}), &gui).unwrap();
         let guide = guide["contents"][0]["text"].as_str().unwrap();
         assert!(guide.contains("get_analysis"));
         assert!(guide.contains("not a required checklist"));
@@ -3318,7 +3233,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "logotomy_mcp_test_{}_{}.log",
+            "haystack_mcp_test_{}_{}.log",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -3363,9 +3278,9 @@ mod tests {
         // --- Timeline density must be centered on the visible lines ---
         let tl = Timeline::build(&doc, &[], 256);
         let sum: u32 = tl.density.iter().sum();
-        assert_eq!(sum as usize, doc.total_lines());
+        assert_eq!(sum as usize, doc.record_count());
 
-        // Density-weighted mean of bucket centers ≈ mean of visible timestamps.
+        // Density-weighted mean remains centered on visible source positions.
         let mut weighted_sum: i64 = 0;
         let mut total: u32 = 0;
         for (i, &c) in tl.density.iter().enumerate() {
@@ -3374,11 +3289,11 @@ mod tests {
                 total += c;
             }
         }
-        let mean_ts = (doc.ts_at(0) + doc.ts_at(1) + doc.ts_at(2)) / 3;
+        let mean_line = 1;
         let weighted_mean = weighted_sum / total as i64;
         assert!(
-            (weighted_mean - mean_ts).abs() < 2000,
-            "timeline density peak drifted: weighted_mean={weighted_mean} expected≈{mean_ts}"
+            (weighted_mean - mean_line).abs() <= 1,
+            "timeline density peak drifted: weighted_mean={weighted_mean} expected≈{mean_line}"
         );
 
         std::fs::remove_file(path).ok();
@@ -3722,6 +3637,47 @@ mod tests {
     }
 
     #[test]
+    fn disordered_time_ranges_return_discontiguous_lines_in_source_order() {
+        let mut state = gui_state(
+            "2026-09-11T10:00:02Z INFO first\n\
+             2026-09-11T10:00:00Z INFO excluded\n\
+             2026-09-11T10:00:01Z INFO third\n",
+        );
+        let bounds = json!({
+            "start": "2026-09-11T10:00:01Z",
+            "end": "2026-09-11T10:00:02Z",
+            "with_filtered_log": false,
+        });
+        let sequence = tool_log_sequence(&bounds, &mut state).unwrap();
+        let source_lines = sequence["sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry[1].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(source_lines, vec![1, 3]);
+
+        let raw = tool_raw_log(&bounds, &mut state).unwrap();
+        assert_eq!(raw["line_numbers"], json!([1, 3]));
+        assert_eq!(raw["total"], 2);
+    }
+
+    #[test]
+    fn out_of_range_time_query_returns_an_empty_selection() {
+        let mut state = gui_state(&repetitive_log());
+        let out = tool_log_sequence(
+            &json!({
+                "start": "2036-01-01T00:00:00Z",
+                "with_filtered_log": false,
+            }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(out["total_entries"], 0);
+        assert_eq!(out["sequence"], json!([]));
+    }
+
+    #[test]
     fn resolve_bound_rejects_zero_and_clamps() {
         let mut state = gui_state(&repetitive_log());
         // 0 is not a valid 1-based line number.
@@ -3792,6 +3748,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["domain"], "time");
+        assert_eq!(out["x_unit"], "epoch_ms");
+        assert_eq!(out["count_unit"], "physical_lines");
         assert_eq!(out["total"], 21);
         assert_eq!(out["counts"].as_array().unwrap().len(), 20);
 
@@ -3802,6 +3760,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["total"], 1);
+        assert_eq!(out["count_unit"], "physical_lines");
 
         // Both filters is an error.
         assert!(tool_timeline_histogram(
@@ -3809,6 +3768,76 @@ mod tests {
             &mut state
         )
         .is_err());
+    }
+
+    #[test]
+    fn histogram_overview_counts_records_while_lanes_count_physical_hits() {
+        let mut state = gui_state(
+            "2026-09-11T10:00:00Z INFO first\n\
+             continuation needle\n\
+             2026-09-11T10:00:01Z INFO second\n\
+             continuation needle\n",
+        );
+        let overview = tool_timeline_histogram(
+            &json!({ "buckets": 16, "domain": "line", "count_unit": "records", "with_filtered_log": false }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(overview["domain"], "line");
+        assert_eq!(overview["count_unit"], "records");
+        assert_eq!(overview["total"], 2);
+
+        let lane = tool_timeline_histogram(
+            &json!({ "buckets": 16, "domain": "line", "keyword": "needle", "with_filtered_log": false }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(lane["count_unit"], "physical_lines");
+        assert_eq!(lane["total"], 2);
+        assert_eq!(lane["x"][0], 1);
+
+        let legacy = tool_timeline_histogram(
+            &json!({ "buckets": 16, "with_filtered_log": false }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(legacy["domain"], "time");
+        assert_eq!(legacy["count_unit"], "physical_lines");
+        assert_eq!(legacy["total"], 4);
+
+        assert!(tool_timeline_histogram(
+            &json!({ "domain": "unknown", "with_filtered_log": false }),
+            &mut state,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn headless_load_accepts_inline_record_profile_and_reports_revision() {
+        let path = write_temp(
+            "2026-09-11T10:00:00Z ERROR first\n    payload retry_at=2035-01-01T00:00:00Z\n2026-09-11T10:00:01Z INFO next\n",
+        );
+        let profile = crate::core::record::RecordProfile::text(
+            "test:headless",
+            "Headless layout",
+            "{time} {log_level} {log}",
+        );
+        let mut state = ServerState::default();
+        let loaded = tool_load_log(
+            &json!({ "path": path, "record_profile": profile }),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(loaded["stats"]["record_profile"]["id"], "test:headless");
+        assert_eq!(loaded["stats"]["record_profile"]["revision"], 1);
+        assert_eq!(loaded["stats"]["detection"]["profile_id"], "test:headless");
+        assert_eq!(loaded["stats"]["lines"], 3);
+        assert!(tool_load_log(
+            &json!({ "path": path, "profile_id": "missing:preset" }),
+            &mut state,
+        )
+        .is_err());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

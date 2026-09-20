@@ -9,6 +9,7 @@ use aho_corasick::AhoCorasick;
 use regex::{Regex, RegexBuilder};
 
 use crate::core::document::LogDocument;
+use crate::core::field_query::{CompiledFieldQuery, FieldQuery};
 
 /// Hard caps keep user supplied regular expressions predictable. Rust's regex
 /// engine is linear-time (no catastrophic backtracking); these caps also bound
@@ -41,6 +42,8 @@ pub struct FilterSpec {
     /// When present, select mined Drain template IDs instead of matching text.
     /// `text` remains the human-readable timeline lane label.
     pub template_id: Option<u32>,
+    /// Typed capture query; ordinary text and Template-ID modes leave this empty.
+    pub field_query: Option<FieldQuery>,
 }
 
 impl FilterSpec {
@@ -51,6 +54,7 @@ impl FilterSpec {
             polarity: FilterPolarity::Include,
             regex: false,
             template_id: None,
+            field_query: None,
         }
     }
 
@@ -62,6 +66,7 @@ impl FilterSpec {
             && self.case_sensitive == other.case_sensitive
             && self.regex == other.regex
             && self.template_id == other.template_id
+            && self.field_query == other.field_query
     }
 }
 
@@ -111,6 +116,9 @@ pub fn validate_regex(pattern: &str, case_sensitive: bool) -> Result<(), String>
 /// already normalized into `FilterSpec::template_id` by the UI, while phrase
 /// matching needs no compilation-time validation.
 pub fn validate_matcher(spec: &FilterSpec) -> Result<(), String> {
+    if spec.field_query.is_some() {
+        return Ok(());
+    }
     if spec.template_id.is_some() || !spec.regex {
         return Ok(());
     }
@@ -166,7 +174,7 @@ pub fn build_filter_highlighter(filters: &[FilterSpec]) -> Result<FilterHighligh
 }
 
 fn compile_filter(spec: &FilterSpec) -> Result<Option<CompiledFilter>, String> {
-    if spec.template_id.is_some() {
+    if spec.template_id.is_some() || spec.field_query.is_some() {
         return Ok(None);
     }
     let text = spec.text.trim();
@@ -221,6 +229,18 @@ pub fn scan_advanced_range(
         .iter()
         .map(compile_filter)
         .collect::<Result<_, _>>()?;
+    let field_matchers: Vec<Option<CompiledFieldQuery>> = filters
+        .iter()
+        .map(|spec| {
+            spec.field_query
+                .as_ref()
+                .map(|query| query.compile(doc))
+                .transpose()
+        })
+        .collect::<Result<_, _>>()?;
+    let has_field_matcher = field_matchers.iter().any(Option::is_some);
+    let mut cached_owner: Option<usize> = None;
+    let mut cached_field_hits = vec![false; filters.len()];
     let mut out = vec![Vec::new(); filters.len()];
     let start = range.start.min(doc.total_lines());
     let end = range.end.min(doc.total_lines()).max(start);
@@ -238,12 +258,27 @@ pub fn scan_advanced_range(
                 progress.scanned_lines.store(processed, Ordering::Relaxed);
             }
         }
+        if has_field_matcher {
+            let original = doc.trim_start + line_index;
+            let owner = doc
+                .record_range_containing(original)
+                .map(|range| range.start);
+            if owner != cached_owner || processed == 0 {
+                cached_owner = owner;
+                for (slot, matcher) in cached_field_hits.iter_mut().zip(&field_matchers) {
+                    *slot = matcher
+                        .as_ref()
+                        .map_or(Ok(false), |query| query.matches(doc, original))?;
+                }
+            }
+        }
         let line = doc.line(line_index);
         for (filter_index, matcher) in compiled.iter().enumerate() {
             let template_matches = filters[filter_index]
                 .template_id
                 .is_some_and(|template_id| doc.template_at(line_index) == template_id);
             if template_matches
+                || cached_field_hits[filter_index]
                 || matcher
                     .as_ref()
                     .is_some_and(|matcher| matcher.is_match(line.as_ref()))
@@ -510,36 +545,59 @@ pub fn find_advanced_u32(
 ) -> Result<Vec<u32>, String> {
     validate_matcher(spec)?;
     let matcher = compile_filter(spec)?;
+    let field_matcher = spec
+        .field_query
+        .as_ref()
+        .map(|query| query.compile(doc))
+        .transpose()?;
+    let mut cached_owner = None;
+    let mut cached_field_hit = false;
     let mut out = Vec::new();
     let n = doc.total_lines();
-    let mut visit = |line: u32, step: usize| {
+    let mut visit = |line: u32, step: usize| -> Result<bool, String> {
         if step % 16_384 == 0 && cancel.load(Ordering::Relaxed) {
-            return false;
+            return Ok(false);
         }
         let index = line as usize;
+        let field_matches = if index < n && field_matcher.is_some() {
+            let original = doc.trim_start + index;
+            let owner = doc
+                .record_range_containing(original)
+                .map(|range| range.start);
+            if owner != cached_owner || step == 0 {
+                cached_owner = owner;
+                cached_field_hit = field_matcher
+                    .as_ref()
+                    .map_or(Ok(false), |query| query.matches(doc, original))?;
+            }
+            cached_field_hit
+        } else {
+            false
+        };
         if index < n
             && (spec
                 .template_id
                 .is_some_and(|id| doc.template_at(index) == id)
+                || field_matches
                 || matcher
                     .as_ref()
                     .is_some_and(|matcher| matcher.is_match(doc.line(index).as_ref())))
         {
             out.push(line);
         }
-        true
+        Ok(true)
     };
     match subset {
         Some(lines) => {
             for (step, &line) in lines.iter().enumerate() {
-                if !visit(line, step) {
+                if !visit(line, step)? {
                     break;
                 }
             }
         }
         None => {
             for index in 0..n {
-                if !visit(index as u32, index) {
+                if !visit(index as u32, index)? {
                     break;
                 }
             }
@@ -593,7 +651,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "logotomy_search_test_{}_{}.log",
+            "haystack_search_test_{}_{}.log",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -635,6 +693,7 @@ mod tests {
                 polarity: FilterPolarity::Include,
                 regex: false,
                 template_id: None,
+                field_query: None,
             },
             FilterSpec {
                 text: "timeout".into(),
@@ -642,6 +701,7 @@ mod tests {
                 polarity: FilterPolarity::Include,
                 regex: false,
                 template_id: None,
+                field_query: None,
             },
             FilterSpec {
                 text: "INFO".into(),
@@ -649,6 +709,7 @@ mod tests {
                 polarity: FilterPolarity::Exclude,
                 regex: false,
                 template_id: None,
+                field_query: None,
             },
         ];
         let matches = scan_advanced(&doc, &filters, &AtomicBool::new(false), None).unwrap();
@@ -673,6 +734,7 @@ mod tests {
             polarity: FilterPolarity::Include,
             regex: true,
             template_id: None,
+            field_query: None,
         }];
         let matches = scan_advanced(&doc, &filters, &AtomicBool::new(false), None).unwrap();
         assert_eq!(matches, vec![vec![0, 1]]);
@@ -689,6 +751,7 @@ mod tests {
             polarity: FilterPolarity::Exclude,
             regex: false,
             template_id: None,
+            field_query: None,
         }];
         assert_eq!(
             combine_filter_matches(4, &filters, &[vec![1, 3]], FilterJoin::Any),
@@ -737,6 +800,7 @@ mod tests {
                 polarity: FilterPolarity::Include,
                 regex: true,
                 template_id: None,
+                field_query: None,
             },
             FilterSpec {
                 text: "disk".into(),
@@ -744,6 +808,7 @@ mod tests {
                 polarity: FilterPolarity::Include,
                 regex: false,
                 template_id: None,
+                field_query: None,
             },
         ];
         let highlighter = build_filter_highlighter(&filters).unwrap();
@@ -766,6 +831,7 @@ mod tests {
             polarity: FilterPolarity::Include,
             regex: false,
             template_id: Some(connected),
+            field_query: None,
         }];
         assert_eq!(
             scan_advanced(&doc, &filters, &AtomicBool::new(false), None).unwrap(),
@@ -816,7 +882,7 @@ mod tests {
     #[test]
     fn matches_exact_case_sensitive_phrase() {
         // Multi-word exact phrase must match verbatim; a case-different variant
-        // must not (regression: logotomy iOS log line).
+        // must not (regression: haystack iOS log line).
         let (doc, path) = doc_with(
             "2026-07-15 22:00:02.107175+0300 MyApp[12345:13] <WARNING> AnalyticsTracker.swift:136 CoreData fetch exceeded threshold entity=LogEntry count=15000\n",
         );
@@ -908,6 +974,7 @@ mod tests {
                 polarity: FilterPolarity::Include,
                 regex: false,
                 template_id: None,
+                field_query: None,
             },
             FilterSpec {
                 text: "error".into(),
@@ -915,6 +982,7 @@ mod tests {
                 polarity: FilterPolarity::Include,
                 regex: false,
                 template_id: None,
+                field_query: None,
             },
             FilterSpec {
                 text: r"code=\d+".into(),
@@ -922,6 +990,7 @@ mod tests {
                 polarity: FilterPolarity::Include,
                 regex: true,
                 template_id: None,
+                field_query: None,
             },
             FilterSpec {
                 text: format!("T{{{template_id}}}"),
@@ -929,6 +998,7 @@ mod tests {
                 polarity: FilterPolarity::Include,
                 regex: false,
                 template_id: Some(template_id),
+                field_query: None,
             },
         ];
         let cancel = AtomicBool::new(false);

@@ -1,11 +1,15 @@
 pub mod document;
 pub mod drain;
 pub mod embedded_data;
+pub mod field_query;
 pub mod format;
 pub mod masking;
+pub mod record;
 pub mod saved_filter;
 pub mod search;
 pub mod settings;
 pub mod sidecar;
+pub mod template_extract;
 pub mod time;
+pub mod time_query;
 pub mod timeline;

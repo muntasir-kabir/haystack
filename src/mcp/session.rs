@@ -124,7 +124,7 @@ pub(crate) fn session_id_matches(expected: &str, supplied: &str) -> bool {
 fn load_at(path: &Path) -> Result<GuiSession, String> {
     let bytes = std::fs::read(path).map_err(|e| {
         format!(
-            "no active Logotomy GUI MCP session at {}: {e}",
+            "no active Haystack GUI MCP session at {}: {e}",
             path.display()
         )
     })?;
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn manifest_round_trips_atomically() {
         let path = std::env::temp_dir().join(format!(
-            "logotomy-mcp-session-{}-{}.json",
+            "haystack-mcp-session-{}-{}.json",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn invalid_manifest_values_are_rejected() {
         let path = std::env::temp_dir().join(format!(
-            "logotomy-mcp-session-invalid-{}-{}.json",
+            "haystack-mcp-session-invalid-{}-{}.json",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn session_id_must_match_current_private_manifest() {
         let path = std::env::temp_dir().join(format!(
-            "logotomy-mcp-session-auth-{}-{}.json",
+            "haystack-mcp-session-auth-{}-{}.json",
             std::process::id(),
             rand::random::<u64>()
         ));

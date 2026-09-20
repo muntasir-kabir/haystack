@@ -137,16 +137,30 @@ pub(crate) fn show(
         AnalysisPopupMode::Actions => "actions",
         AnalysisPopupMode::Editor => "editor",
     };
-    let popup_id = egui::Id::new(("analysis_popup", state.id, popup_mode));
+    let popup_id = egui::Id::new((
+        "analysis_popup",
+        tab.focused_log_view_id,
+        state.id,
+        popup_mode,
+    ));
 
     let mut switch_editor = false;
     let mut save = false;
     let mut cancel = false;
     let mut copy: Option<bool> = None;
+    let shield = crate::ui::app::overlay::input_shield(
+        ui.ctx(),
+        (
+            "analysis_popup_shield",
+            tab.focused_log_view_id,
+            state.id,
+            popup_mode,
+        ),
+    );
 
     let area = egui::Window::new("analysis_popup")
         .id(popup_id)
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Tooltip)
         .title_bar(false)
         .collapsible(false)
         .movable(true)
@@ -267,17 +281,9 @@ pub(crate) fn show(
         switch_to_editor(tab);
     }
 
-    let outside_click = ui.ctx().input(|input| {
-        input
-            .pointer
-            .any_click()
-            .then(|| input.pointer.interact_pos())
-            .flatten()
-    });
     let should_cancel = cancel
         || escape_pressed
-        || (outside_click.is_some_and(|position| !bubble_rect.contains(position))
-            && !state.ignore_outside_click);
+        || (shield.backdrop_response.clicked() && !state.ignore_outside_click);
 
     if should_cancel {
         return Some(Action::Cancel);
@@ -372,7 +378,7 @@ fn scaled_alpha(color: Color32, factor: f32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logotomy::core::document::LogDocument;
+    use haystack::core::document::LogDocument;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -380,7 +386,7 @@ mod tests {
 
     fn test_path() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "logotomy-analysis-popup-{}-{}.log",
+            "haystack-analysis-popup-{}-{}.log",
             std::process::id(),
             NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
         ))

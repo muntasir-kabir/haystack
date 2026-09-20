@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Sender};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use logotomy::core::settings::Settings;
+use haystack::core::settings::Settings;
 
 const LOCK_FILE: &str = "gui-instance.lock";
 const ENDPOINT_FILE: &str = "gui-instance.json";
@@ -90,7 +90,7 @@ impl SingleInstance {
                     }
                     if Instant::now() >= deadline {
                         return Err(
-                            "another logotomy GUI instance is running, but it did not accept the file-open request"
+                            "another haystack GUI instance is running, but it did not accept the file-open request"
                                 .to_string(),
                         );
                     }
@@ -138,7 +138,7 @@ impl SingleInstance {
         let stopping = Arc::new(AtomicBool::new(false));
         let stop_listener = Arc::clone(&stopping);
         let listener_thread = match thread::Builder::new()
-            .name("logotomy-open-file".to_string())
+            .name("haystack-open-file".to_string())
             .spawn(move || listen_for_requests(listener, token, tx, stop_listener))
         {
             Ok(thread) => thread,
@@ -298,7 +298,7 @@ mod tests {
     fn test_dir() -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
-            "logotomy_instance_test_{}_{}",
+            "haystack_instance_test_{}_{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ))

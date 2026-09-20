@@ -1,0 +1,12 @@
+<!-- Canonical Haystack application icon. Edit this SVG, then run
+     ./scripts/export-icons.sh to refresh every runtime and package asset. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">Haystack colored log lines</title>
+  <rect width="1024" height="1024" rx="216" fill="#202938"/>
+  <rect x="190" y="258" width="466" height="82" rx="41" fill="#8EC5FF"/>
+  <rect x="190" y="414" width="624" height="82" rx="41" fill="#FF9A8B"/>
+  <rect x="190" y="570" width="390" height="82" rx="41" fill="#B8A7FF"/>
+  <rect x="190" y="726" width="520" height="82" rx="41" fill="#7ED6B2"/>
+  <circle cx="128" cy="142" r="38" fill="#F4C95D"/>
+  <circle cx="884" cy="884" r="30" fill="#E86A6A"/>
+</svg>

@@ -12,9 +12,9 @@ use std::time::Duration;
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
-use logotomy::core::document::LogDocument;
-use logotomy::core::time::format_ms;
-use logotomy::core::timeline::TimelineDomain;
+use haystack::core::document::LogDocument;
+use haystack::core::time::format_ms;
+use haystack::core::timeline::TimelineDomain;
 
 use crate::ui::app::model::LogTab;
 use crate::ui::filters as filter_strip;
@@ -48,12 +48,18 @@ const EYE_LEFT_PAD: f32 = 2.0;
 /// Margin from the label column's right edge (and the lane content) to the
 /// trailing trash icon, so the label never crowds the lane.
 const LABEL_LANE_PAD: f32 = 3.0;
-/// Width of the right column for pan/zoom hint icons.
-const ICON_WIDTH: f32 = 18.0;
-/// Height of the header row ("Timeline" label + filter controls). Included in
-/// `panel_height` so the fixed top panel is tall enough for header + body +
-/// minimap.
+/// Height of the header row (filter controls). Included in `panel_height` so
+/// the fixed top panel is tall enough for controls + body + minimap.
 const HEADER_HEIGHT: f32 = 24.0;
+
+fn minimap_height() -> f32 {
+    8.0 + MINIMAP_HEIGHT
+}
+
+fn minimap_color(theme: &Theme) -> Color32 {
+    // The overview minimap always uses the untouched theme-aware default.
+    Color32::from_rgba_unmultiplied(theme.axis.r(), theme.axis.g(), theme.axis.b(), 255)
+}
 
 /// Compute the total height of the timeline panel for the given tab.
 /// Used by the fixed top panel so the whole timeline (header, histogram,
@@ -81,26 +87,31 @@ pub fn panel_height(tab: &LogTab) -> f32 {
         + content_height
         + (if has_lanes { 10.0 } else { 0.0 }) // gap after histo
         + 18.0 // axis labels row
-        + 8.0   // gap
-        + MINIMAP_HEIGHT
+        + minimap_height()
 }
 
-pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
+pub fn show(
+    ui: &mut egui::Ui,
+    tab: &mut LogTab,
+    theme: &Theme,
+) {
+    let (full_start, full_end) = domain_span(&tab.timeline.domain, tab.doc.total_lines());
+    let full_span = (full_end - full_start).max(1);
+    let (view_start, view_end) = effective_zoom(&tab.timeline_zoom, full_start, full_end);
+    let zoomed = tab.timeline_zoom.is_some();
+
     ui.horizontal(|ui| {
         ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
-        ui.add(icons::icon_image(
-            ui.ctx(),
-            Icon::Timeline,
-            15.0,
-            theme.text,
-        ));
-        ui.label(RichText::new("Timeline").strong());
-        ui.add_sized(
-            egui::vec2(1.0, HEADER_HEIGHT - 2.0),
-            egui::Separator::default(),
-        );
-
         filter_strip::add_filter_ui(ui, tab, theme);
+
+        if zoomed
+            && ui
+                .button(RichText::new("Reset zoom").small())
+                .on_hover_text("Return to the full source range")
+                .clicked()
+        {
+            tab.timeline_zoom = None;
+        }
 
         if tab.selected_lane.is_some() {
             // Keep this navigation hint inside the fixed header row. A bare
@@ -141,7 +152,10 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     ))
                     .on_hover_text("Previous filter occurrence (Left Arrow)");
                     ui.add_space(5.0);
-                    ui.label(RichText::new("Use").small().color(theme.text_muted));
+                    ui.label(RichText::new("Navigate").small().color(theme.text_muted))
+                        .on_hover_text(
+                            "Use Left and Right arrows to move through occurrences in the selected lane",
+                        );
                     if let Some(text) = occurrence_navigation_text(tab) {
                         ui.add_space(10.0);
                         let changed = tab
@@ -198,13 +212,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    // ---- determine domain span ----
-    let (full_start, full_end) = domain_span(&tab.timeline.domain, tab.doc.total_lines());
-    let (view_start, view_end) = effective_zoom(&tab.timeline_zoom, full_start, full_end);
-    let zoomed = tab.timeline_zoom.is_some();
-
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, egui::CornerRadius::same(4), theme.surface);
+    painter.rect_filled(rect, egui::CornerRadius::same(4), theme.log_surface);
 
     // ---- layout sub-rects ----
     // The main content area spans either from rect.min.x+4 (no filters) or
@@ -214,19 +223,10 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     } else {
         rect.min.x + 4.0
     };
-    let icon_right = rect.max.x - 4.0;
-    let icon_left = icon_right - ICON_WIDTH;
     // Histo + lanes content rect
     let hist = Rect::from_min_max(
         Pos2::new(content_left, rect.min.y),
-        Pos2::new(
-            if has_lanes {
-                icon_left - 2.0
-            } else {
-                icon_left
-            },
-            rect.min.y + content_height,
-        ),
+        Pos2::new(rect.max.x - 4.0, rect.min.y + content_height),
     );
     let lanes_bottom = hist.bottom();
     let axis_top = lanes_bottom + 6.0;
@@ -381,7 +381,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         }
         // Marker + label in the left column
         let ee_label_rect = Rect::from_min_max(
-            Pos2::new(label_col.left(), ee_y),
+            Pos2::new(label_col.left() + EYE_LEFT_PAD + 12.0, ee_y),
             Pos2::new(label_col.right(), ee_y + LANE_HEIGHT),
         );
         let ee_label_id = ui.id().with("ee_checkbox");
@@ -394,36 +394,62 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             label_col.left() + EYE_LEFT_PAD + 6.0,
             ee_y + LANE_HEIGHT / 2.0,
         );
-        let ee_marker_color = if tab.everything_else_active {
-            theme.text
-        } else {
-            theme.text_muted
-        };
+        let ee_marker_color = theme.text;
         let ee_icon = if tab.everything_else_active {
             Icon::Visible
         } else {
             Icon::Invisible
         };
         let ee_eye_rect = Rect::from_center_size(ee_marker_pos, Vec2::new(16.0, 14.0));
-        if icons::icon_button_at(ui, ee_eye_rect, ee_icon, ee_marker_color).clicked() {
+        icons::paint_icon(
+            ui.ctx(),
+            &painter,
+            ee_icon,
+            ee_eye_rect.center(),
+            12.0,
+            ee_marker_color,
+        );
+        let ee_eye_resp = ui.interact(ee_eye_rect, ui.id().with("ee_eye"), Sense::click());
+        if ee_eye_resp.clicked() {
             toggle_ee = Some(!tab.everything_else_active);
         }
+        if ee_eye_resp.hovered() || ee_eye_resp.has_focus() {
+            painter.rect_stroke(
+                ee_eye_rect.expand(2.0),
+                egui::CornerRadius::same(2),
+                Stroke::new(1.0, theme.focus_ring),
+                egui::StrokeKind::Middle,
+            );
+            ee_eye_resp.on_hover_text(if tab.everything_else_active {
+                "Hide Everything Else"
+            } else {
+                "Show Everything Else"
+            });
+        }
         // Label text, centered horizontally in the space after the eye icon
-        let ee_text_left = label_col.left() + EYE_LEFT_PAD + 12.0;
-        let ee_text_right = label_col.right() - LABEL_LANE_PAD;
+        let ee_text_left = label_col.left() + EYE_LEFT_PAD + 28.0;
+        let ee_text_right = label_col.right() - LABEL_LANE_PAD - 12.0;
         let ee_text = fit_text_to_width(
             ui,
             "Everything Else",
             egui::FontId::monospace(12.0),
             (ee_text_right - ee_text_left).max(0.0),
         );
-        let ee_label_pos = Pos2::new(
-            (ee_text_left + ee_text_right) / 2.0,
-            ee_y + LANE_HEIGHT / 2.0,
+        let ee_label_pos = Pos2::new(ee_text_left, ee_y + LANE_HEIGHT / 2.0);
+        painter.rect_filled(
+            Rect::from_center_size(
+                Pos2::new(
+                    label_col.left() + EYE_LEFT_PAD + 20.0,
+                    ee_y + LANE_HEIGHT / 2.0,
+                ),
+                Vec2::splat(6.0),
+            ),
+            egui::CornerRadius::same(1),
+            theme.text,
         );
         painter.text(
             ee_label_pos,
-            egui::Align2::CENTER_CENTER,
+            egui::Align2::LEFT_CENTER,
             ee_text,
             egui::FontId::monospace(12.0),
             if tab.everything_else_active {
@@ -565,7 +591,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             // Native visible/invisible toggle button
             let kw_marker_pos =
                 Pos2::new(label_col.left() + EYE_LEFT_PAD + 6.0, y + LANE_HEIGHT / 2.0);
-            let kw_marker_color = if is_active { color } else { theme.text_muted };
+            let kw_marker_color = theme.text;
             let kw_icon = if is_active {
                 Icon::Visible
             } else {
@@ -585,7 +611,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 toggle_kw = Some((ki, !tab.lane_active[ki]));
             }
 
-            // Label text (bold + bigger when active, normal when disabled)
+            // Label text stays neutral: the swatch carries categorical lane
+            // identity, while the label remains readable in both themes.
             let text = &tab.filters[ki].text;
             // Trash (remove) button on the right side of the label row, inset so
             // it never crowds the lane content next to the label column.
@@ -594,40 +621,52 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 Pos2::new(trash_center_x, y + LANE_HEIGHT / 2.0),
                 Vec2::new(16.0, 14.0),
             );
+            let trash_resp =
+                ui.interact(trash_rect, ui.id().with(("kw_trash", ki)), Sense::click());
+            if trash_resp.clicked() {
+                tab.pending_filter_removal = Some(ki);
+            }
+            let trash_focused = trash_resp.hovered() || trash_resp.has_focus();
+            let trash_color = theme.text;
             icons::paint_icon(
                 ui.ctx(),
                 &painter,
                 Icon::Remove,
                 trash_rect.center(),
                 12.0,
-                theme.text_muted,
+                trash_color,
             );
-            let trash_resp =
-                ui.interact(trash_rect, ui.id().with(("kw_trash", ki)), Sense::click());
-            if trash_resp.clicked() {
-                tab.pending_filter_removal = Some(ki);
-            }
-            if trash_resp.hovered() {
+            if trash_focused {
+                painter.rect_stroke(
+                    trash_rect.expand(2.0),
+                    egui::CornerRadius::same(2),
+                    Stroke::new(1.0, theme.focus_ring),
+                    egui::StrokeKind::Middle,
+                );
                 trash_resp.on_hover_text(format!("Remove '{}'", text));
             }
 
             // Label text fills the available interval between the eye and trash
             // icons, truncating only when the actual rendered width requires it.
-            let text_left = label_col.left() + EYE_LEFT_PAD + 12.0;
+            let swatch_center = Pos2::new(
+                label_col.left() + EYE_LEFT_PAD + 20.0,
+                y + LANE_HEIGHT / 2.0,
+            );
+            painter.rect_filled(
+                Rect::from_center_size(swatch_center, Vec2::splat(6.0)),
+                egui::CornerRadius::same(1),
+                if is_active { color } else { theme.text_muted },
+            );
+            let text_left = label_col.left() + EYE_LEFT_PAD + 28.0;
             let text_right = label_col.right() - LABEL_LANE_PAD - 12.0;
-            let label_center_x = (text_left + text_right) / 2.0;
-            let label_font = if is_active {
-                egui::FontId::proportional(12.0)
-            } else {
-                egui::FontId::monospace(11.0)
-            };
+            let label_font = egui::FontId::proportional(12.0);
             let short = fit_text_to_width(
                 ui,
                 text,
                 label_font.clone(),
                 (text_right - text_left).max(0.0),
             );
-            let label_pos = Pos2::new(label_center_x, y + LANE_HEIGHT / 2.0);
+            let label_pos = Pos2::new(text_left, y + LANE_HEIGHT / 2.0);
 
             // New-filter notification: briefly glow the lane label when the
             // filter was just added (via the strip or the search "Add Filter").
@@ -639,7 +678,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                         let t = elapsed.as_secs_f32() / duration.as_secs_f32();
                         let glow = (1.0 - t).clamp(0.0, 1.0);
                         let galley = ui.ctx().fonts_mut(|f| {
-                            f.layout_no_wrap(short.clone(), label_font.clone(), color)
+                            f.layout_no_wrap(short.clone(), label_font.clone(), theme.text)
                         });
                         let size = galley.size();
                         let hl_rect = Rect::from_center_size(
@@ -676,10 +715,14 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
             painter.text(
                 label_pos,
-                egui::Align2::CENTER_CENTER,
+                egui::Align2::LEFT_CENTER,
                 &short,
                 label_font,
-                if is_active { color } else { theme.text_muted },
+                if is_active {
+                    theme.text
+                } else {
+                    theme.text_muted
+                },
             );
             if tab.selected_lane == Some(ki) {
                 painter.rect_stroke(
@@ -693,16 +736,25 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 );
             }
             if kw_check_resp.hovered() {
-                // Tooltip with the FULL filter text (the label truncates at 14
-                // chars) plus its total occurrence count, e.g. "error (334 occurrence)".
+                // Tooltip with the FULL filter text (the label may truncate to
+                // fit) plus its total occurrence count.
                 let count = tab.matches.get(ki).map_or(0, |m| m.len());
                 let plural = if count == 1 { "" } else { "s" };
-                kw_check_resp.on_hover_text(format!("{} ({count} occurrence{plural})", text));
+                let detail = if let Some(query) =
+                    tab.filter_field_queries.get(ki).and_then(Option::as_ref)
+                {
+                    match query.compile(&tab.doc) {
+                        Ok(_) => format!("{count} physical row{plural} in matching records"),
+                        Err(error) => format!("Disabled for review: {error}"),
+                    }
+                } else {
+                    format!("{count} occurrence{plural}")
+                };
+                kw_check_resp.on_hover_text(format!("{text} ({detail})"));
             }
 
-            // Keep the lane's baseline visible while disabled, using the same
-            // muted color as its disabled label. Disabled lanes intentionally
-            // have no occurrence markers or buckets.
+            // Keep a very quiet baseline for orientation while disabled. The
+            // occurrences themselves carry the lane's categorical colour.
             let line_y = y + LANE_HEIGHT / 2.0;
             if !is_active {
                 painter.line_segment(
@@ -710,19 +762,30 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                         Pos2::new(hist.left(), line_y),
                         Pos2::new(hist.right(), line_y),
                     ],
-                    Stroke::new(1.0_f32, theme.text_muted),
+                    Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(
+                            theme.text_muted.r(),
+                            theme.text_muted.g(),
+                            theme.text_muted.b(),
+                            55,
+                        ),
+                    ),
                 );
                 continue;
             }
 
-            // Draw a straight 1px horizontal line across the full lane width
-            // in the filter's color.
+            // The baseline is only an orientation cue. Full-strength colour is
+            // reserved for actual occurrence markers and density buckets.
             painter.line_segment(
                 [
                     Pos2::new(hist.left(), line_y),
                     Pos2::new(hist.right(), line_y),
                 ],
-                Stroke::new(1.0_f32, color),
+                Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 62),
+                ),
             );
             // ---- exact adaptive filter occurrences ----
             // Resolve by marker footprint, not by the fixed whole-file buckets.
@@ -763,8 +826,6 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     if click_resp.clicked() {
                         select_lane = Some(ki);
                         clicked_occurrence = true;
-                        tab.context_line = Some(line_idx as usize);
-                        tab.pending_scroll = Some(line_idx as usize);
                         ensure_line = Some(line_idx as usize);
                     }
                     if click_resp.hovered() {
@@ -809,8 +870,6 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                             {
                                 select_lane = Some(ki);
                                 clicked_occurrence = true;
-                                tab.context_line = Some(line);
-                                tab.pending_scroll = Some(line);
                                 ensure_line = Some(line);
                             }
                         }
@@ -837,7 +896,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     }
 
     // Apply deferred ensure_visible after occurrence clicks.
-    if let Some(_line) = ensure_line {
+    if let Some(line) = ensure_line {
+        tab.context_line = Some(line);
+        tab.pending_scroll = Some(line);
         tab.ensure_visible();
     }
 
@@ -945,11 +1006,11 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     }
 
     // ---- axis tick labels (smart shorthand) ----
-    let max_ticks_for_width = (hist.width() / 120.0).floor().clamp(2.0, 7.0) as usize;
+    let max_ticks_for_width = (hist.width() / 160.0).floor().clamp(2.0, 5.0) as usize;
     let domain_units = view_end.saturating_sub(view_start).saturating_add(1);
     let n_ticks = max_ticks_for_width.min(domain_units.clamp(1, 7) as usize);
     let label_y = lanes_bottom + 4.0;
-    let font_id = egui::FontId::monospace(12.0);
+    let font_id = egui::FontId::monospace(11.0);
     let mut tick_xs: Vec<f32> = Vec::with_capacity(n_ticks);
     let mut tick_vs: Vec<i64> = Vec::with_capacity(n_ticks);
 
@@ -1017,21 +1078,31 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             Pos2::new(x, label_y + 2.0 + galley.size().y / 2.0),
             galley.size(),
         );
-        ui.put(
+        let tick_response = ui.put(
             label_rect,
             egui::Label::new(
                 RichText::new(&labels[i])
                     .monospace()
-                    .size(9.0)
+                    .size(10.0)
                     .strong()
                     .color(theme.axis),
             ),
         );
+        if matches!(tab.timeline.domain, TimelineDomain::Sequence) {
+            tick_response.on_hover_text(
+                "L = physical source line; positions follow file order, not elapsed time",
+            );
+        }
     }
 
-    // ---- duration labels BETWEEN each pair of adjacent tick labels ----
+    // ---- restrained duration labels between selected tick pairs ----
     let dur_font = egui::FontId::monospace(8.5);
     for i in 1..n_ticks {
+        // Adjacent deltas repeat the same information on dense axes. Keep a
+        // couple of well-spaced guides only when the labels have room.
+        if n_ticks > 3 && i % 2 == 0 {
+            continue;
+        }
         let mid_x = (tick_xs[i - 1] + tick_xs[i]) / 2.0;
         let delta = tick_vs[i] - tick_vs[i - 1];
         if delta > 0 {
@@ -1051,84 +1122,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         }
     }
 
-    // ---- reset zoom button ----
-    if zoomed {
-        let reset_rect = Rect::from_min_size(
-            hist.right_top() + Vec2::new(-28.0, 2.0),
-            Vec2::new(26.0, 14.0),
-        );
-        let reset_resp = icons::icon_button_at(ui, reset_rect, Icon::Reset, theme.text_muted);
-        if reset_resp.clicked() {
-            tab.timeline_zoom = None;
-        }
-        if reset_resp.hovered() {
-            reset_resp.on_hover_text("Reset zoom to full log");
-        }
-    }
-
-    // ---- pan/zoom hint icons on the right ----
-    if has_filters {
-        let icon_col = Rect::from_min_max(
-            Pos2::new(rect.max.x - 4.0 - ICON_WIDTH, rect.min.y + 4.0),
-            Pos2::new(rect.max.x - 4.0, hist.bottom()),
-        );
-        let icon_center_x = icon_col.center().x;
-        let icon_area_top = icon_col.top() + 4.0;
-        let icon_spacing = 18.0;
-
-        // Zoom icon (↕)
-        let zoom_icon_rect = Rect::from_center_size(
-            Pos2::new(icon_center_x, icon_area_top + icon_spacing * 0.5),
-            Vec2::new(ICON_WIDTH, 14.0),
-        );
-        let zoom_icon_id = ui.id().with("zoom_icon");
-        let zoom_icon_resp = ui.interact(zoom_icon_rect, zoom_icon_id, Sense::hover());
-        let zoom_color = if zoom_icon_resp.hovered() {
-            theme.text
-        } else {
-            theme.text_muted
-        };
-        icons::paint_icon(
-            ui.ctx(),
-            &painter,
-            Icon::ArrowsVertical,
-            zoom_icon_rect.center(),
-            10.0,
-            zoom_color,
-        );
-        if zoom_icon_resp.hovered() {
-            zoom_icon_resp.on_hover_text("Scroll to zoom in/out");
-        }
-
-        // Pan icon (↔)
-        let pan_icon_rect = Rect::from_center_size(
-            Pos2::new(icon_center_x, icon_area_top + icon_spacing * 1.5),
-            Vec2::new(ICON_WIDTH, 14.0),
-        );
-        let pan_icon_id = ui.id().with("pan_icon");
-        let pan_icon_resp = ui.interact(pan_icon_rect, pan_icon_id, Sense::hover());
-        let pan_color = if pan_icon_resp.hovered() {
-            theme.text
-        } else {
-            theme.text_muted
-        };
-        icons::paint_icon(
-            ui.ctx(),
-            &painter,
-            Icon::ArrowsHorizontal,
-            pan_icon_rect.center(),
-            10.0,
-            pan_color,
-        );
-        if pan_icon_resp.hovered() {
-            pan_icon_resp.on_hover_text("Drag to pan left/right");
-        }
-    }
-
     // ---- minimap ----
     painter.rect_filled(minimap, egui::CornerRadius::same(2), theme.minimap_bg);
     // Draw full-range density in one bar per minimap pixel.
-    let full_span = (full_end - full_start).max(1);
     let minimap_bins = tab.timeline.resolve_density_bins(
         &tab.doc,
         full_start,
@@ -1136,6 +1132,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         minimap.width().ceil() as usize,
     );
     let minimap_max = minimap_bins.iter().copied().max().unwrap_or(1).max(1) as f32;
+    let minimap_color = minimap_color(theme);
     for (i, &c) in minimap_bins.iter().enumerate() {
         if c == 0 {
             continue;
@@ -1150,41 +1147,39 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 Pos2::new((map_x + map_bw).min(minimap.right()), minimap.bottom()),
             ),
             egui::CornerRadius::ZERO,
-            theme.minimap_bar,
+            minimap_color,
         );
     }
     // Draw zoom window highlight on minimap.
-    {
-        let frac_left =
-            ((view_start - full_start) as f64 / full_span as f64).clamp(0.0, 1.0) as f32;
-        let frac_right = ((view_end - full_start) as f64 / full_span as f64).clamp(0.0, 1.0) as f32;
-        let win_left = minimap.left() + frac_left * minimap.width();
-        let win_right = minimap.left() + frac_right * minimap.width();
-        let win_rect = Rect::from_min_max(
-            Pos2::new(win_left.max(minimap.left()), minimap.top()),
-            Pos2::new(win_right.min(minimap.right()), minimap.bottom()),
+    let frac_left =
+        ((view_start - full_start) as f64 / full_span as f64).clamp(0.0, 1.0) as f32;
+    let frac_right = ((view_end - full_start) as f64 / full_span as f64).clamp(0.0, 1.0) as f32;
+    let win_left = minimap.left() + frac_left * minimap.width();
+    let win_right = minimap.left() + frac_right * minimap.width();
+    let win_rect = Rect::from_min_max(
+        Pos2::new(win_left.max(minimap.left()), minimap.top()),
+        Pos2::new(win_right.min(minimap.right()), minimap.bottom()),
+    );
+    if win_rect.width() > 1.0 {
+        painter.rect_stroke(
+            win_rect,
+            egui::CornerRadius::same(1),
+            Stroke::new(1.5_f32, theme.minimap_zoom),
+            egui::StrokeKind::Middle,
         );
-        if win_rect.width() > 1.0 {
-            painter.rect_stroke(
-                win_rect,
-                egui::CornerRadius::same(1),
-                Stroke::new(1.5_f32, theme.minimap_zoom),
-                egui::StrokeKind::Middle,
-            );
+    }
+    // Click on minimap → pan to that position.
+    let minimap_resp = ui.interact(minimap, ui.id().with("minimap"), Sense::click());
+    if minimap_resp.clicked() {
+        if let Some(pos) = minimap_resp.interact_pointer_pos() {
+            let frac = ((pos.x - minimap.left()) / minimap.width()).clamp(0.0, 1.0) as f64;
+            let center = full_start + (frac * full_span as f64) as i64;
+            let window = centered_window(center, view_span, full_start, full_end);
+            tab.timeline_zoom = (window != (full_start, full_end)).then_some(window);
         }
-        // Click on minimap → pan to that position.
-        let minimap_resp = ui.interact(minimap, ui.id().with("minimap"), Sense::click());
-        if minimap_resp.clicked() {
-            if let Some(pos) = minimap_resp.interact_pointer_pos() {
-                let frac = ((pos.x - minimap.left()) / minimap.width()).clamp(0.0, 1.0) as f64;
-                let center = full_start + (frac * full_span as f64) as i64;
-                let window = centered_window(center, view_span, full_start, full_end);
-                tab.timeline_zoom = (window != (full_start, full_end)).then_some(window);
-            }
-        }
-        if minimap_resp.hovered() {
-            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-        }
+    }
+    if minimap_resp.hovered() {
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
     }
 
     /*
@@ -1550,7 +1545,7 @@ fn format_occurrence_navigation_text(
     previous: Option<&str>,
 ) -> String {
     format!(
-        "OCCURANCE: {position}/{total}  |  PREV: {} ago  |  NEXT: after {}",
+        "OCCURRENCE: {position}/{total}  |  PREV: {} ago  |  NEXT: after {}",
         previous.unwrap_or("—"),
         next.unwrap_or("—")
     )
@@ -1580,7 +1575,7 @@ fn show_occurrence_navigation(
     ui.add_space(offset);
     ui.label(
         RichText::new(text)
-            .size(14.0)
+            .size(12.0)
             .color(animated_color(theme.text_muted)),
     );
 }
@@ -1642,7 +1637,7 @@ fn pin_marker_tooltip(
 fn v_caption(domain: TimelineDomain, v: i64) -> String {
     match domain {
         TimelineDomain::Time { .. } => format_ms(v),
-        TimelineDomain::Sequence => format!("~line {}", v + 1),
+        TimelineDomain::Sequence => format!("source line L{}", v + 1),
     }
 }
 
@@ -1661,11 +1656,11 @@ mod tests {
     fn occurrence_navigation_uses_one_fixed_label_template() {
         assert_eq!(
             format_occurrence_navigation_text(2, 8, Some("200ms"), Some("1.5sec")),
-            "OCCURANCE: 2/8  |  PREV: 1.5sec ago  |  NEXT: after 200ms"
+            "OCCURRENCE: 2/8  |  PREV: 1.5sec ago  |  NEXT: after 200ms"
         );
         assert_eq!(
             format_occurrence_navigation_text(1, 1, None, None),
-            "OCCURANCE: 1/1  |  PREV: — ago  |  NEXT: after —"
+            "OCCURRENCE: 1/1  |  PREV: — ago  |  NEXT: after —"
         );
     }
 
@@ -1707,6 +1702,23 @@ mod tests {
         assert_eq!(minimap.bottom(), minimap.top() + MINIMAP_HEIGHT);
         assert_eq!(minimap.left(), hist.left());
         assert_eq!(minimap.right(), hist.right());
+    }
+
+    #[test]
+    fn minimap_is_always_visible_with_default_height() {
+        assert_eq!(minimap_height(), 8.0 + MINIMAP_HEIGHT);
+    }
+
+    #[test]
+    fn minimap_default_color_follows_the_active_theme() {
+        assert_eq!(
+            minimap_color(&Theme::light()),
+            Color32::from_rgba_unmultiplied(100, 100, 100, 255)
+        );
+        assert_eq!(
+            minimap_color(&Theme::dark()),
+            Color32::from_rgba_unmultiplied(130, 130, 130, 255)
+        );
     }
 
     #[test]

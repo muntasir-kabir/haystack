@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, RichText, Stroke, StrokeKind};
 
-use logotomy::core::document::LogDocument;
-use logotomy::core::embedded_data::{DataNode, Detection, SourcePos, SourceSpan};
-use logotomy::core::time::format_ms;
+use haystack::core::document::LogDocument;
+use haystack::core::embedded_data::{DataNode, Detection, SourcePos, SourceSpan};
+use haystack::core::time::format_ms;
 
 use super::embedded::presentation;
-use super::{analysis_popup, annotation_popup};
+use super::{analysis_popup, annotation_popup, occurrence_overlay};
 use crate::ui::app::model::{
     AnnotationHoverKey, EmbeddedInspectorMode, LogTab, PinEntry, TrimAction, MAX_FILTERS,
 };
@@ -29,8 +29,6 @@ use crate::ui::util::suggestion_row;
 mod highlight;
 pub use highlight::{line_job, line_job_for_mode, Highlights};
 
-/// Number of digits reserved by the line-number gutter before it grows.
-const GUTTER_DIGITS: usize = 9;
 /// Extra breathing room after the line number and separator.
 const GUTTER_PADDING: f32 = 12.0;
 /// Small baseline adjustment so the gutter sits closer to source text.
@@ -50,6 +48,7 @@ const SELECTION_SCROLL_MARGIN_LINES: usize = 2;
 /// scroll-area closure so we avoid borrow conflicts with `tab`.
 enum RowAction {
     Select,
+    OpenOccurrenceOverlay,
     Pin,
     CopyFull,
     CopyWithoutHeader,
@@ -58,6 +57,9 @@ enum RowAction {
     TrimRight,
     TrimLeft,
     Keyword(String),
+    OpenEmbedded(Detection),
+    SearchField(haystack::core::field_query::FieldQuery),
+    FilterField(haystack::core::field_query::FieldQuery),
 }
 
 #[derive(Default)]
@@ -98,6 +100,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let mut context_pin: Option<(usize, Rect)> = None;
     let mut context_trim: Option<TrimAction> = None;
     let mut context_copy: Option<(usize, RowAction)> = None;
+    let mut context_field_action: Option<RowAction> = None;
+    let mut context_embedded: Option<Detection> = None;
     let mut open_full_line: Option<usize> = None;
     let mut hovered_annotation: Option<annotation_popup::Candidate> = None;
     // Keep a selection-originated highlight authoritative for the whole
@@ -112,6 +116,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let selection_anchor_range = tab.pending_selection.or(selection_range);
     let mut selection_anchor_rect: Option<Rect> = None;
     let mut suppress_select: bool = false;
+    let occurrence_overlay_open = tab.occurrence_overlay.is_some();
 
     let total_visible = match &tab.visible_lines {
         Some(vis) => vis.len(),
@@ -133,9 +138,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
     // ---- scroll area setup ----
     let char_width = ui.ctx().fonts_mut(|f| f.glyph_width(&font_id, ' '));
-    let gutter_width = line_gutter_width(char_width);
+    let gutter_width = line_gutter_width(char_width, n);
     let wrap_offsets = (tab.log_line_display_mode
-        == logotomy::core::settings::LogLineDisplayMode::Wrap)
+        == haystack::core::settings::LogLineDisplayMode::Wrap)
         .then(|| {
             wrap_offsets_for(
                 tab,
@@ -145,14 +150,14 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             )
         });
     let mut scroll_area = if tab.log_line_display_mode
-        == logotomy::core::settings::LogLineDisplayMode::HorizontalScroll
+        == haystack::core::settings::LogLineDisplayMode::HorizontalScroll
     {
         egui::ScrollArea::both()
     } else {
         egui::ScrollArea::vertical()
     }
     .auto_shrink([false, false])
-    .id_salt("log_scroll");
+    .id_salt(("log_scroll", tab.focused_log_view_id));
 
     if let Some(offsets) = wrap_offsets.as_ref() {
         let target = pending
@@ -263,6 +268,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                                     tab.context_line = Some(i);
                                     tab.ensure_visible();
                                 }
+                                Some(RowAction::OpenOccurrenceOverlay) => {
+                                    tab.set_keyword_highlight(None);
+                                    tab.context_line = Some(i);
+                                    tab.ensure_visible();
+                                    tab.open_occurrence_overlay(i);
+                                }
                                 Some(RowAction::Pin) => {
                                     if let Some(anchor_rect) = rendered.anchor_rect {
                                         context_pin = Some((i, anchor_rect));
@@ -281,6 +292,13 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                                     context_trim = Some(TrimAction::TrimLeft(i))
                                 }
                                 Some(RowAction::Keyword(kw)) => tab.set_keyword_highlight(Some(kw)),
+                                Some(RowAction::OpenEmbedded(detection)) => {
+                                    context_embedded = Some(detection)
+                                }
+                                Some(
+                                    action
+                                    @ (RowAction::SearchField(_) | RowAction::FilterField(_)),
+                                ) => context_field_action = Some(action),
                                 _ => {}
                             }
                             if is_select && tab.drag_selecting {
@@ -334,6 +352,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                                 tab.context_line = Some(i);
                                 tab.ensure_visible();
                             }
+                            Some(RowAction::OpenOccurrenceOverlay) => {
+                                tab.set_keyword_highlight(None);
+                                tab.context_line = Some(i);
+                                tab.ensure_visible();
+                                tab.open_occurrence_overlay(i);
+                            }
                             Some(RowAction::Pin) => {
                                 if let Some(anchor_rect) = rendered.anchor_rect {
                                     context_pin = Some((i, anchor_rect));
@@ -358,6 +382,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                                 // search box (Esc / single-click clears it).
                                 tab.set_keyword_highlight(Some(kw));
                             }
+                            Some(RowAction::OpenEmbedded(detection)) => {
+                                context_embedded = Some(detection)
+                            }
+                            Some(
+                                action @ (RowAction::SearchField(_) | RowAction::FilterField(_)),
+                            ) => context_field_action = Some(action),
                             _ => {}
                         }
 
@@ -406,6 +436,29 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
     // Apply deferred context menu actions.
     apply_context_actions(tab, context_pin, context_trim, context_copy, ui.ctx());
+    if let Some(detection) = context_embedded {
+        tab.embedded_inspector = Some(detection);
+    }
+    if let Some(action) = context_field_action {
+        match action {
+            RowAction::SearchField(query) => {
+                tab.find_template_id_mode = false;
+                tab.find_regex = false;
+                tab.find_field_mode = true;
+                tab.find_case_sensitive = query.case_sensitive;
+                tab.find_input = query.expression();
+                tab.start_find(tab.find_input.clone());
+                tab.trigger_search_focus();
+            }
+            RowAction::FilterField(query) => {
+                let color = theme.filter_colors[tab.filters.len() % theme.filter_colors.len()];
+                if let Err(error) = tab.push_field_filter(query, color) {
+                    tab.pending_toast = Some(error);
+                }
+            }
+            _ => {}
+        }
+    }
     if let Some(line) = open_full_line {
         tab.full_line_inspector = Some(line);
     }
@@ -488,7 +541,12 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     }
 
     // ---- arrow-key find navigation ----
-    if tab.pin_modal.is_none() && tab.pending_selection.is_none() {
+    let background_input_blocked = crate::ui::app::overlay::background_input_blocked(ui.ctx());
+    if !background_input_blocked
+        && !occurrence_overlay_open
+        && tab.pin_modal.is_none()
+        && tab.pending_selection.is_none()
+    {
         let search_has_focus = tab.find_rx.is_some() || !tab.find_query.is_empty();
         // Arrow keys belong to whichever text editor owns keyboard input —
         // not only the Log View find box. This includes Add Filter, notes,
@@ -521,11 +579,22 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) && !text_edit_focused {
                 navigate_vertical(tab, true);
             }
+            if should_advance_find_on_enter(
+                search_has_focus,
+                !tab.find_matches.is_empty(),
+                text_edit_focused,
+                i.modifiers == egui::Modifiers::NONE && i.key_pressed(egui::Key::Enter),
+            ) {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                tab.find_next();
+            }
         });
     }
 
     // ---- Esc peels one layer at a time ----
-    if tab.pin_modal.is_none()
+    if !background_input_blocked
+        && !occurrence_overlay_open
+        && tab.pin_modal.is_none()
         && tab.pending_selection.is_none()
         && ui.input(|i| i.key_pressed(egui::Key::Escape))
     {
@@ -541,7 +610,15 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let pointer = ui.input(|i| i.pointer.clone());
     let inner_rect = output.inner_rect;
 
-    if pointer.primary_pressed() {
+    if background_input_blocked {
+        tab.drag_selecting = false;
+        tab.drag_start_pos = None;
+        tab.drag_start_line = None;
+        tab.drag_current_line = None;
+    } else if pointer.primary_pressed()
+        && !occurrence_overlay_open
+        && !ui.input(|i| i.modifiers.shift)
+    {
         if let Some(press_pos) = pointer.latest_pos() {
             if inner_rect.contains(press_pos) {
                 // Don't start a new drag if a popup is visible — the press is on the buttons
@@ -663,6 +740,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             analysis_popup::Action::Cancel => analysis_popup::dismiss(tab),
         }
     }
+
+    occurrence_overlay::show(ui, tab, theme);
 }
 
 /// Render the pin editing modal (comment + log preview). Called from the app
@@ -696,16 +775,14 @@ pub fn pin_modal_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     };
     let font_id = crate::ui::fonts::log_font(tab.log_font_size);
 
-    let mut open = true;
     let mut do_save = false;
     let mut do_cancel = false;
-    egui::Window::new(title)
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(true)
-        .default_width(500.0)
-        .default_height(400.0)
-        .show(ui.ctx(), |ui| {
+    crate::ui::app::overlay::modal(
+        ui.ctx(),
+        "pin_editor_modal",
+        title,
+        egui::vec2(500.0, 400.0),
+        |ui| {
             ui.horizontal(|ui| {
                 let ctx = ui.ctx().clone();
                 ui.add(icons::icon_image(&ctx, Icon::Date, 13.0, theme.text));
@@ -830,11 +907,12 @@ pub fn pin_modal_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     do_cancel = true;
                 }
             });
-        });
+        },
+    );
 
     if do_save {
         save_pin(tab, range);
-    } else if do_cancel || !open {
+    } else if do_cancel {
         tab.pin_modal = None;
         tab.pin_edit_index = None;
         tab.pin_comment.clear();
@@ -857,17 +935,16 @@ pub fn full_line_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme
         return;
     }
     let source = tab.doc.line(line).into_owned();
-    let mut open = true;
-    egui::Window::new(format!("Full line {}", tab.doc.trim_start + line + 1))
-        .id(egui::Id::new((
+    crate::ui::app::overlay::modal(
+        ui.ctx(),
+        (
             "full_line_inspector",
+            tab.focused_log_view_id,
             tab.doc.trim_start + line,
-        )))
-        .open(&mut open)
-        .resizable(true)
-        .default_size(egui::vec2(760.0, 380.0))
-        .min_size(egui::vec2(420.0, 180.0))
-        .show(ui.ctx(), |ui| {
+        ),
+        format!("Full line {}", tab.doc.trim_start + line + 1),
+        egui::vec2(760.0, 380.0),
+        |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("{} bytes", source.len()))
@@ -892,55 +969,39 @@ pub fn full_line_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add(
-                        egui::Label::new(RichText::new(&source).monospace())
-                            .selectable(true)
-                            .extend(),
+                        egui::Label::new(
+                            RichText::new(&source).family(crate::ui::fonts::log_font_family()),
+                        )
+                        .selectable(true)
+                        .extend(),
                     );
                 });
-        });
+        },
+    );
     if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-        open = false;
-    }
-    if !open {
         tab.full_line_inspector = None;
     }
 }
 
-/// Persistent structured-data inspector, drawn as an in-view foreground
-/// overlay so it stays visually attached to the cue that opened it.
+/// Persistent structured-data inspector with modal ownership of application
+/// input so selecting or copying its contents cannot affect the Log View.
 pub fn embedded_data_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let Some(detection) = tab.embedded_inspector.take() else {
         return;
     };
-    let anchor = tab
-        .embedded_inspector_anchor
-        .unwrap_or_else(|| ui.ctx().content_rect().center());
     let screen = ui.ctx().content_rect();
     let default_size = inspector_default_size(&detection, tab.embedded_inspector_mode, screen);
-    let panel_pos = inspector_position(anchor, screen, default_size);
     let mut close = false;
-    let area_response = egui::Window::new("embedded_json_inspector")
-        .id(egui::Id::new("embedded_json_inspector"))
-        .order(egui::Order::Foreground)
-        .title_bar(false)
-        .collapsible(false)
-        .resizable(true)
-        .movable(false)
-        .fixed_pos(panel_pos)
-        .default_size(default_size)
-        .min_size(INSPECTOR_MIN_SIZE)
-        .max_size(inspector_max_size(screen))
-        .frame(
-            egui::Frame::new()
-                .fill(scaled_alpha(theme.surface, 0.98))
-                .stroke(Stroke::new(1.0, scaled_alpha(theme.accent, 0.65)))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::same(10)),
-        )
-        .show(ui.ctx(), |ui| {
+    let title = presentation(detection.detector_id).title;
+    let modal_response = crate::ui::app::overlay::modal(
+        ui.ctx(),
+        ("embedded_data_inspector_modal", tab.focused_log_view_id),
+        title,
+        default_size
+            .max(INSPECTOR_MIN_SIZE)
+            .min(inspector_max_size(screen)),
+        |ui| {
             ui.horizontal(|ui| {
-                let presentation = presentation(detection.detector_id);
-                ui.label(RichText::new(presentation.title).strong());
                 ui.label(detection.summary());
                 ui.separator();
                 ui.label(format!(
@@ -1031,31 +1092,30 @@ pub fn embedded_data_inspector_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &T
                     }
                     EmbeddedInspectorMode::Pretty => {
                         ui.add(
-                            egui::Label::new(RichText::new(&detection.pretty).monospace())
-                                .selectable(true),
+                            egui::Label::new(
+                                RichText::new(&detection.pretty)
+                                    .family(crate::ui::fonts::log_font_family()),
+                            )
+                            .selectable(true),
                         );
                     }
                     EmbeddedInspectorMode::Raw => {
                         ui.add(
-                            egui::Label::new(RichText::new(&detection.raw).monospace())
-                                .selectable(true),
+                            egui::Label::new(
+                                RichText::new(&detection.raw)
+                                    .family(crate::ui::fonts::log_font_family()),
+                            )
+                            .selectable(true),
                         );
                     }
                     EmbeddedInspectorMode::Decoded => {
                         render_decoded_preview(ui, detection.detector_id, &detection.raw, theme);
                     }
                 });
-        });
+        },
+    );
     let escape = ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-    let outside_click = ui.input(|input| {
-        input
-            .pointer
-            .any_click()
-            .then(|| input.pointer.interact_pos())
-            .flatten()
-    });
-    let window_rect = area_response.map(|response| response.response.rect);
-    let dismissed = should_dismiss_inspector(escape, outside_click, window_rect);
+    let dismissed = escape || modal_response.backdrop_response.clicked();
     if close || dismissed {
         tab.embedded_inspector_anchor = None;
     } else {
@@ -1099,7 +1159,12 @@ fn render_decoded_preview(ui: &mut egui::Ui, detector_id: &str, raw: &str, theme
     let decoded = decode_embedded_preview(detector_id, raw)
         .unwrap_or_else(|message| format!("Unable to decode preview: {message}"));
     ui.add(
-        egui::Label::new(RichText::new(decoded).monospace().color(theme.log_text)).selectable(true),
+        egui::Label::new(
+            RichText::new(decoded)
+                .family(crate::ui::fonts::log_font_family())
+                .color(theme.log_text),
+        )
+        .selectable(true),
     );
 }
 
@@ -1214,37 +1279,6 @@ fn inspector_max_size(screen: Rect) -> egui::Vec2 {
     )
 }
 
-fn inspector_position(anchor: Pos2, screen: Rect, size: egui::Vec2) -> Pos2 {
-    let right_space = screen.right() - anchor.x;
-    let x = if right_space >= size.x + INSPECTOR_HORIZONTAL_GAP {
-        anchor.x + INSPECTOR_HORIZONTAL_GAP
-    } else {
-        anchor.x - size.x - INSPECTOR_HORIZONTAL_GAP
-    };
-
-    let below_space = screen.bottom() - anchor.y;
-    let y = if below_space >= size.y + INSPECTOR_VERTICAL_GAP {
-        anchor.y + INSPECTOR_VERTICAL_GAP
-    } else {
-        anchor.y - size.y - INSPECTOR_VERTICAL_GAP
-    };
-
-    Pos2::new(
-        x.clamp(
-            screen.left() + INSPECTOR_HORIZONTAL_GAP,
-            screen.right() - size.x - INSPECTOR_HORIZONTAL_GAP,
-        ),
-        y.clamp(
-            screen.top() + INSPECTOR_VERTICAL_GAP,
-            screen.bottom() - size.y - INSPECTOR_VERTICAL_GAP,
-        ),
-    )
-}
-
-fn should_dismiss_inspector(escape: bool, click: Option<Pos2>, window_rect: Option<Rect>) -> bool {
-    escape || click.is_some_and(|position| window_rect.is_some_and(|rect| !rect.contains(position)))
-}
-
 fn render_data_node(
     ui: &mut egui::Ui,
     label: &str,
@@ -1305,7 +1339,11 @@ fn render_data_node(
 fn data_leaf(ui: &mut egui::Ui, label: &str, display: &str, copy: &str, theme: &Theme) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).strong());
-        ui.label(RichText::new(display).monospace().color(theme.log_text));
+        ui.label(
+            RichText::new(display)
+                .family(crate::ui::fonts::log_font_family())
+                .color(theme.log_text),
+        );
         if icons::icon_action_button(ui, Icon::Copy, theme.text, "Copy this value").clicked() {
             ui.ctx().copy_text(copy.to_string());
         }
@@ -1372,68 +1410,109 @@ fn navigate_vertical(tab: &mut LogTab, next: bool) {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Font-size buttons, trim indicator, and "lines visible" label.
-fn show_toolbar(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme, _max_visible_lines: usize) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
-        if ui
-            .add_sized(
-                egui::vec2(28.0, icons::ACTION_HEIGHT),
-                egui::Button::new("A−").frame_when_inactive(false),
-            )
-            .on_hover_text("Decrease log text size")
-            .clicked()
-        {
-            tab.log_font_size = (tab.log_font_size - 1.0).max(8.0);
-        }
-        if ui
-            .add_sized(
-                egui::vec2(28.0, icons::ACTION_HEIGHT),
-                egui::Button::new("A+").frame_when_inactive(false),
-            )
-            .on_hover_text("Increase log text size")
-            .clicked()
-        {
-            tab.log_font_size = (tab.log_font_size + 1.0).min(24.0);
-        }
-        ui.label(
-            RichText::new(format!("{:.0}px", tab.log_font_size))
-                .monospace()
-                .color(theme.text_muted),
-        );
-        ui.add_space(8.0);
+/// Viewer controls use a local compact metric so the text editor, menus, and
+/// icon actions share one baseline without changing the spacing of dialogs.
+const TOOLBAR_HEIGHT: f32 = 24.0;
 
-        // Trim indicator + reset button
-        if tab.doc.is_trimmed() {
-            let total = tab.doc.total_lines_untrimmed();
-            let current = tab.doc.total_lines();
-            let ctx = ui.ctx().clone();
-            ui.add(icons::icon_image(&ctx, Icon::Trim, 12.0, theme.warning));
+/// Inline font-size controls, trim indicator, and search controls.
+fn show_toolbar(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme, _max_visible_lines: usize) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = TOOLBAR_HEIGHT;
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
+        ui.horizontal(|ui| {
+            
+            if ui
+                .add_sized(
+                    egui::vec2(28.0, TOOLBAR_HEIGHT),
+                    egui::Button::new("A−").frame_when_inactive(false),
+                )
+                .on_hover_text("Decrease log text size")
+                .clicked()
+            {
+                tab.log_font_size = (tab.log_font_size - 1.0).max(8.0);
+            }
+            
+            if ui
+                .add_sized(
+                    egui::vec2(28.0, TOOLBAR_HEIGHT),
+                    egui::Button::new("A+").frame_when_inactive(false),
+                )
+                .on_hover_text("Increase log text size")
+                .clicked()
+            {
+                tab.log_font_size = (tab.log_font_size + 1.0).min(24.0);
+            }
+
             ui.label(
-                RichText::new(format!("{} / {} lines", current, total))
-                    .color(theme.warning)
-                    .size(11.0),
+                RichText::new(format!("{:.0}px", tab.log_font_size))
+                    .monospace()
+                    .color(theme.text_muted),
             );
+
             if icons::action_button(
                 ui,
                 Icon::Reset,
-                "Reset trim",
+                "Reset text size",
                 theme.text,
-                "Reset trim to show all lines",
+                "Reset this Log View's text size to 12 px",
             )
             .clicked()
             {
-                tab.handle_trim_reset();
+                tab.log_font_size = 12.0;
             }
-        }
 
-        // Search controls sit left-aligned, right after the status text, separated
-        // by a separator (not flushed to the right of the toolbar).
-        ui.separator();
-        ui.add_space(8.0);
-        show_search_ui(ui, tab, theme);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            show_export_menu(ui, tab, theme);
+            ui.separator();
+
+            let mut mode = tab.log_line_display_mode;
+            let mode_response =
+                egui::ComboBox::from_id_salt(("log_line_mode", tab.focused_log_view_id))
+                    .selected_text(mode.label())
+                    .show_ui(ui, |ui| {
+                        for candidate in haystack::core::settings::LogLineDisplayMode::ALL {
+                            ui.selectable_value(&mut mode, candidate, candidate.label())
+                                .on_hover_text(candidate.description());
+                        }
+                    })
+                    .response;
+            mode_response.on_hover_text(mode.description());
+            if mode != tab.log_line_display_mode {
+                tab.log_line_display_mode = mode;
+                tab.wrap_layout = None;
+            }
+
+            // Trim indicator + reset button
+            if tab.doc.is_trimmed() {
+                let total = tab.doc.total_lines_untrimmed();
+                let current = tab.doc.total_lines();
+                let ctx = ui.ctx().clone();
+                ui.add(icons::icon_image(&ctx, Icon::Trim, 12.0, theme.warning));
+                ui.label(
+                    RichText::new(format!("{} / {} lines", current, total))
+                        .color(theme.warning)
+                        .size(11.0),
+                );
+                if icons::action_button(
+                    ui,
+                    Icon::Reset,
+                    "Reset trim",
+                    theme.text,
+                    "Reset trim to show all lines",
+                )
+                .clicked()
+                {
+                    tab.handle_trim_reset();
+                }
+            }
+
+            // Search controls sit left-aligned after viewing controls; Export stays
+            // at the far edge without creating a second toolbar row.
+            ui.separator();
+            ui.add_space(4.0);
+            show_search_ui(ui, tab, theme);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                show_export_menu(ui, tab, theme);
+            });
         });
     });
 }
@@ -1445,8 +1524,9 @@ fn show_export_menu(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         "Export",
     )
     .frame_when_inactive(false)
-    .min_size(egui::vec2(0.0, icons::ACTION_HEIGHT));
+    .min_size(egui::vec2(0.0, TOOLBAR_HEIGHT));
     let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+        ui.label(RichText::new("Export scope").small().color(theme.text_muted));
         if let Some((start, end)) = tab.pending_selection.or(tab.selection_range) {
             if icons::action_button(
                 ui,
@@ -1478,9 +1558,9 @@ fn show_export_menu(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         if icons::action_button(
             ui,
             Icon::Export,
-            "Visible / filtered rows",
+            "Current view rows",
             theme.text,
-            "Export every row in the current filtered view",
+            "Export all rows currently in this view; when filters are active, this is the filtered view",
         )
         .clicked()
         {
@@ -1496,7 +1576,7 @@ fn show_export_menu(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     .join("\n"),
                 None => lines_text(tab, 0, last, false, false),
             };
-            save_text_file(tab, "visible-log.txt", text, "Visible rows exported");
+            save_text_file(tab, "current-view.txt", text, "Current view rows exported");
             ui.close();
         }
         if tab.timeline_zoom.is_some() {
@@ -1528,7 +1608,8 @@ fn show_export_menu(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             );
         }
     });
-    response.on_hover_text("Export selected, visible/filtered, or Timeline-range rows.");
+    response
+        .on_hover_text("Export selected rows, the current view, or the current timeline range.");
 }
 
 /// Return cached estimated wrapped-row offsets. The calculation reads each
@@ -1612,12 +1693,12 @@ fn timeline_range_text(tab: &LogTab) -> String {
         return String::new();
     };
     let lines: Vec<usize> = match tab.timeline.domain {
-        logotomy::core::timeline::TimelineDomain::Sequence => {
+        haystack::core::timeline::TimelineDomain::Sequence => {
             let start = start.max(0) as usize;
             let end = end.max(0) as usize;
             (start..=end.min(tab.doc.total_lines().saturating_sub(1))).collect()
         }
-        logotomy::core::timeline::TimelineDomain::Time { .. } => (0..tab.doc.total_lines())
+        haystack::core::timeline::TimelineDomain::Time { .. } => (0..tab.doc.total_lines())
             .filter(|&line| {
                 tab.doc
                     .ts_at_opt(line)
@@ -1670,10 +1751,25 @@ fn find_enter_action(
     }
 }
 
+fn should_advance_find_on_enter(
+    search_active: bool,
+    has_matches: bool,
+    text_edit_focused: bool,
+    enter_pressed: bool,
+) -> bool {
+    search_active && has_matches && !text_edit_focused && enter_pressed
+}
+
+fn has_search_content(find_input: &str, find_query: &str, search_in_flight: bool) -> bool {
+    search_in_flight || !find_input.trim().is_empty() || !find_query.is_empty()
+}
+
 fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     const VALIDATION_DEBOUNCE: Duration = Duration::from_millis(150);
     let search_active = tab.find_rx.is_some() || !tab.find_query.is_empty();
-    if !tab.find_regex && !tab.find_template_id_mode {
+    let search_content =
+        has_search_content(&tab.find_input, &tab.find_query, tab.find_rx.is_some());
+    if !tab.find_regex && !tab.find_template_id_mode && !tab.find_field_mode {
         tab.find_validate_at = None;
         tab.find_error = None;
         tab.find_error_dismissed = false;
@@ -1684,10 +1780,14 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         let input = tab.find_input.trim();
         tab.find_error = if input.is_empty() {
             None
+        } else if tab.find_field_mode {
+            haystack::core::field_query::FieldQuery::parse(input, tab.find_case_sensitive)
+                .and_then(|query| query.bind_to_doc(&tab.doc))
+                .err()
         } else if tab.find_template_id_mode {
-            logotomy::core::search::parse_template_id(input).err()
+            haystack::core::search::parse_template_id(input).err()
         } else {
-            logotomy::core::search::validate_regex(input, tab.find_case_sensitive).err()
+            haystack::core::search::validate_regex(input, tab.find_case_sensitive).err()
         };
         tab.find_validate_at = None;
         tab.find_error_dismissed = false;
@@ -1701,14 +1801,19 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             14.0,
             theme.text_muted,
         ))
-        .on_hover_text("Search the visible log rows");
+        .on_hover_text("Find text, expressions, templates, or fields in this view");
+
+        let hint_text = if tab.find_template_id_mode {
+            "42, T42, or T{42}"
+        } else if tab.find_field_mode {
+            "b >= 9 or loglevel = \"FAULT\""
+        } else {
+            "text or expression"
+        };
+        let find_input_id = tab.find_input_widget_id();
         let output = egui::TextEdit::singleline(&mut tab.find_input)
-            .id(egui::Id::new("log_find_input"))
-            .hint_text(if tab.find_template_id_mode {
-                "42, T42, or T{42} + Enter"
-            } else {
-                "search log + Enter"
-            })
+            .id(find_input_id)
+            .hint_text(hint_text)
             .desired_width(200.0)
             .min_size(egui::vec2(200.0, icons::ACTION_HEIGHT))
             .show(ui);
@@ -1765,7 +1870,9 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         if input_resp.changed() && !tab.find_input.trim().is_empty() {
             tab.search_suggestions_open = false;
         }
-        if input_resp.changed() && (tab.find_regex || tab.find_template_id_mode) {
+        if input_resp.changed()
+            && (tab.find_regex || tab.find_template_id_mode || tab.find_field_mode)
+        {
             tab.find_validate_at = Some(Instant::now() + VALIDATION_DEBOUNCE);
             tab.find_error = None;
             tab.find_error_dismissed = false;
@@ -1776,12 +1883,17 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         // tying visibility directly to `has_focus` loses the click.
         if tab.search_suggestions_open
             && tab.find_input.trim().is_empty()
-            && !tab.search_history.is_empty()
+            && ((!tab.find_field_mode && !tab.search_history.is_empty())
+                || (tab.doc.record_profile().is_some() && !tab.field_search_history.is_empty()))
             && !tab.find_regex
             && !tab.find_template_id_mode
         {
             let mut chosen = None;
-            let suggestion_area = egui::Area::new(egui::Id::new("log_find_recent_suggestions"))
+            let mut chosen_field = None;
+            let suggestion_area = egui::Area::new(egui::Id::new((
+                "log_find_recent_suggestions",
+                tab.focused_log_view_id,
+            )))
                 .order(egui::Order::Foreground)
                 .fixed_pos(input_resp.rect.left_bottom())
                 .show(ui.ctx(), |ui| {
@@ -1789,17 +1901,37 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                         ui.set_min_width(input_resp.rect.width());
                         ui.set_max_width(input_resp.rect.width());
                         ui.label(RichText::new("Recent searches").weak());
-                        for query in &tab.search_history {
-                            if suggestion_row::show(ui, query)
-                                .on_hover_text("Run this recent search")
-                                .clicked()
-                            {
-                                chosen = Some(query.clone());
+                        if !tab.find_field_mode {
+                            for query in &tab.search_history {
+                                if suggestion_row::show(ui, query)
+                                    .on_hover_text("Run this recent text search")
+                                    .clicked()
+                                {
+                                    chosen = Some(query.clone());
+                                }
+                            }
+                        }
+                        if tab.doc.record_profile().is_some() {
+                            for query in &tab.field_search_history {
+                                if suggestion_row::show(ui, &format!("Field · {}", query.expression()))
+                                    .on_hover_text("Run this typed field search")
+                                    .clicked()
+                                {
+                                    chosen_field = Some(query.clone());
+                                }
                             }
                         }
                     });
                 });
-            if let Some(query) = chosen {
+            if let Some(query) = chosen_field {
+                tab.find_case_sensitive = query.case_sensitive;
+                tab.find_regex = false;
+                tab.find_template_id_mode = false;
+                tab.find_field_mode = true;
+                tab.find_input = query.expression();
+                tab.search_suggestions_open = false;
+                tab.start_find(tab.find_input.clone());
+            } else if let Some(query) = chosen {
                 tab.find_input = query.clone();
                 tab.search_suggestions_open = false;
                 tab.start_find(query);
@@ -1814,15 +1946,19 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
         let mode_label = if tab.find_template_id_mode {
             "Template ID"
+        } else if tab.find_field_mode {
+            "Field"
         } else if tab.find_regex {
             "Regex"
         } else if tab.find_case_sensitive {
-            "Text (Aa)"
+            "Text (case-sensitive)"
         } else {
-            "Text (Ab)"
+            "Text (ignore case)"
         };
         let original_mode = if tab.find_template_id_mode {
             3_u8
+        } else if tab.find_field_mode {
+            4_u8
         } else if tab.find_regex {
             2
         } else if tab.find_case_sensitive {
@@ -1831,18 +1967,20 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             1
         };
         let mut mode = original_mode;
-        egui::ComboBox::from_id_salt("log_find_match_mode")
+        egui::ComboBox::from_id_salt(("log_find_match_mode", tab.focused_log_view_id))
             .selected_text(mode_label)
-            .width(108.0)
+            .width(150.0)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut mode, 0, "Text (Aa)")
+                ui.selectable_value(&mut mode, 0, "Text (case-sensitive)")
                     .on_hover_text("Plain text; match case exactly.");
-                ui.selectable_value(&mut mode, 1, "Text (Ab)")
+                ui.selectable_value(&mut mode, 1, "Text (ignore case)")
                     .on_hover_text("Plain text; match ASCII case-insensitively.");
                 ui.selectable_value(&mut mode, 2, "Regex")
                     .on_hover_text("Rust regular expression; case follows the selected text mode.");
                 ui.selectable_value(&mut mode, 3, "Template ID")
                     .on_hover_text("Mined Drain template ID. Enter digits, Tdigits, or T{digits}.");
+                ui.selectable_value(&mut mode, 4, "Field")
+                    .on_hover_text("Query a captured field, e.g. b >= 9 or loglevel = \"FAULT\".");
             });
         let mode_changed = mode != original_mode;
         if mode_changed {
@@ -1850,24 +1988,34 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 0 => {
                     tab.find_regex = false;
                     tab.find_template_id_mode = false;
+                    tab.find_field_mode = false;
                     tab.find_case_sensitive = true;
                 }
                 1 => {
                     tab.find_regex = false;
                     tab.find_template_id_mode = false;
+                    tab.find_field_mode = false;
                     tab.find_case_sensitive = false;
                 }
                 2 => {
                     tab.find_regex = true;
                     tab.find_template_id_mode = false;
+                    tab.find_field_mode = false;
+                }
+                3 => {
+                    tab.find_regex = false;
+                    tab.find_template_id_mode = true;
+                    tab.find_field_mode = false;
+                    tab.search_suggestions_open = false;
                 }
                 _ => {
                     tab.find_regex = false;
-                    tab.find_template_id_mode = true;
+                    tab.find_template_id_mode = false;
+                    tab.find_field_mode = true;
                     tab.search_suggestions_open = false;
                 }
             }
-            if tab.find_regex || tab.find_template_id_mode {
+            if tab.find_regex || tab.find_template_id_mode || tab.find_field_mode {
                 tab.find_validate_at = Some(Instant::now() + VALIDATION_DEBOUNCE);
                 tab.find_error = None;
                 tab.find_error_dismissed = false;
@@ -1876,6 +2024,14 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 tab.find_validate_at = None;
                 tab.find_error = None;
             }
+        }
+        let field_case_changed = tab.find_field_mode
+            && ui.checkbox(&mut tab.find_case_sensitive, "Case-sensitive")
+                .on_hover_text("Match captured text/path values with exact case; turn off for case-insensitive matching.")
+                .clicked();
+        if field_case_changed {
+            tab.find_validate_at = Some(Instant::now() + VALIDATION_DEBOUNCE);
+            ui.ctx().request_repaint_after(VALIDATION_DEBOUNCE);
         }
 
         let validation_pending = tab.find_validate_at.is_some();
@@ -1888,22 +2044,42 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             ui.input(|i| i.key_pressed(egui::Key::Enter)),
             can_execute,
             trimmed != tab.find_query,
-            mode_changed,
+            mode_changed || field_case_changed,
         ) {
             Some(FindEnterAction::Start) => tab.start_find(trimmed.to_string()),
             Some(FindEnterAction::Next) => tab.find_next(),
             None => {}
         }
 
-        if !tab.find_matches.is_empty() {
-            let pos = tab.find_pos.unwrap_or(0);
-            ui.label(
-                RichText::new(format!("{} / {}", pos + 1, tab.find_matches.len()))
-                    .size(11.0)
-                    .color(theme.text_muted),
-            );
+        let find_status = if tab.find_validate_at.is_some() {
+            Some(("Checking…", theme.text_muted, "Validating the current expression."))
+        } else if let Some(error) = tab.find_error.as_deref() {
+            Some(("Invalid expression", theme.warning, error))
+        } else if tab.find_rx.is_some() {
+            Some(("Searching…", theme.text_muted, "Searching this view in the background."))
+        } else if !tab.find_matches.is_empty() {
+            None
         } else if search_active {
-            ui.label(RichText::new("no matches").size(11.0).color(theme.warning));
+            Some(("No matches", theme.warning, "The completed query found no matches."))
+        } else {
+            None
+        };
+        if let Some((label, color, tooltip)) = find_status {
+            ui.label(RichText::new(label).size(11.0).color(color))
+                .on_hover_text(tooltip);
+        } else if !tab.find_matches.is_empty() {
+            let pos = tab.find_pos.unwrap_or(0);
+            let count = if tab.find_active_spec.as_ref().is_some_and(|spec| spec.field_query.is_some()) {
+                format!(
+                    "{} / {} rows · {} records",
+                    pos + 1,
+                    tab.find_matches.len(),
+                    tab.find_record_count
+                )
+            } else {
+                format!("{} / {}", pos + 1, tab.find_matches.len())
+            };
+            ui.label(RichText::new(count).size(11.0).color(theme.text_muted));
         }
 
         let has_matches = !tab.find_matches.is_empty();
@@ -1932,7 +2108,10 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             tab.find_next();
         }
 
-        if icons::icon_action_button(ui, Icon::Close, theme.text, "Clear search (Esc)").clicked() {
+        if search_content
+            && icons::icon_action_button(ui, Icon::Close, theme.text, "Clear search (Esc)")
+                .clicked()
+        {
             tab.clear_find();
             tab.find_input.clear();
         }
@@ -1942,7 +2121,9 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         let can_add_filter = !tab.find_query.is_empty()
             && !tab.find_matches.is_empty()
             && tab.filters.len() < MAX_FILTERS
-            && !tab.filters.iter().any(|f| f.text == tab.find_query);
+            && !tab.filters.iter().any(|f| f.text == tab.find_query)
+            && !tab.find_active_spec.as_ref().and_then(|spec| spec.field_query.as_ref())
+                .is_some_and(|query| tab.filter_field_queries.iter().flatten().any(|existing| existing == query));
         if can_add_filter {
             if ui
                 .add(
@@ -1959,7 +2140,9 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 let Some(spec) = tab.find_active_spec.clone() else {
                     return;
                 };
-                if let Some(template_id) = spec.template_id {
+                if let Some(query) = spec.field_query {
+                    let _ = tab.push_field_filter(query, color);
+                } else if let Some(template_id) = spec.template_id {
                     tab.push_template_filter(template_id, color);
                 } else {
                     tab.push_filter_with_options(
@@ -1977,19 +2160,49 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         }
     });
 
+    if tab.find_field_mode
+        && !(tab.search_suggestions_open
+            && tab.find_input.trim().is_empty()
+            && !tab.field_search_history.is_empty())
+    {
+        if let Some(anchor) = input_rect {
+            if ui.memory(|memory| memory.has_focus(tab.find_input_widget_id())) {
+                let current = tab.find_input.clone();
+                tab.refresh_field_suggestions(&current);
+                if let Some(completed) = crate::ui::field_query_ui::show(
+                    ui,
+                    "search_field_completion",
+                    &tab.doc,
+                    &current,
+                    tab.field_suggestions.as_ref(),
+                    tab.find_error.as_deref(),
+                    anchor,
+                ) {
+                    tab.find_input = completed;
+                    tab.find_validate_at = Some(Instant::now() + VALIDATION_DEBOUNCE);
+                    ui.ctx().request_repaint_after(VALIDATION_DEBOUNCE);
+                }
+            }
+        }
+    }
+
     if tab.find_validate_at.is_some() {
         ui.ctx().request_repaint_after(VALIDATION_DEBOUNCE);
-    } else if let (Some(error), Some(anchor)) = (&tab.find_error, input_rect) {
-        let mut bubble_open = !tab.find_error_dismissed;
-        error_bubble(
-            ui.ctx(),
-            "log_find_input_error",
-            anchor,
-            BubbleAlign::Below,
-            error,
-            &mut bubble_open,
-        );
-        tab.find_error_dismissed = !bubble_open;
+    } else if !(tab.find_field_mode
+        && ui.memory(|memory| memory.has_focus(tab.find_input_widget_id())))
+    {
+        if let (Some(error), Some(anchor)) = (&tab.find_error, input_rect) {
+            let mut bubble_open = !tab.find_error_dismissed;
+            error_bubble(
+                ui.ctx(),
+                ("log_find_input_error", tab.focused_log_view_id),
+                anchor,
+                BubbleAlign::Below,
+                error,
+                &mut bubble_open,
+            );
+            tab.find_error_dismissed = !bubble_open;
+        }
     }
 }
 
@@ -2324,20 +2537,47 @@ fn render_row(
     selection_range: Option<(usize, usize)>,
     char_width: f32,
     gutter_width: f32,
-    display_mode: logotomy::core::settings::LogLineDisplayMode,
+    display_mode: haystack::core::settings::LogLineDisplayMode,
 ) -> RowRenderResult {
     let mut action: Option<RowAction> = None;
     let mut hovered: Option<annotation_popup::Candidate> = None;
     let mut anchor_rect: Option<Rect> = None;
 
     let in_selection = selection_range.is_some_and(|(lo, hi)| idx >= lo && idx <= hi);
+    let selected_bg = if ui.ctx().input(|input| input.focused) {
+        theme.selection_focused
+    } else {
+        theme.selection_unfocused
+    };
     let bg = if selected {
-        theme.selection_bg
+        selected_bg
     } else if in_selection {
         theme.selection_range_bg
     } else {
         Color32::TRANSPARENT
     };
+
+    // Paint the selection across the complete row. The small left marker keeps
+    // the selected source line discoverable without turning the gutter into a
+    // second, competing highlight surface.
+    let row_rect = Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), row_height),
+    );
+    if bg != Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(row_rect, egui::CornerRadius::ZERO, bg);
+        if selected {
+            ui.painter().rect_filled(
+                Rect::from_min_max(
+                    row_rect.left_top(),
+                    Pos2::new(row_rect.left() + 3.0, row_rect.bottom()),
+                ),
+                egui::CornerRadius::ZERO,
+                theme.accent,
+            );
+        }
+    }
 
     // Build the log content job (no line number, no color marker).
     let job = line_job_for_mode(
@@ -2361,10 +2601,10 @@ fn render_row(
                 egui::Layout::left_to_right(egui::Align::Center),
                 |gutter_ui| {
                     let gutter_rect = gutter_ui.max_rect();
-                    let gutter_fill = if bg == Color32::TRANSPARENT {
-                        theme.gutter_bg
-                    } else {
-                        bg
+            let gutter_fill = if bg == Color32::TRANSPARENT {
+                theme.gutter_bg
+            } else {
+                bg
                     };
                     gutter_ui.painter().rect_filled(
                         gutter_rect,
@@ -2386,7 +2626,11 @@ fn render_row(
                         };
                         let mut line_num_job = egui::text::LayoutJob::default();
                         line_num_job.append(
-                            &format!("{:>width$}: ", idx + 1, width = GUTTER_DIGITS),
+                            &format!(
+                                "{:>width$}: ",
+                                idx + 1,
+                                width = doc.total_lines().max(1).to_string().len()
+                            ),
                             0.0,
                             line_num_fmt,
                         );
@@ -2405,11 +2649,11 @@ fn render_row(
             let content_job = job;
             let content_resp = ui.add(log_content_label(
                 content_job,
-                display_mode == logotomy::core::settings::LogLineDisplayMode::Wrap,
+                display_mode == haystack::core::settings::LogLineDisplayMode::Wrap,
             ));
             anchor_rect = Some(content_resp.rect);
 
-            if display_mode == logotomy::core::settings::LogLineDisplayMode::Truncate
+            if display_mode == haystack::core::settings::LogLineDisplayMode::Truncate
                 && doc.line(idx).len() > highlight::MAX_DISPLAY_BYTES
             {
                 let preview_len = highlight::display_source_len(&doc.line(idx));
@@ -2477,6 +2721,7 @@ fn render_row(
                             )),
                             egui::Sense::hover(),
                         );
+                        paint_annotation_cue(ui, source_rect, theme.timestamp, response.hovered());
                         if response.hovered() {
                             hovered = Some(annotation_popup::Candidate {
                                 key: AnnotationHoverKey::Timestamp { span },
@@ -2516,14 +2761,19 @@ fn render_row(
                         hover_id,
                         egui::Sense::hover(),
                     );
+                    paint_annotation_cue(ui, source_rect, theme.embedded_data, response.hovered());
                     if response.hovered() && hovered.is_none() {
                         hovered = Some(annotation_popup::Candidate { key, source_rect });
                     }
                 }
             }
 
+            // Shift-click is a read-focused occurrence context. It takes
+            // priority over double-click keyword highlighting.
+            if content_resp.clicked() && ui.input(|input| input.modifiers.shift) {
+                action = Some(RowAction::OpenOccurrenceOverlay);
             // Double-click: keyword highlight
-            if content_resp.double_clicked() {
+            } else if content_resp.double_clicked() {
                 let rel_x = ui
                     .input(|i| i.pointer.latest_pos())
                     .map(|p| p.x - content_resp.rect.left())
@@ -2546,6 +2796,80 @@ fn render_row(
                     ui.close();
                 }
                 ui.separator();
+                if let Some(detection) = detections
+                    .iter()
+                    .find(|detection| detection.span.includes_line(original_line))
+                {
+                    if icons::action_button(
+                        ui,
+                        Icon::Analysis,
+                        "Inspect structured data",
+                        theme.text,
+                        "Open the structured-data inspector for this row",
+                    )
+                    .clicked()
+                    {
+                        action = Some(RowAction::OpenEmbedded(detection.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                if doc.record_profile().is_some() {
+                    ui.menu_button("Captured fields", |ui| {
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            let original = doc.trim_start + idx;
+                            for (field, kind) in doc.record_field_schema() {
+                                let Some(span) = doc.record_field_span(original, field) else { continue };
+                                let Some(bytes) = doc.source_bytes(span) else { continue };
+                                let preview: String = String::from_utf8_lossy(&bytes[..bytes.len().min(256)])
+                                    .chars().take(48).collect();
+                                ui.menu_button(format!("{field}: {preview}"), |ui| {
+                                    if ui.button("Copy value").clicked() {
+                                        ui.ctx().copy_text(String::from_utf8_lossy(bytes).into_owned());
+                                        ui.close();
+                                    }
+                                    if !crate::ui::field_query_ui::is_field_criteria_kind(kind) {
+                                        ui.label("Use Text or Regex to search the log message.");
+                                    } else if bytes.len() <= 4096 {
+                                        let value = String::from_utf8_lossy(bytes).into_owned();
+                                        let (operator, value) = if kind == "timestamp" {
+                                            let zoned = chrono::DateTime::parse_from_rfc3339(&value)
+                                                .or_else(|_| chrono::DateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S%.f%z"));
+                                            if zoned.is_ok() {
+                                                (haystack::core::field_query::FieldOperator::Equal, value)
+                                            } else {
+                                                doc.explicit_time_untrimmed(original)
+                                                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                                                    .map_or((haystack::core::field_query::FieldOperator::Exists, String::new()),
+                                                        |time| (haystack::core::field_query::FieldOperator::Equal, time.to_rfc3339()))
+                                            }
+                                        } else {
+                                            (haystack::core::field_query::FieldOperator::Equal, value)
+                                        };
+                                        let query = haystack::core::field_query::FieldQuery {
+                                            field: field.to_owned(),
+                                            operator,
+                                            value,
+                                            case_sensitive: true,
+                                            field_type: Some(kind.to_owned()),
+                                        };
+                                        if ui.button("Search this field value").clicked() {
+                                            action = Some(RowAction::SearchField(query.clone()));
+                                            ui.close();
+                                        }
+                                        if ui.button("Add field filter").clicked() {
+                                            action = Some(RowAction::FilterField(query));
+                                            ui.close();
+                                        }
+                                    } else {
+                                        ui.label("Value is too long for a one-click field query.");
+                                    }
+                                });
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
                 if icons::action_button(
                     ui,
                     Icon::ExternalWindow,
@@ -2652,7 +2976,7 @@ fn log_content_label(job: egui::text::LayoutJob, wrap: bool) -> egui::Label {
 fn search_match_beyond_preview(
     line: &str,
     preview_len: usize,
-    matcher: &logotomy::core::search::FilterHighlighter,
+    matcher: &haystack::core::search::FilterHighlighter,
 ) -> bool {
     matcher
         .spans(line)
@@ -2697,17 +3021,25 @@ fn source_range_rect(
     (rect.width() > 0.0 && rect.height() > 0.0).then_some(rect)
 }
 
-fn line_gutter_width(char_width: f32) -> f32 {
-    char_width * (GUTTER_DIGITS as f32 + 2.0) + GUTTER_PADDING
+fn line_gutter_width(char_width: f32, total_lines: usize) -> f32 {
+    let digits = total_lines.max(1).to_string().len();
+    char_width * (digits as f32 + 2.0) + GUTTER_PADDING
 }
 
-fn scaled_alpha(color: Color32, factor: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(
+fn paint_annotation_cue(ui: &egui::Ui, rect: Rect, color: Color32, emphasized: bool) {
+    let color = Color32::from_rgba_unmultiplied(
         color.r(),
         color.g(),
         color.b(),
-        (color.a() as f32 * factor).round() as u8,
-    )
+        if emphasized { 220 } else { 135 },
+    );
+    let y = rect.bottom() - if emphasized { 1.0 } else { 1.5 };
+    let radius = if emphasized { 1.0 } else { 0.7 };
+    let mut x = rect.left() + 1.0;
+    while x < rect.right() {
+        ui.painter().circle_filled(Pos2::new(x, y), radius, color);
+        x += if emphasized { 3.0 } else { 4.0 };
+    }
 }
 
 /// Apply the deferred pin / trim actions from the context menu.
@@ -2925,6 +3257,16 @@ mod tests {
     use crate::ui::app::model::Filter;
 
     #[test]
+    fn log_scroll_identity_is_distinct_for_each_log_view() {
+        use crate::ui::app::model::LogViewId;
+
+        assert_ne!(
+            egui::Id::new(("log_scroll", LogViewId(1))),
+            egui::Id::new(("log_scroll", LogViewId(2)))
+        );
+    }
+
+    #[test]
     fn focused_search_enter_advances_an_existing_query() {
         assert_eq!(
             find_enter_action(true, false, true, true, false, false),
@@ -2940,12 +3282,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clear_search_is_visible_only_when_search_has_content() {
+        assert!(!has_search_content("", "", false));
+        assert!(has_search_content("error", "", false));
+        assert!(has_search_content("", "error", false));
+        assert!(has_search_content("", "", true));
+    }
+
+    #[test]
+    fn enter_advances_an_active_search_from_the_selected_log_view() {
+        assert!(should_advance_find_on_enter(true, true, false, true));
+        assert!(!should_advance_find_on_enter(true, false, false, true));
+        assert!(!should_advance_find_on_enter(true, true, true, true));
+        assert!(!should_advance_find_on_enter(false, true, false, true));
+        assert!(!should_advance_find_on_enter(true, true, false, false));
+    }
+
     fn write_temp(content: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = std::env::temp_dir().join(format!(
-            "logotomy_log_view_test_{}_{}.log",
+            "haystack_log_view_test_{}_{}.log",
             std::process::id(),
             n
         ));
@@ -3119,8 +3478,8 @@ mod tests {
         tab.scroll_fraction = 0.0;
 
         for mode in [
-            logotomy::core::settings::LogLineDisplayMode::Truncate,
-            logotomy::core::settings::LogLineDisplayMode::HorizontalScroll,
+            haystack::core::settings::LogLineDisplayMode::Truncate,
+            haystack::core::settings::LogLineDisplayMode::HorizontalScroll,
         ] {
             tab.log_line_display_mode = mode;
             // Both modes use one fixed-height row per source line. The target
@@ -3148,8 +3507,8 @@ mod tests {
     #[test]
     fn fully_visible_rows_exclude_clipped_edges_in_fixed_modes() {
         for mode in [
-            logotomy::core::settings::LogLineDisplayMode::Truncate,
-            logotomy::core::settings::LogLineDisplayMode::HorizontalScroll,
+            haystack::core::settings::LogLineDisplayMode::Truncate,
+            haystack::core::settings::LogLineDisplayMode::HorizontalScroll,
         ] {
             assert_eq!(
                 fully_visible_virtual_range(100.0, 50.0, 10.0, None, 20),
@@ -3209,7 +3568,7 @@ mod tests {
         let path = write_temp(&content);
         let doc = LogDocument::open(&path).unwrap();
         let mut tab = LogTab::new(doc);
-        tab.log_line_display_mode = logotomy::core::settings::LogLineDisplayMode::Wrap;
+        tab.log_line_display_mode = haystack::core::settings::LogLineDisplayMode::Wrap;
         tab.viewport_range = Some((10, 14));
         tab.scroll_top_line = Some(10);
         tab.scroll_fraction = 0.0;
@@ -3239,7 +3598,7 @@ mod tests {
         let path = write_temp(&content);
         let doc = LogDocument::open(&path).unwrap();
         let mut tab = LogTab::new(doc);
-        tab.log_line_display_mode = logotomy::core::settings::LogLineDisplayMode::Wrap;
+        tab.log_line_display_mode = haystack::core::settings::LogLineDisplayMode::Wrap;
         tab.scroll_top_line = Some(10);
         tab.scroll_fraction = 0.0;
         // Lines 10..14 occupy 50 visual rows, while the selected wrapped
@@ -3284,9 +3643,9 @@ mod tests {
         tab.viewport_range = Some((5, 9));
 
         for mode in [
-            logotomy::core::settings::LogLineDisplayMode::Truncate,
-            logotomy::core::settings::LogLineDisplayMode::HorizontalScroll,
-            logotomy::core::settings::LogLineDisplayMode::Wrap,
+            haystack::core::settings::LogLineDisplayMode::Truncate,
+            haystack::core::settings::LogLineDisplayMode::HorizontalScroll,
+            haystack::core::settings::LogLineDisplayMode::Wrap,
         ] {
             tab.log_line_display_mode = mode;
             tab.context_line = Some(12);
@@ -3417,23 +3776,9 @@ mod tests {
 
     #[test]
     fn line_number_gutter_reserves_more_than_the_previous_width() {
-        let width = line_gutter_width(8.0);
+        let width = line_gutter_width(8.0, 999_999_999);
         assert!(width > 8.0 * 9.0);
-        assert_eq!(line_gutter_width(8.0), 100.0);
-    }
-
-    #[test]
-    fn inspector_chooses_available_side_and_vertical_space() {
-        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0));
-        let size = egui::vec2(620.0, 480.0);
-        assert_eq!(
-            inspector_position(Pos2::new(100.0, 100.0), screen, size),
-            Pos2::new(104.0, 112.0)
-        );
-        assert_eq!(
-            inspector_position(Pos2::new(1100.0, 740.0), screen, size),
-            Pos2::new(476.0, 248.0)
-        );
+        assert_eq!(line_gutter_width(8.0, 999_999_999), 100.0);
     }
 
     #[test]
@@ -3469,23 +3814,6 @@ mod tests {
     }
 
     #[test]
-    fn inspector_dismisses_on_escape_or_outside_click() {
-        let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), egui::vec2(100.0, 80.0));
-        assert!(should_dismiss_inspector(true, None, Some(rect)));
-        assert!(should_dismiss_inspector(
-            false,
-            Some(Pos2::new(5.0, 5.0)),
-            Some(rect)
-        ));
-        assert!(!should_dismiss_inspector(
-            false,
-            Some(Pos2::new(20.0, 20.0)),
-            Some(rect)
-        ));
-        assert!(!should_dismiss_inspector(false, None, Some(rect)));
-    }
-
-    #[test]
     fn visible_lines_range_uses_sorted_bounds() {
         let lines = [1, 3, 7, 10, 11, 20];
         assert_eq!(visible_lines_in_range(&lines, 3, 11), &[3, 7, 10, 11]);
@@ -3515,8 +3843,8 @@ mod tests {
         let font_id = crate::ui::fonts::log_font(12.0);
 
         // Search match must carry the search highlight background.
-        let search_matcher = logotomy::core::search::build_filter_highlighter(&[
-            logotomy::core::search::FilterSpec::phrase("error"),
+        let search_matcher = haystack::core::search::build_filter_highlighter(&[
+            haystack::core::search::FilterSpec::phrase("error"),
         ])
         .unwrap();
         let hl = Highlights {
@@ -3524,6 +3852,10 @@ mod tests {
             filter_matcher: None,
             search_matcher: Some(&search_matcher),
             search_template_id: None,
+            search_field: None,
+            search_rows: None,
+            filter_fields: None,
+            filter_rows: None,
             keyword_ac: None,
             embedded: None,
         };
@@ -3536,12 +3868,16 @@ mod tests {
         );
 
         // Keyword match must carry the keyword highlight background.
-        let keyword_ac = logotomy::core::search::build_find_automaton("error", true);
+        let keyword_ac = haystack::core::search::build_find_automaton("error", true);
         let hl = Highlights {
             filters: &[],
             filter_matcher: None,
             search_matcher: None,
             search_template_id: None,
+            search_field: None,
+            search_rows: None,
+            filter_fields: None,
+            filter_rows: None,
             keyword_ac: keyword_ac.as_ref(),
             embedded: None,
         };
@@ -3557,6 +3893,61 @@ mod tests {
     }
 
     #[test]
+    fn field_find_highlights_the_exact_captured_value() {
+        use haystack::core::record::{CompiledProfile, RecordProfile};
+        use std::sync::Arc;
+
+        let path = write_temp("2026-07-15 22:26:39.907481+0300 <FAULT> crash\n");
+        let profile = CompiledProfile::compile(RecordProfile::inline(
+            "test:highlight",
+            "Highlight",
+            "{time} <{loglevel}> {log}",
+        ))
+        .unwrap();
+        let doc = LogDocument::open_with_record_profile(
+            &path,
+            haystack::core::document::ParsingConfig::default(),
+            &[],
+            Arc::clone(&profile),
+            Some(haystack::core::time::TimeFormatKind::BuiltIn(
+                &haystack::core::time::Iso,
+            )),
+        )
+        .unwrap();
+        let query = haystack::core::field_query::FieldQuery::parse("loglevel = \"FAULT\"", true)
+            .unwrap()
+            .bind_to_doc(&doc)
+            .unwrap();
+        let rows = [0u32];
+        let highlights = Highlights {
+            filters: &[],
+            filter_matcher: None,
+            search_matcher: None,
+            search_template_id: None,
+            search_field: Some(&query),
+            search_rows: Some(&rows),
+            filter_fields: None,
+            filter_rows: None,
+            keyword_ac: None,
+            embedded: None,
+        };
+        let theme = Theme::dark();
+        let job = line_job(
+            &doc,
+            &highlights,
+            0,
+            false,
+            crate::ui::fonts::log_font(12.0),
+            &theme,
+        );
+        assert!(job.sections.iter().any(|section| {
+            section.format.background == theme.search_highlight_bg
+                && &job.text[section.byte_range.start.0..section.byte_range.end.0] == "FAULT"
+        }));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn higher_priority_highlight_wins_over_filter() {
         let path = write_temp("error\n");
         let doc = LogDocument::open(&path).unwrap();
@@ -3566,12 +3957,12 @@ mod tests {
             text: "error".to_owned(),
             color: Color32::RED,
         }];
-        let filter_matcher = logotomy::core::search::build_filter_highlighter(&[
-            logotomy::core::search::FilterSpec::phrase("error"),
+        let filter_matcher = haystack::core::search::build_filter_highlighter(&[
+            haystack::core::search::FilterSpec::phrase("error"),
         ])
         .unwrap();
-        let search_matcher = logotomy::core::search::build_filter_highlighter(&[
-            logotomy::core::search::FilterSpec::phrase("error"),
+        let search_matcher = haystack::core::search::build_filter_highlighter(&[
+            haystack::core::search::FilterSpec::phrase("error"),
         ])
         .unwrap();
         let hl = Highlights {
@@ -3579,6 +3970,10 @@ mod tests {
             filter_matcher: Some(&filter_matcher),
             search_matcher: Some(&search_matcher),
             search_template_id: None,
+            search_field: None,
+            search_rows: None,
+            filter_fields: None,
+            filter_rows: None,
             keyword_ac: None,
             embedded: None,
         };
@@ -3600,8 +3995,8 @@ mod tests {
     }
 
     #[test]
-    fn embedded_json_underline_coexists_with_search_background() {
-        use logotomy::core::embedded_data::{AnalysisLimits, EmbeddedDataEngine};
+    fn embedded_json_keeps_search_background_without_persistent_underlines() {
+        use haystack::core::embedded_data::{AnalysisLimits, EmbeddedDataEngine};
         use std::sync::atomic::AtomicBool;
 
         let path = write_temp("INFO payload={\"error\":true}\n");
@@ -3612,8 +4007,8 @@ mod tests {
             AnalysisLimits::default(),
             &AtomicBool::new(false),
         );
-        let search_matcher = logotomy::core::search::build_filter_highlighter(&[
-            logotomy::core::search::FilterSpec::phrase("error"),
+        let search_matcher = haystack::core::search::build_filter_highlighter(&[
+            haystack::core::search::FilterSpec::phrase("error"),
         ])
         .unwrap();
         let highlights = Highlights {
@@ -3621,6 +4016,10 @@ mod tests {
             filter_matcher: None,
             search_matcher: Some(&search_matcher),
             search_template_id: None,
+            search_field: None,
+            search_rows: None,
+            filter_fields: None,
+            filter_rows: None,
             keyword_ac: None,
             embedded: Some(&detections),
         };
@@ -3633,16 +4032,20 @@ mod tests {
             crate::ui::fonts::log_font(12.0),
             &theme,
         );
-        assert!(job.sections.iter().any(|section| {
-            section.format.background == theme.search_highlight_bg
-                && section.format.underline.width > 0.0
-        }));
+        assert!(job
+            .sections
+            .iter()
+            .any(|section| { section.format.background == theme.search_highlight_bg }));
+        assert!(job
+            .sections
+            .iter()
+            .all(|section| section.format.underline.width == 0.0));
 
         std::fs::remove_file(path).ok();
     }
 
     #[test]
-    fn explicit_timestamp_has_its_own_quiet_underline() {
+    fn explicit_timestamp_has_no_persistent_underline() {
         let path = write_temp("2026-08-15T19:40:01.123Z INFO ready\n");
         let doc = LogDocument::open(&path).unwrap();
         let theme = Theme::dark();
@@ -3653,6 +4056,10 @@ mod tests {
                 filter_matcher: None,
                 search_matcher: None,
                 search_template_id: None,
+                search_field: None,
+                search_rows: None,
+                filter_fields: None,
+                filter_rows: None,
                 keyword_ac: None,
                 embedded: None,
             },
@@ -3666,14 +4073,13 @@ mod tests {
             .iter()
             .find(|section| section.byte_range.start.0 == 0)
             .expect("timestamp section");
-        assert_eq!(timestamp.format.underline.color, theme.timestamp);
-        assert!(timestamp.format.underline.width > 0.0);
+        assert_eq!(timestamp.format.underline.width, 0.0);
         std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn exact_kv_source_spans_leave_field_gaps_unstyled() {
-        use logotomy::core::embedded_data::{AnalysisLimits, EmbeddedDataEngine};
+        use haystack::core::embedded_data::{AnalysisLimits, EmbeddedDataEngine};
         use std::sync::atomic::AtomicBool;
 
         let path = write_temp("INFO first=1 second=2\n");
@@ -3689,6 +4095,10 @@ mod tests {
             filter_matcher: None,
             search_matcher: None,
             search_template_id: None,
+            search_field: None,
+            search_rows: None,
+            filter_fields: None,
+            filter_rows: None,
             keyword_ac: None,
             embedded: Some(&detections),
         };
@@ -3726,8 +4136,8 @@ mod tests {
 
     #[test]
     fn search_match_beyond_preview_distinguishes_hidden_and_visible_hits() {
-        let matcher = logotomy::core::search::build_filter_highlighter(&[
-            logotomy::core::search::FilterSpec::phrase("needle"),
+        let matcher = haystack::core::search::build_filter_highlighter(&[
+            haystack::core::search::FilterSpec::phrase("needle"),
         ])
         .unwrap();
         assert!(!search_match_beyond_preview(
@@ -3747,14 +4157,14 @@ mod tests {
         assert_eq!(
             highlight::display_text_for_mode(
                 &line,
-                logotomy::core::settings::LogLineDisplayMode::HorizontalScroll,
+                haystack::core::settings::LogLineDisplayMode::HorizontalScroll,
             ),
             line
         );
         assert_eq!(
             highlight::display_text_for_mode(
                 &line,
-                logotomy::core::settings::LogLineDisplayMode::Wrap,
+                haystack::core::settings::LogLineDisplayMode::Wrap,
             ),
             line
         );

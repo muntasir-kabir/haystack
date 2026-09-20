@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use super::{ok, protocol_response, session, tool_err, ServerState};
 
 /// Authenticated client for the GUI's private local IPC socket. Public MCP
-/// clients communicate with Logotomy only over stdio; this socket and its port
+/// clients communicate with Haystack only over stdio; this socket and its port
 /// are internal routing details.
 #[derive(Clone)]
 pub(crate) struct GuiClient {
@@ -43,7 +43,7 @@ impl GuiClient {
     fn ping(&self) -> Result<(), String> {
         let request = json!({
             "jsonrpc": "2.0",
-            "id": "logotomy-attach-check",
+            "id": "haystack-attach-check",
             "method": "ping",
             "params": {}
         });
@@ -108,7 +108,7 @@ pub fn run_gui_bridge() {
             Err(error) => {
                 if let Some(id) = id {
                     let response = ok(id, tool_err(&format!(
-                        "Logotomy GUI session unavailable: {error}. Open a log in Logotomy and choose Start MCP, then retry."
+                        "Haystack GUI session unavailable: {error}. Open a log in Haystack and choose Start MCP, then retry."
                     )));
                     let _ = writeln!(output, "{response}");
                     let _ = output.flush();

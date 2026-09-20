@@ -1,12 +1,12 @@
 use std::sync::atomic::AtomicBool;
 
-use logotomy::{AnalysisLimits, Detection, EmbeddedDataEngine, LogDocument};
+use haystack::{AnalysisLimits, Detection, EmbeddedDataEngine, LogDocument};
 
 fn detect(input: &str) -> Vec<Detection> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
-        "logotomy_embedded_kv_{}_{}.log",
+        "haystack_embedded_kv_{}_{}.log",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));

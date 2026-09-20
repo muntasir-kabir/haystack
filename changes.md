@@ -1,3 +1,168 @@
+# 2026-09-20
+- Increased the application version to 0.1.5.
+- Restricted the main dock to upper Log Views and a shared lower Pinned/Templates panel, while keeping detached Log View windows free-form. Individual Log Views now drag between the main panel and detached Log View windows, with an empty source window closing automatically.
+- Removed the Appearance → Timeline settings and persisted minimap customization; the Timeline overview minimap is always visible with its default theme-aware colors.
+- Removed the Timeline zoom/pan hint controls and their Appearance setting so the histogram and lanes use the full available width.
+- Corrected Timeline lane controls: Everything Else now has a neutral swatch, eye/delete icons use theme foreground colours, zoom/pan visibility no longer hides filter bulk actions, and Overview Minimap settings now clearly apply to the full-file density minimap.
+- Removed the redundant Timeline icon and title from the timeline controls row.
+- Restored the Log View text-size label, A−/A+ controls, pixel-size readout, and reset action inline in the viewer header instead of hiding them under the Text popup.
+- Added Focus Log View, a reversible reading mode from More or the command palette that gives the focused docked Log View the workspace and restores the timeline/dock layout with Exit focus or Escape.
+- Removed detached Log View's duplicate header. Return-to-main now lives in the Log tab beside the existing view controls, while the normal tab-close action remains the permanent-remove path.
+- Compacted dock and Log View chrome to reclaim vertical reading space. The Log View now puts per-view text-size controls in a single Text menu with aligned toolbar metrics.
+- Fixed icon-and-label controls so text does not steal row clicks or show a selectable-text cursor, including Intro recent files, Settings navigation, tabs, and the Recent popup; the Intro Open file action now uses the standard app theme.
+- Updated the in-app SVG brand mark to match the refreshed full-colour application icon, including distinct line colours and the two corner markers.
+- Refreshed the canonical application icon with distinct blue, coral, lavender, and mint log lines, removed the vertical yellow line, and added small yellow and red corner markers; regenerated all runtime and packaged icon assets.
+- Fixed files opened from Recent or the Log View after startup: the one-shot startup active-file preference is now cleared after restoration, allowing newly loaded files to become active instead of leaving an empty tab area.
+- Refined Settings into responsive grouped sections with full-width navigation, immediate per-section resets, readable values, and a compact highlighted log preview; migrated the legacy dark-mode boolean to Light/Dark/System OS-tracked themes. Detached Log View windows now use filename-aware titles and compact chrome for focused-pane scope, shared document/filter state, Return to main window, and explicit permanent removal while preserving native-close and final-view behavior.
+- Simplified the Timeline presentation without changing source-order coordinates or occurrence navigation: lane labels are left-aligned with quiet swatches, baselines and viewport overlays are subdued, zoom retains a labeled Reset zoom action, and occurrence navigation is named explicitly. Renamed the minimap preference to Overview minimap, exposed zoom/pan visibility separately, and made untouched minimap defaults theme-aware while preserving saved overrides.
+- Refined the main shell and Log View hierarchy: file tabs now use a restrained active indicator, Find/Filter controls expose explicit modes and Enter hints, long-line/font/export controls sit beside the viewer, and selected rows/inspectable data use quieter persistent cues. Existing async search, inspectors, filters, pin actions, and per-view state are unchanged.
+- Fixed the empty workspace intro so its logo, guidance, Open file action, drop target, and five recent-file entries share a responsive centered block; cleared stale document status when no file remains open.
+- Kept filter-match text readable by separating categorical marker colours from text colour, preserved selected-row fills beneath overlapping highlights, and changed timeline lane labels to neutral text with explicit colour swatches.
+- Unified the light and dark visual foundations around semantic canvas, surface, text, interaction, severity, search, filter, and embedded-data tokens. Standard egui controls, dock tabs, and custom log/timeline surfaces now share the same palette, including distinct hover, focus, selected, and inactive-window states.
+- Switched the embedded UI face from Inter ExtraLight to Inter Regular, fixed the first frame after a file load so the new log dock renders immediately, and centered the empty-state action buttons.
+
+# 2026-09-19
+- Added Shift-click filter-occurrence context in Log View, centering the chosen row between each filter's nearest surrounding occurrences with retained highlights and embedded-data cues.
+- Replaced the Haystack app icon with the approved transparent midnight-dark magnifying glass, pale subtle lens, and prominent orange lowercase `h` across runtime and packaged icon assets.
+- Refined the Haystack app icon into a minimal magnifying-glass mark by removing the haystack, enlarging the lens, and using a large warm-gold H on the navy background.
+- Rebranded the application as Haystack across the crate, binary, GUI/MCP identifiers, installer metadata, documentation, and assets; replaced the old medical-procedure messaging with needle-in-a-haystack positioning and a new haystack magnifying-glass app icon.
+- Switched the embedded non-log UI face from Inter Thin to Inter ExtraLight (weight 200); Space Mono remains unchanged for Log View and pin content.
+- Set primary non-log UI text to pure white in dark mode and pure black in light mode, including egui-inherited labels and controls; muted, accent, warning, and log colours remain distinct.
+- Embedded Inter Thin for all non-log UI labels, controls, and text while preserving Space Mono for Log View and pin content. Added Inter's original SIL OFL 1.1 license and README attribution.
+- Improved Log View search navigation and Settings clarity: the clear-search action now appears only when search content exists, Enter advances active results in the selected Log View, and Appearance uses larger icon-free group headings with the minimap renamed to Zoomed panel.
+- Fixed the Settings body sizing so the right-side control panel fills the popup and scrolls through all grouped controls instead of being clipped to the navigation height.
+- Flattened Settings navigation to top-level Appearance, Log parsing, AI Assistant, and Support; Appearance now shows View, Timeline, Zoom Panel, Minimap, and Filters as grouped controls in the right panel, with the Close action in the modal title row.
+- Fixed the Settings window hierarchy and layout: removed the duplicate header, stacked all detail controls vertically, grouped View/Timeline/Zoom Panel/Minimap/Filters under Appearance, and added an explicit Close button.
+- Fixed Settings navigation inheriting the modal's horizontal layout, which caused section labels and controls to overlap.
+- Replaced the anchored Settings dropdown with a centered two-column settings window, separating Timeline, Zoom Panel, and Minimap controls. Added a persisted Zoom Panel visibility preference while retaining minimap show/hide, colour, and opacity controls.
+- Moved the Log View add action to the dock panel's standalone add button and recentered the shared timeline when switching to a view whose selected line is outside the current timeline scope.
+- Detached Log View windows now render their own dock panel, starting with one full-panel view and retaining added tabs and layout changes until re-docking.
+
+# Investigate one file from multiple Log Views
+
+Each open file can now have several independent Log Views in dock tabs or native windows. Use the plus action beside a Log tab to branch from its current location; selections, scroll positions, Find sessions, row ranges, inspectors, and embedded-data work stay independent while filters, timeline, pins, templates, trim, parsing, live tailing, and MCP document changes remain shared. Timeline and navigation actions follow the focused Log View. Views keep stable numbered titles, can be re-docked or permanently closed, and the final Log View is protected. Schema-4 sidecars restore the complete keyed layout; earlier unreleased development schemas are rejected safely without migration.
+
+# Keep the Settings dropdown compact and scrollable
+
+Opening application Settings now caps the dropdown at a compact height instead of expanding down the full window. Shorter viewports reduce the cap further, and overflowing settings remain accessible through the vertical scrollbar.
+
+# Put pop-out controls beside workspace tab titles
+
+Log, Pinned, and Templates now each show an External Window control immediately after the tab title instead of at the far edge of the dock leaf. The control exists only in the main dock tab header, so detached windows do not offer a redundant second pop-out action.
+
+# Keep `{log}` out of Field criteria
+
+Field-mode Search and Timeline Filter suggestions now offer only captured header fields. The `{log}` message capture is also excluded from row-context Field actions; users search message bodies with the existing Text or Regex modes instead.
+
+# Make the Timeline minimap configurable
+
+Settings now groups view and filter controls by feature and adds Timeline minimap visibility, colour, and opacity preferences under View → Timeline → Minimap. Existing installations keep the minimap shown with its current opaque bar colour, while hiding it reclaims the unused Timeline height.
+
+# Align record-format tests with the current schema-3 grammar
+
+Record matcher, preview, document-capture, and GUI reparse tests now use required `{time}` templates and exact capture names while preserving their original typing, bounding, ownership, and anchor-restoration coverage.
+
+# Apply the overlay boundary to analysis and suggestion surfaces
+
+Movable analysis bubbles and interactive annotation callouts now receive a transparent modal shield, while recent-search, recent-filter, and focused Field suggestions participate in base-input suppression. Documentation now defines the common modal and popover interaction contract.
+
+# Stop dropdown dismissal clicks from reaching the workspace
+
+Top-bar Format, Recent, Saved Filters, More, Settings, and AI Assistant popovers now sit over a transparent click-and-drag shield. Outside clicks still dismiss immediately, but can no longer select log rows or trigger controls behind the popover.
+
+# Prevent inspectors and pin editors from leaking input
+
+Pin editing, full-line viewing, and structured-data inspection now use the shared modal host, keeping text selection, copying, keyboard navigation, and backdrop clicks isolated from the underlying log.
+
+# Center application dialogs behind one input-blocking modal host
+
+Custom-date and integration editors, command/navigation sheets, filter confirmations, recovery/error dialogs, and ZIP progress now share the centered modal backdrop, so application controls cannot react through them.
+
+# Isolate modal editor input from the log workspace
+
+The log-format editor is now a centered modal, while a shared overlay input owner prevents app shortcuts, Log View selection, and template navigation from consuming events intended for interactive foreground surfaces. Template Left/Right movement is native again instead of relying on manual caret mutation.
+
+# Support ignored log-header fields
+
+New log formats support repeatable typed `{ignore}` declarations such as `{ignore:number}` and `{ignore:path}`. They participate in header matching but are excluded from stored record captures, Field search/filter suggestions, and captured-field inspection; raw text search still sees the original source.
+Template field names now default to token matching, so custom-field setup is no longer required before using a name. The unreleased log-format editor uses one grammar rather than profile-version compatibility behavior.
+
+# Guide log-format customization with examples and diagnostics
+
+The format editor now includes Basic, Named fields, Ignore header values, and Quoted path examples. Preview summaries distinguish records and continuations, while Diagnostics reports successful ignored-header matches without exposing their values as fields.
+
+# Keep template preview work out of the editor frame
+
+Log-format preview compilation and custom date recognizer preparation now run in the background with revision-tagged results. Renaming a format no longer reparses its sample, and the editor keeps the last preview visible as `Updating…` until the latest draft result is ready.
+
+# Make template editing behave like a code editor
+
+Template completion now replaces the complete field or type around the caret, keeps Left/Right navigation native, and uses an overlay so suggestions no longer push the editor layout. Up/Down/Enter/Tab control visible choices, Ctrl/Cmd+Space reopens them, and template literals, names, types, and invalid declarations receive readable syntax coloring.
+
+# Compact log-format authoring groups
+
+The Log format editor now keeps Name, collapsed rules, Template and its validation together, then Sample log and Parsing preview, with Advanced options and Diagnostics collapsed below. The Format dropdown uses the same compact text scale and keeps Edit/New beside the active format, so the first customization flow no longer hides its name or preview behind a large rules block.
+
+# Search and filter captured log-format fields
+
+Search and Timeline Filter now have an explicit Field mode for expressions such as `b >= 9` and `loglevel = "FAULT"`. Matching uses retained record captures, includes continuation rows, offers bounded suggestions from real values, highlights captured spans, and persists typed queries in sidecars, saved filters, and separate recent-search history. Incompatible queries are disabled for review after a format change instead of becoming text queries.
+
+# Retain typed format captures by record
+
+Explicit log formats now keep compact field spans tied to record headers. Captures resolve from continuation rows, and log fields expose the first-line remainder plus continuation segments. A partial live-tail line replays its captures on append instead of leaving stale values.
+
+# Switch log formats from the top bar
+
+A visible Format menu now shows the selected file's applied name and syntax, saved formats, and Auto-detect. Selecting a format reparses the file in the background, and a profile matching zero headers leaves the current view intact.
+
+# Make the log-format editor readable and inline-first
+
+New formats start with self-contained syntax and a sample; the editor now shows full-size rules, syntax help, live field/type/value preview, and cursor-aware placeholder completion. Saving and applying have separate labels, while legacy controls remain available under Advanced options.
+
+# Add schema-2 inline log format parsing
+
+New record profiles can declare arbitrary fields inline with token, number, path, or text types; common aliases resolve to the same semantic fields. Matching is bounded, human-authored iOS/path/URL fixtures are covered, and schema-1 saved formats retain their existing behavior.
+
+# Simplify the log format editor
+
+The Log format window now leads with a real sample line and its template, while regex, timestamp, prefix, and custom-field controls are tucked into Advanced options. The starter iOS layout supports the compact `{a}` and `{b}` token placeholders used in the sample.
+
+# Verify record parsing and document the remaining release gates
+
+Added an explicit-layout production benchmark and recorded deterministic fixture fingerprints, five-run release measurements, full/debug/MCP-only tests, and Linux/Windows cross-target compile checks. Added a regression for appending a first record to an empty file and updated the guide's line-axis and MCP histogram descriptions. The report calls out noisy load measurements and unverified UI/performance gates; no push, tag, or release was made.
+
+# Replay amended live-tail lines exactly
+
+Live tailing now reverses and reanalyzes a final unterminated physical line when more bytes arrive, including its record boundary, time/provenance, diagnostics, and Drain template changes. Incremental filter scans replace hits on that changed row. Yearless BSD syslog, logcat, and glog dates use one visible, per-document reference year, with an explicit profile override that remains stable across appends.
+
+# Apply custom record profiles without losing the investigation
+
+Added a log-format template editor with typed fields, timestamp choice, a bounded background multiline preview, reusable versioned presets, and explicit per-file apply. The selected profile is embedded in the investigation sidecar and available to headless `load_log`; reparsing keeps the old view until success, restores line-based state, and disables stale Template-ID filters for review.
+
+# Keep the primary timeline in source order
+
+The GUI timeline now always uses physical source-line positions, so equal, missing, reversed, and widely separated timestamps cannot reorder or stretch the file. Overview buckets count record starts through the document rank index, filter lanes retain physical-line counts, and legacy saved time zooms migrate through exact time selection to a source-line envelope. MCP histograms add explicit line/time domains and record/physical-line units while retaining their omitted-argument compatibility behavior.
+
+# Make time queries independent of timeline order
+
+Added a provenance-aware time-query service for exact inclusive selections, closest valid-header navigation, and signed clock deltas. GUI Go to Time no longer depends on timeline coordinates, and MCP range tools now evaluate event-time predicates by source scan, preserve discontiguous matches in physical order, exclude unknown-time records, return empty out-of-range selections, and map raw rows back through explicit line numbers.
+
+# Resolve sparse record headers with bounded evidence
+
+Automatic parser discovery now samples distributed contiguous regions under independent 8,192-line and 2 MiB budgets, selects structured formats from anchored header evidence, and resolves timestamp families within the chosen header shape. Two consistent headers can identify long multiline records, explicit profile/date choices bypass popularity thresholds, ambiguous ties remain unresolved, and each document exposes selection confidence, support counts, conflicts, and truncation limits.
+
+# Parse multiline records from anchored headers
+
+Record starts now come from validated, format-aware headers instead of any date found in a physical line. Continuations inherit only their owning record's time; missing or malformed header times reset inheritance and retain typed provenance. Document indexes now include compact time state, rank-assisted record lookup, exact overflow spans, and one locked top-level JSON time field, while RFC 5424 missing timestamps remain real boundaries.
+
+# Compile versioned log-format profiles safely
+
+Added the core schema and bounded anchored compiler for placeholder-based record profiles, including exact byte spans, typed/custom fields, configurable levels, literal-brace escaping, fixed indentation, terminal prefixes, Windows paths, and advanced anchored regex rules. The compiler is available for preview and later parsing phases but is not yet wired into document loading.
+
+# Establish record-parsing correctness and performance baselines
+
+Added a human-authored multiline-record oracle, a deterministic configurable record-log generator, and opt-in stage timings from the production loader. Benchmarks now report record markers and logical retained index bytes so later parser/timeline phases can compare equivalent workloads without treating current false-positive behavior as the oracle.
+
 # Fix Windows analysis-popup tests
 
 Analysis-popup test fixtures now use an atomic numeric suffix rather than Rust test thread names, whose `::` separators are invalid in Windows filenames. A regression check keeps those fixture paths Windows-safe.
@@ -16,7 +181,7 @@ Removed the Timeline gesture hint to reclaim vertical space and moved the minima
 
 # Refresh the complete desktop UX
 
-Standardized the app on recognizable theme-colored SVG actions, rebuilt the responsive `LOGotomy` shell and AI Assistant controls, clarified tabs/empty states, compacted and aligned workspace controls around the data, and reduced every dock leaf to one External Window action. Settings, dialogs, hints, deletion wording, transient-surface dismissal, and both themes now follow consistent grouping, copy, contrast, and interaction rules without changing analysis or persisted schemas.
+Standardized the app on recognizable theme-colored SVG actions, rebuilt the responsive `Haystack` shell and AI Assistant controls, clarified tabs/empty states, compacted and aligned workspace controls around the data, and reduced every dock leaf to one External Window action. Settings, dialogs, hints, deletion wording, transient-surface dismissal, and both themes now follow consistent grouping, copy, contrast, and interaction rules without changing analysis or persisted schemas.
 
 # Keep selection visible during analysis entry
 
@@ -100,7 +265,7 @@ Reordered the top-panel actions to Open File, Recent, Saved Filter, and Views; g
 
 # Remove unsupported binary file associations
 
-Release installers no longer associate `.evt`, `.evtx`, or `.sys` files because logotomy accepts text input rather than Windows Event Log binaries. Updated release validation and packaging documentation to match.
+Release installers no longer associate `.evt`, `.evtx`, or `.sys` files because haystack accepts text input rather than Windows Event Log binaries. Updated release validation and packaging documentation to match.
 
 # Persist per-file investigation state
 
@@ -168,7 +333,7 @@ Limited the default `LogTab::new` convenience constructor to test builds, where 
 
 # Agent-assisted MCP setup and safer GUI handoff
 
-Added a copyable setup prompt at the top of the AI Integration guide so Codex, Claude, or Cline can translate Logotomy's dynamic executable path into its native global/user MCP configuration, while preserving existing servers. Manual client-specific setup remains directly below as a fallback. The live GUI instruction now stops when Logotomy MCP is unavailable and directs the user to **Settings → Integrate with AI Assistant** before sharing the temporary session ID.
+Added a copyable setup prompt at the top of the AI Integration guide so Codex, Claude, or Cline can translate Haystack's dynamic executable path into its native global/user MCP configuration, while preserving existing servers. Manual client-specific setup remains directly below as a fallback. The live GUI instruction now stops when Haystack MCP is unavailable and directs the user to **Settings → Integrate with AI Assistant** before sharing the temporary session ID.
 
 # Unified MCP verification
 
@@ -176,21 +341,21 @@ Verified the stdio-only MCP architecture with the 349-test full suite, MCP-focus
 
 # Unified MCP integration documentation
 
-Rewrote the MCP guide and aligned the in-app guide, README, user guide, feature inventory, and contributor references around one permanent `logotomy --mcp` stdio configuration for Codex, Claude, and Cline. Documented standalone versus `gui_attached` behavior, session-ID handling, resources, compatibility, security, and troubleshooting without any HTTP setup path.
+Rewrote the MCP guide and aligned the in-app guide, README, user guide, feature inventory, and contributor references around one permanent `haystack --mcp` stdio configuration for Codex, Claude, and Cline. Documented standalone versus `gui_attached` behavior, session-ID handling, resources, compatibility, security, and troubleshooting without any HTTP setup path.
 
 Removed HTTP-era `--port` and `--status-file` behavior now fails explicitly instead of being silently ignored.
 
 # Private IPC replaces MCP HTTP
 
-Removed the HTTP MCP transport, CLI port mode, bearer headers, and GUI HTTP endpoint. Agents now connect only through `logotomy --mcp` stdio; a temporary 256-bit GUI session ID authenticates requests forwarded over a private loopback JSON IPC socket.
+Removed the HTTP MCP transport, CLI port mode, bearer headers, and GUI HTTP endpoint. Agents now connect only through `haystack --mcp` stdio; a temporary 256-bit GUI session ID authenticates requests forwarded over a private loopback JSON IPC socket.
 
 # Attachment-aware MCP resources and guidance
 
-Updated `session_info`, `logotomy://session`, `logotomy://guide`, initialization guidance, and lifecycle errors for the unified `standalone` / `gui_attached` model. Expired GUI attachments now clear automatically and return a retryable structured error without exposing the session ID.
+Updated `session_info`, `haystack://session`, `haystack://guide`, initialization guidance, and lifecycle errors for the unified `standalone` / `gui_attached` model. Expired GUI attachments now clear automatically and return a retryable structured error without exposing the session ID.
 
 # Explicit GUI attachment through standard MCP stdio
 
-Added `attach_gui_session` and `detach_gui_session` to the normal `logotomy --mcp` server. A user-supplied 256-bit temporary session ID is validated against the private GUI manifest and a live authenticated ping before calls are routed to the selected GUI log; detach and expiry restore the same preserved standalone state without leaking credentials.
+Added `attach_gui_session` and `detach_gui_session` to the normal `haystack --mcp` server. A user-supplied 256-bit temporary session ID is validated against the private GUI manifest and a live authenticated ping before calls are routed to the selected GUI log; detach and expiry restore the same preserved standalone state without leaking credentials.
 
 # Reusable private GUI MCP client
 
@@ -218,7 +383,7 @@ Added a `session_info` tool and MCP resources that describe the current GUI/head
 
 # Stable MCP bridge for live GUI sessions
 
-Added `logotomy --mcp-gui`, a stable stdio bridge that agents can configure once while Logotomy keeps its random-port GUI HTTP session temporary. GUI sessions now publish an atomic user-private manifest with a 256-bit credential, remove it on stop/exit, avoid logging secrets, and keep the GUI tool surface stable even while no document is attached.
+Added `haystack --mcp-gui`, a stable stdio bridge that agents can configure once while Haystack keeps its random-port GUI HTTP session temporary. GUI sessions now publish an atomic user-private manifest with a 256-bit credential, remove it on stop/exit, avoid logging secrets, and keep the GUI tool surface stable even while no document is attached.
 
 # MCP dual-era transport foundation
 
@@ -370,7 +535,7 @@ Two UI relocations. (1) `src/ui/timeline/view.rs`: the "Show/Hide all filters" a
 
 Replaced hand-drawn `paint_icon` + `ui.interact` buttons with **default egui `Button`s** (icon or icon+text) wherever they fit, so hover feedback and animation come from egui itself and stay consistent across the app. New reusable helpers in `src/ui/icons.rs`: `icon_button_at` (icon-only button placed at an exact rect) and `icon_text_button_at` (icon+text button), both using `ui.put` + zero/minimal `button_padding` for precise placement on the painter-layout timeline. Converted: timeline filter eye **visible/invisible** toggle and **trash delete** per lane (and the Everything Else eye), the **reset-zoom** button, and the bottom-bar **"Show/Hide all filters"** + **"Clear all filters"**; log-view search **▲/▼/✕** now use `Button::new(icon_image(...))` (nav stays disabled/muted when no matches). Also added a **whole-lane hover highlight** in `src/ui/timeline/view.rs`: hovering any part of a filter lane (or Everything Else) paints a translucent lane-colored fill+border background spanning the label column through the lane content, so the visible/invisible marker, filter text, delete button and lane read as one controllable row; the native buttons still render their own hover on top. (`src/ui/timeline/view.rs`, `src/ui/log_view/view.rs`, `src/ui/icons.rs`.)
 
-`sample.log`-style lines use a **non-zero-padded hour with a 12-hour `AM/PM` marker** (often preceded by `U+202F`), which the ISO-8601 regex (zero-padded 24h hour, no AM/PM) rejected, so no timestamp family was detected and the file had no timeline/date. Added a separate `src/core/time/iso12.rs` family (single/double-digit hour, `AM`/`PM`, space/narrow-no-break-space tolerant, 12h→24h conversion) registered in `TIME_FORMATS`, and a full **custom date-recognizer** system: users define a regex with named groups (`year month day hour min sec` + optional `ms`, `ampm`), verify it live in a new **"Custom date"** popup (top bar) which prints `Year: … Month: … Date: … Hour: … Min: … Sec: … MILLI SECOND: …`, and persist to `~/.logotomy/custom_date_format_list.json`. Custom recognizers are compiled and tried alongside the built-ins whenever a file is opened (`LogDocument::open_with_custom` / `load_with_custom`), with a "Re-scan active log" button to re-run on the current file. (`src/core/time/iso12.rs`, `src/core/time/custom.rs`, `src/core/time/mod.rs`, `src/core/document.rs`, `src/core/format/mod.rs`, `src/core/settings.rs`, `src/ui/custom_date/`, `src/ui/app/model.rs`, `src/ui/app/view.rs`.)
+`sample.log`-style lines use a **non-zero-padded hour with a 12-hour `AM/PM` marker** (often preceded by `U+202F`), which the ISO-8601 regex (zero-padded 24h hour, no AM/PM) rejected, so no timestamp family was detected and the file had no timeline/date. Added a separate `src/core/time/iso12.rs` family (single/double-digit hour, `AM`/`PM`, space/narrow-no-break-space tolerant, 12h→24h conversion) registered in `TIME_FORMATS`, and a full **custom date-recognizer** system: users define a regex with named groups (`year month day hour min sec` + optional `ms`, `ampm`), verify it live in a new **"Custom date"** popup (top bar) which prints `Year: … Month: … Date: … Hour: … Min: … Sec: … MILLI SECOND: …`, and persist to `~/.haystack/custom_date_format_list.json`. Custom recognizers are compiled and tried alongside the built-ins whenever a file is opened (`LogDocument::open_with_custom` / `load_with_custom`), with a "Re-scan active log" button to re-run on the current file. (`src/core/time/iso12.rs`, `src/core/time/custom.rs`, `src/core/time/mod.rs`, `src/core/document.rs`, `src/core/format/mod.rs`, `src/core/settings.rs`, `src/ui/custom_date/`, `src/ui/app/model.rs`, `src/ui/app/view.rs`.)
 
 
 
@@ -400,11 +565,11 @@ Search is case-insensitive and scans only currently-visible lines when lane filt
 
 # Fix: CI release smoke test now builds the binary first
 
-The Release workflow (`.github/workflows/release.yml`) failed in the "Smoke-test built binary" step on Windows/macOS because `cargo-packager` does not build the binary itself (and `cargo test` only leaves test-harness artifacts), so `target/<triple>/release/logotomy` never existed. Added a `cargo build --release --target ${{ matrix.target }}` step before the smoke test (which also guarantees the binary exists for the packager step).
+The Release workflow (`.github/workflows/release.yml`) failed in the "Smoke-test built binary" step on Windows/macOS because `cargo-packager` does not build the binary itself (and `cargo test` only leaves test-harness artifacts), so `target/<triple>/release/haystack` never existed. Added a `cargo build --release --target ${{ matrix.target }}` step before the smoke test (which also guarantees the binary exists for the packager step).
 
 # Native OS installers for release (cargo-packager)
 
-Releases now publish **native installers** instead of raw binary tarballs/zips. `.github/workflows/release.yml` builds `logotomy-<version>-setup.exe` (NSIS) on Windows, `.deb` + `.AppImage` on Ubuntu, and `.dmg` (Apple Silicon + Intel) on macOS, uploading them plus `checksums.sha256` to the GitHub Release. The packaging config lives in `Cargo.toml` under `[package.metadata.packager]` (identifier, icons, NSIS/macOS/Linux options). New committed icon assets in `assets/icons/` (128×128 app icon as requested, plus 256/512 PNGs and `logotomy.ico`); on Windows the `.exe` itself embeds the icon + version info via `build.rs`/`winres`, and the NSIS installer uses the same 128-px icon. Manual "binary → installer" steps are documented in `docs/release.md`; `scripts/package-release.sh` wraps build+package for one command.
+Releases now publish **native installers** instead of raw binary tarballs/zips. `.github/workflows/release.yml` builds `haystack-<version>-setup.exe` (NSIS) on Windows, `.deb` + `.AppImage` on Ubuntu, and `.dmg` (Apple Silicon + Intel) on macOS, uploading them plus `checksums.sha256` to the GitHub Release. The packaging config lives in `Cargo.toml` under `[package.metadata.packager]` (identifier, icons, NSIS/macOS/Linux options). New committed icon assets in `assets/icons/` (128×128 app icon as requested, plus 256/512 PNGs and `haystack.ico`); on Windows the `.exe` itself embeds the icon + version info via `build.rs`/`winres`, and the NSIS installer uses the same 128-px icon. Manual "binary → installer" steps are documented in `docs/release.md`; `scripts/package-release.sh` wraps build+package for one command.
 
 # Fix cross-platform keyboard shortcut startup deadlock
 
@@ -418,15 +583,15 @@ Log text (the central log view, the pin preview modal, and the pinned-lines pane
 
 GUI timeline/filter/pin UX batch:
 - **Filter tooltip with match count** — hovering a timeline filter label/eye now shows the full filter text plus its total match count (e.g. `Some Filter (334 occurrences)`) instead of just the truncated name (`src/ui/timeline/view.rs`).
-- **Delete-filter confirmation is always-on by default** — new persistent setting `skip_filter_delete_confirm` (`~/.logotomy/settings.json`, default `false` = always ask). The "Remove Filter" popup gained a **"Do not ask me again"** checkbox that flips and saves the setting; Settings popup gained the matching *Do not ask before deleting a filter* checkbox (`src/core/settings.rs`, `src/ui/app/view.rs`, `src/ui/settings/view.rs`).
+- **Delete-filter confirmation is always-on by default** — new persistent setting `skip_filter_delete_confirm` (`~/.haystack/settings.json`, default `false` = always ask). The "Remove Filter" popup gained a **"Do not ask me again"** checkbox that flips and saves the setting; Settings popup gained the matching *Do not ask before deleting a filter* checkbox (`src/core/settings.rs`, `src/ui/app/view.rs`, `src/ui/settings/view.rs`).
 - **Timeline bottom toolbar** — when filters exist, two left-aligned buttons under the minimap: **Hide/Show all filters** (toggles every filter lane at once, never touches "Everything Else", re-enables it if the view would go blank) and **Clear all filters** (confirmation popup → removes them all). New `LogTab::toggle_all_lanes` / `LogTab::clear_all_filters` + `pending_clear_filters` state (`src/ui/timeline/view.rs`, `src/ui/app/model.rs`).
 - **Pin editing** — each pinned card gained an ✏️ **Edit** button that reopens the same pin creation window pre-filled (`LogTab::pin_edit_index`); `save_pin` now updates the entry in place instead of appending. The pin modal moved to a shared `log_view::pin_modal_ui` drawn at the app level so it works from any dock tab / detached viewport (`src/ui/app/model.rs`, `src/ui/pin_viewer/view.rs`, `src/ui/log_view/view.rs`, `src/ui/app/view.rs`).
 - **`window_resize.svg` redesigned** — replaced the single-rectangle-with-corner-arrows with an asymmetric double-rectangle (overlapping windows) icon so the pop-out affordance reads clearly.
 - Tests: settings serde default + round-trip for the new flag, `toggle_all_lanes` (toggles all lanes, keeps Everything Else, blanks-safe), `clear_all_filters`, and `save_pin` edit-in-place vs new-pin behavior.
 
-# Rename app to logotomy + app icon + settings links
+# Rename app to haystack + app icon + settings links
 
-Renamed the project from `waddaheck` to `logotomy` everywhere: Cargo package/lib/bin name, the single binary + MCP CLI (`logotomy` / `logotomy --mcp`), the data dir `~/.waddaheck` → `~/.logotomy`, the log filename, the MCP server name + config strings in the integrate guide, examples, release workflow, and docs. The app icon is now the bundled `src/ui/icons/logotomy_256.png` — decoded at startup via the `image` crate and set as the native window icon, and rendered in the top-left corner of the toolbar next to the "LOGotomoy" app name. The settings popup gained **Report Bug** (opens the GitHub issues page) and **About** (opens the GitHub repo) buttons, both opening the default browser via a new cross-platform `open_url` helper in `src/ui/settings/view.rs`.
+Renamed the project from `waddaheck` to `haystack` everywhere: Cargo package/lib/bin name, the single binary + MCP CLI (`haystack` / `haystack --mcp`), the data dir `~/.waddaheck` → `~/.haystack`, the log filename, the MCP server name + config strings in the integrate guide, examples, release workflow, and docs. The app icon is now the bundled `src/ui/icons/haystack_256.png` — decoded at startup via the `image` crate and set as the native window icon, and rendered in the top-left corner of the toolbar next to the "LOGotomoy" app name. The settings popup gained **Report Bug** (opens the GitHub issues page) and **About** (opens the GitHub repo) buttons, both opening the default browser via a new cross-platform `open_url` helper in `src/ui/settings/view.rs`.
 # MCP: `with_filtered_log=true` with zero filters short-circuits with a "no log" hint
 
 All 8 MCP analysis tools (`find_occurrences`, `raw_log`, `log_sequence`, `summarize_log`, `get_timeline_histogram`, `get_template_anomalies`, `get_template`, `get_template_samples`) now **short-circuit** when invoked with `with_filtered_log=true` (the default) while `filter_count == 0`: instead of silently scanning the whole file they return a successful `{"comment":"no log","reason":"with_filtered_log=true and no filter count = 0, so no log. Try with with_filtered_log=false for full log file traversal or add filter (tool: filters_add)"}`. The check runs immediately after document resolution (before other arg validation) and applies uniformly in headless + GUI modes. `with_filtered_log=false` restores full-file traversal with zero filters. Tests: `with_filtered_log_no_filters_short_circuits_every_tool` (all 8 tools) plus full-log-path assertions; existing full-log tool tests now pass `with_filtered_log:false`.
@@ -449,7 +614,7 @@ The GUI-started MCP server no longer uses a port from settings — it binds an O
 
 # Show detected log format + date format in the status bar
 
-The top toolbar now shows the active log's detected format and date format (e.g. `format: json · date: field-based`, `format: plain · date: ISO-8601`, `format: cef · date: none`) via a new `LogotomyApp::selected_log_format_status()` helper in `src/ui/app/model.rs`, rendered as a muted label in `src/ui/app/view.rs`. JSON reports `field-based` since its timestamp comes from a field rather than a positional date format.
+The top toolbar now shows the active log's detected format and date format (e.g. `format: json · date: field-based`, `format: plain · date: ISO-8601`, `format: cef · date: none`) via a new `HaystackApp::selected_log_format_status()` helper in `src/ui/app/model.rs`, rendered as a muted label in `src/ui/app/view.rs`. JSON reports `field-based` since its timestamp comes from a field rather than a positional date format.
 
 # Add Apple Unified Logging System (ULS) text format
 
@@ -469,11 +634,11 @@ Reworked the MCP tool surface around how AI agents actually investigate logs. Re
 
 # Rename app "keywords" to "text filters" and the saved keyword-set "Templates" dropdown to "Saved filters"
 
-The GUI's text-filtering feature is renamed from "keywords" to "filters"/"text filter" across code identifiers, comments, UI labels, and docs (e.g. `tab.keywords`→`tab.filters`, `Keyword`→`Filter`, `MAX_KEYWORDS`→`MAX_FILTERS`, timeline `keyword_buckets`→`filter_buckets`, module `src/ui/keywords/`→`src/ui/filters/`). The toolbar dropdown that saved/loaded keyword sets was previously labeled "Templates", colliding with Drain template mining; it is now "Saved filters" (`core/template.rs`→`core/saved_filter.rs`, `Settings::default_template`→`default_filter`, `~/.logotomy/templates/`→`filters/`). Drain log-structure mining and the MCP tool API (which still uses the `keyword` parameter) are intentionally untouched.
+The GUI's text-filtering feature is renamed from "keywords" to "filters"/"text filter" across code identifiers, comments, UI labels, and docs (e.g. `tab.keywords`→`tab.filters`, `Keyword`→`Filter`, `MAX_KEYWORDS`→`MAX_FILTERS`, timeline `keyword_buckets`→`filter_buckets`, module `src/ui/keywords/`→`src/ui/filters/`). The toolbar dropdown that saved/loaded keyword sets was previously labeled "Templates", colliding with Drain template mining; it is now "Saved filters" (`core/template.rs`→`core/saved_filter.rs`, `Settings::default_template`→`default_filter`, `~/.haystack/templates/`→`filters/`). Drain log-structure mining and the MCP tool API (which still uses the `keyword` parameter) are intentionally untouched.
 
 # File-open progress shown in its own new log tab; release matrix targets only supported OS/archs
 
-Opening a file (Recent, Open dialog, or drag-drop) while at least one log tab is open now creates and auto-focuses a dedicated new log tab that shows the loading progress — it no longer appears "inside" the current log tab's content area. Loading tabs appear in the top tab bar as `<name> ⏳` with an inline cancel, and become the normal log tab once loading finishes (`active_loader` state in `LogotomyApp`). Also updated `.github/workflows/release.yml` to keep only latest runners (ubuntu-latest, macos-latest, windows-latest) and to publish binaries solely for windows x86_64, ubuntu/linux x86_64, and mac arm (Apple Silicon) + x86_64 — dropping the `ubuntu-24.04-arm` (aarch64 linux) build.
+Opening a file (Recent, Open dialog, or drag-drop) while at least one log tab is open now creates and auto-focuses a dedicated new log tab that shows the loading progress — it no longer appears "inside" the current log tab's content area. Loading tabs appear in the top tab bar as `<name> ⏳` with an inline cancel, and become the normal log tab once loading finishes (`active_loader` state in `HaystackApp`). Also updated `.github/workflows/release.yml` to keep only latest runners (ubuntu-latest, macos-latest, windows-latest) and to publish binaries solely for windows x86_64, ubuntu/linux x86_64, and mac arm (Apple Silicon) + x86_64 — dropping the `ubuntu-24.04-arm` (aarch64 linux) build.
 
 # Recenter timeline zoom when log-view shadow scrolls out of view
 
@@ -539,7 +704,7 @@ When stopping MCP from the GUI, `stop_mcp()` now signals a shutdown `AtomicBool`
 
 # Dual-mode MCP server: simplified GUI tools (no log_id) + headless tools preserved
 
-When MCP is started from the GUI, the server now exposes 5 simplified tools (`get_occurrence_count`, `get_occurrence_time_range`, `get_logs_within_time`, `find_occurrences`, `get_templates`) that operate on the currently active log without requiring a `log_id` parameter. The `load_log`/`list_logs`/`close_log` tools are hidden in GUI mode. Headless mode (`logotomy --mcp`) retains all 8 original tools. The active tab's document is shared directly (no disk reload), and MCP-originated mutations are auto-refreshed in the UI via a dirty flag. The MCP start button is disabled when no tabs are open with a "Open a log file first" hint. The serving tab shows a "📡 filename (MCP)" badge.
+When MCP is started from the GUI, the server now exposes 5 simplified tools (`get_occurrence_count`, `get_occurrence_time_range`, `get_logs_within_time`, `find_occurrences`, `get_templates`) that operate on the currently active log without requiring a `log_id` parameter. The `load_log`/`list_logs`/`close_log` tools are hidden in GUI mode. Headless mode (`haystack --mcp`) retains all 8 original tools. The active tab's document is shared directly (no disk reload), and MCP-originated mutations are auto-refreshed in the UI via a dirty flag. The MCP start button is disabled when no tabs are open with a "Open a log file first" hint. The serving tab shows a "📡 filename (MCP)" badge.
 
 # Consolidated MCP, Integrate, and Settings menus under a single Settings popup
 
@@ -602,7 +767,7 @@ Replaced `vertical_scroll_offset` with `ui.scroll_to_rect(…, Align::Center)` i
 
 # Persistent settings (recent files, dark mode, MCP port) + file logging
 
-Settings (dark mode, MCP port, recent files list) are now persisted to `~/.logotomy/settings.json` and logging writes to both stderr and a rotating file in `~/.logotomy/logs/`.
+Settings (dark mode, MCP port, recent files list) are now persisted to `~/.haystack/settings.json` and logging writes to both stderr and a rotating file in `~/.haystack/logs/`.
 
 # Timeline shadow position shift (viewport_range miscalculation)
 
@@ -626,7 +791,7 @@ Added right-click pin/analysis system with collapsible bottom panel, replaced ch
 
 # Single binary (GUI + MCP server merged)
 
-Merged separate GUI and MCP binaries into a single `logotomy` binary with an `--mcp` flag, sharing loaded documents and ServerState between modes via a `gui` feature gate.
+Merged separate GUI and MCP binaries into a single `haystack` binary with an `--mcp` flag, sharing loaded documents and ServerState between modes via a `gui` feature gate.
 
 # Dark/Light mode & logging
 
@@ -677,3 +842,18 @@ Filtered visible-line and Log View Find results now retain 32-bit line IDs, and 
 # Add compatible advanced Log View search
 
 Log View search now has a native SVG search icon and the same Text (Aa), Text (Ab), Regex, and Template ID matchers as Timeline filters, with live validation, typed filter promotion, and close/Escape cancellation. Selected Templates rows now start a Template ID Log search instead of exposing first/previous/next/last buttons.
+# Recover visibly from invalid saved log settings
+
+Opening a log now prompts before an invalid saved profile or sidecar can block loading. Users can continue with automatic detection and repair only the invalid profile; malformed state is replaced only after a successful open, while newer-version and unreadable sidecars are left untouched.
+# Flag weak applied log formats
+
+The top-bar Format control now turns amber when an applied format matches fewer than 90% of source log lines. Its menu shows the exact match percentage and directs users to check and update the format.
+# Make log-format save requirements and editing responsive
+
+The log-format editor now marks a missing required name and explains why Save is disabled. Left/Right arrow navigation and Backspace dismiss template suggestions without consuming native text-editor input.
+# Repair invalid saved formats and keep template arrows responsive
+
+Invalid unshipped saved log formats are discarded and the presets file is repaired automatically, with details recorded in the application log instead of a persistent Format warning. Template completion now routes Left/Right cursor movement directly while its popup is visible.
+# Remove obsolete log-format compiler code
+
+Removed unused field variants and custom-field compilation code left behind after the log-format grammar was simplified. The project now builds without warnings from that path.

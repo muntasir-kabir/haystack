@@ -1,0 +1,52 @@
+{
+  "purpose": "Human-authored RF5 schema-3 acceptance fixtures. RF1 stores expected behavior before schema-3 implementation; these cases are not executed until RF5.",
+  "profile_schema_version": 3,
+  "cases": [
+    {
+      "id": "ignored_number",
+      "template": "{time} {thread:number} [{module}:{ignore:number}] {log}",
+      "line": "2026-09-13T10:30:00Z 42 [Network:7] Connected",
+      "fields": {"time": "2026-09-13T10:30:00Z", "thread": "42", "module": "Network", "log": "Connected"},
+      "ignored_spans": ["7"]
+    },
+    {
+      "id": "ignored_path",
+      "template": "{time} file={ignore:path} request={request_id} {log}",
+      "line": "2026-09-13T10:30:00Z file=C:\\Logs\\service.log request=req-7 Completed",
+      "fields": {"time": "2026-09-13T10:30:00Z", "request_id": "req-7", "log": "Completed"},
+      "ignored_spans": ["C:\\Logs\\service.log"]
+    },
+    {
+      "id": "repeated_ignore",
+      "template": "{time} {ignore:number} {module} {ignore:token} {log}",
+      "line": "2026-09-13T10:30:00Z 12 Network DEBUG Connected",
+      "fields": {"time": "2026-09-13T10:30:00Z", "module": "Network", "log": "Connected"},
+      "ignored_spans": ["12", "DEBUG"]
+    },
+    {
+      "id": "ignored_number_rejects_invalid_value",
+      "template": "{time} {ignore:number} {log}",
+      "line": "2026-09-13T10:30:00Z worker-9 Connected",
+      "fields": null
+    },
+    {
+      "id": "multiline_message",
+      "template": "{time} {module} {log}",
+      "line": "2026-09-13T10:30:00Z Network Connected\n  retry completed",
+      "fields": {"time": "2026-09-13T10:30:00Z", "module": "Network", "log": "Connected"},
+      "continuation_lines": 1
+    },
+    {
+      "id": "escaped_braces",
+      "template": "{time} {{id={request_id}}} {log}",
+      "line": "2026-09-13T10:30:00Z {id=req-7} Completed",
+      "fields": {"time": "2026-09-13T10:30:00Z", "request_id": "req-7", "log": "Completed"}
+    },
+    {
+      "id": "quoted_path",
+      "template": "{time} source=\"{source:path}\" {log}",
+      "line": "2026-09-13T10:30:00Z source=\"C:\\Program Files\\App\\service.log\" Completed",
+      "fields": {"time": "2026-09-13T10:30:00Z", "source": "C:\\Program Files\\App\\service.log", "log": "Completed"}
+    }
+  ]
+}

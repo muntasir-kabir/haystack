@@ -1,19 +1,15 @@
 use eframe::egui;
 use egui::RichText;
 
-use crate::ui::app::model::LogotomyApp;
+use crate::ui::app::model::HaystackApp;
+use crate::ui::app::overlay;
 use crate::ui::icons::{self, Icon};
 
-impl LogotomyApp {
+impl HaystackApp {
     pub(super) fn show_filters_dropdown(&mut self, ui: &mut egui::Ui) {
         if let Some(button_rect) = self.filter_button_rect {
-            let popup_id = egui::Id::new("filters_popup");
-            let area = egui::Area::new(popup_id)
-                .current_pos(button_rect.left_bottom())
-                .order(egui::Order::Foreground)
-                .fixed_pos(button_rect.left_bottom());
-            let area_resp = area.show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
+            let popup =
+                overlay::popover(ui.ctx(), "filters_popup", button_rect.left_bottom(), |ui| {
                     ui.set_min_width(260.0);
                     ui.set_max_width(360.0);
                     ui.label(RichText::new("Filters").strong().size(14.0));
@@ -123,20 +119,7 @@ impl LogotomyApp {
                             }
                         });
                 });
-            });
-            let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
-            let outside = ui.input(|input| {
-                input
-                    .pointer
-                    .any_click()
-                    .then(|| input.pointer.interact_pos())
-                    .flatten()
-                    .is_some_and(|position| {
-                        !button_rect.contains(position)
-                            && !area_resp.response.rect.contains(position)
-                    })
-            });
-            if escape || outside {
+            if popup.should_close() {
                 self.show_filter_dropdown = false;
             }
         }

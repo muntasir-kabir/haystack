@@ -1,24 +1,210 @@
 use super::*;
 
 impl LogTab {
+    /// Open the transient Shift-click context using the completed filter
+    /// indexes. This is deliberately independent of lane visibility: the
+    /// popup answers "where are the surrounding occurrences of each filter?"
+    /// rather than recreating the filtered main viewport.
+    pub(crate) fn open_occurrence_overlay(&mut self, selected_line: usize) {
+        let selected_line = selected_line.min(self.doc.total_lines().saturating_sub(1));
+        let (before, after) = occurrence_context_rows(&self.matches, selected_line);
+        let mut overlay = OccurrenceOverlayState {
+            selected_line,
+            before,
+            after,
+            center_selected: true,
+            embedded_detections: Arc::new(Vec::new()),
+            embedded_rx: None,
+        };
+        self.start_occurrence_overlay_embedded_scan(&mut overlay);
+        self.occurrence_overlay = Some(overlay);
+    }
+
+    pub(crate) fn close_occurrence_overlay(&mut self) {
+        self.occurrence_overlay = None;
+        self.annotation_hover = None;
+    }
+
+    fn start_occurrence_overlay_embedded_scan(&self, overlay: &mut OccurrenceOverlayState) {
+        let interest_lines: Vec<usize> = overlay
+            .rows()
+            .map(|line| self.doc.trim_start + line)
+            .collect();
+        if interest_lines.is_empty() {
+            return;
+        }
+        let trim_start = self.doc.trim_start;
+        let trim_end = self.doc.trim_end;
+        let mut intervals: Vec<(usize, usize)> = interest_lines
+            .iter()
+            .map(|&line| {
+                self.doc
+                    .record_range_containing(line)
+                    .map(|record| (record.start.max(trim_start), record.end.min(trim_end)))
+                    .unwrap_or_else(|| {
+                        (
+                            line.saturating_sub(32).max(trim_start),
+                            (line + 513).min(trim_end),
+                        )
+                    })
+            })
+            .collect();
+        intervals.sort_unstable();
+        let mut merged = Vec::<(usize, usize)>::new();
+        for interval in intervals {
+            if let Some(last) = merged.last_mut() {
+                if interval.0 <= last.1 {
+                    last.1 = last.1.max(interval.1);
+                    continue;
+                }
+            }
+            merged.push(interval);
+        }
+
+        let doc = Arc::clone(&self.doc);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        crate::ui::worker_pool::spawn(move || {
+            let engine = EmbeddedDataEngine::default();
+            let limits = AnalysisLimits {
+                max_bytes: 8 * 1024 * 1024,
+                max_lines: 20_000,
+                ..AnalysisLimits::default()
+            };
+            let mut detections = Vec::new();
+            let mut seen = HashSet::<SourceSpan>::new();
+            for (start, end) in merged {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                for detection in
+                    engine.analyze_original_lines(&doc, start..end, limits, &worker_cancel)
+                {
+                    if interest_lines
+                        .iter()
+                        .any(|&line| detection.span.includes_line(line))
+                        && seen.insert(detection.span)
+                    {
+                        detections.push(detection);
+                    }
+                }
+            }
+            detections.sort_by_key(|d| (d.span.start.line, d.span.start.byte));
+            if !worker_cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(Arc::new(detections));
+            }
+        });
+        overlay.embedded_rx = Some((rx, cancel));
+    }
+
+    fn poll_occurrence_overlay_embedded_data(&mut self) -> bool {
+        let Some(overlay) = self.occurrence_overlay.as_mut() else {
+            return false;
+        };
+        let Some((rx, _)) = &overlay.embedded_rx else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(detections) => {
+                overlay.embedded_detections = detections;
+                overlay.embedded_rx = None;
+                false
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => true,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                overlay.embedded_rx = None;
+                false
+            }
+        }
+    }
+
+    pub fn refresh_field_suggestions(&mut self, input: &str) {
+        let Some((field, prefix)) = FieldQuery::completion_context(input) else {
+            self.field_suggestion_key = None;
+            self.field_suggestions = None;
+            if let Some((_, _, cancel)) = self.field_suggestion_rx.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            return;
+        };
+        let key = format!(
+            "{}:{}:{}:{field}\0{prefix}",
+            self.doc.file_size, self.doc.trim_start, self.doc.trim_end
+        );
+        if self.field_suggestion_key.as_deref() != Some(&key) {
+            if let Some((_, _, cancel)) = self.field_suggestion_rx.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.field_suggestion_key = Some(key.clone());
+            self.field_suggestions = None;
+            if self
+                .doc
+                .record_field_type(field)
+                .is_some_and(crate::ui::field_query_ui::is_field_criteria_kind)
+            {
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let cancel = Arc::new(AtomicBool::new(false));
+                let worker_cancel = Arc::clone(&cancel);
+                let doc = Arc::clone(&self.doc);
+                let field = field.to_owned();
+                let prefix = prefix.to_owned();
+                crate::ui::worker_pool::spawn(move || {
+                    let result = haystack::core::field_query::suggest_field_values(
+                        &doc,
+                        &field,
+                        &prefix,
+                        12,
+                        &worker_cancel,
+                    );
+                    let _ = tx.send(result);
+                });
+                self.field_suggestion_rx = Some((key, rx, cancel));
+            }
+        }
+        if let Some((key, rx, _)) = &self.field_suggestion_rx {
+            match rx.try_recv() {
+                Ok(Ok(values)) if self.field_suggestion_key.as_deref() == Some(key) => {
+                    self.field_suggestions = Some(values);
+                    self.field_suggestion_rx = None;
+                }
+                Ok(_) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.field_suggestion_rx = None;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
     pub(super) fn filter_specs_snapshot(&self) -> Vec<search::FilterSpec> {
         self.filters
             .iter()
             .enumerate()
-            .map(|(index, filter)| search::FilterSpec {
-                text: filter.text.clone(),
-                case_sensitive: self
-                    .filter_case_sensitive
-                    .get(index)
-                    .copied()
-                    .unwrap_or(true),
-                polarity: if self.filter_exclude.get(index).copied().unwrap_or(false) {
-                    search::FilterPolarity::Exclude
-                } else {
-                    search::FilterPolarity::Include
-                },
-                regex: self.filter_regex.get(index).copied().unwrap_or(false),
-                template_id: self.filter_template_ids.get(index).copied().flatten(),
+            .map(|(index, filter)| {
+                let query = self.filter_field_queries.get(index).cloned().flatten();
+                let valid = query
+                    .as_ref()
+                    .is_none_or(|query| query.compile(&self.doc).is_ok());
+                search::FilterSpec {
+                    text: if valid {
+                        filter.text.clone()
+                    } else {
+                        String::new()
+                    },
+                    case_sensitive: self
+                        .filter_case_sensitive
+                        .get(index)
+                        .copied()
+                        .unwrap_or(true),
+                    polarity: if self.filter_exclude.get(index).copied().unwrap_or(false) {
+                        search::FilterPolarity::Exclude
+                    } else {
+                        search::FilterPolarity::Include
+                    },
+                    regex: self.filter_regex.get(index).copied().unwrap_or(false),
+                    template_id: self.filter_template_ids.get(index).copied().flatten(),
+                    field_query: valid.then_some(query).flatten(),
+                }
             })
             .collect()
     }
@@ -56,11 +242,12 @@ impl LogTab {
             .collect();
         self.filter_regex = specs.iter().map(|spec| spec.regex).collect();
         self.filter_template_ids = specs.iter().map(|spec| spec.template_id).collect();
+        self.filter_field_queries = specs.iter().map(|spec| spec.field_query.clone()).collect();
         self.filter_join = join;
         self.rescan_filters();
     }
 
-    pub(super) fn apply_mcp_search(&mut self, request: logotomy::mcp::GuiSearch) {
+    pub(super) fn apply_mcp_search(&mut self, request: haystack::mcp::GuiSearch) {
         if !Arc::ptr_eq(&self.doc, &request.doc) {
             return;
         }
@@ -69,13 +256,14 @@ impl LogTab {
         self.find_case_sensitive = spec.case_sensitive;
         self.find_regex = spec.regex;
         self.find_template_id_mode = spec.template_id.is_some();
+        self.find_field_mode = spec.field_query.is_some();
         self.find_template_id = spec.template_id;
         self.find_input = spec.text.clone();
         self.find_query = spec.text.clone();
         self.find_highlighter = search::build_filter_highlighter(&[spec.clone()])
             .ok()
             .map(Arc::new);
-        self.find_active_spec = Some(spec);
+        self.find_active_spec = Some(spec.clone());
         self.find_matches = request.matches;
         // An explicit full-document MCP search may find lines hidden by lane
         // visibility. Reveal those hits so navigation can actually show them;
@@ -96,11 +284,18 @@ impl LogTab {
         self.find_pos = request
             .first_page_line
             .and_then(|line| self.find_matches.binary_search(&(line as u32)).ok());
-        self.search_history
-            .retain(|query| query != &self.find_query);
-        self.search_history.insert(0, self.find_query.clone());
-        self.search_history.truncate(20);
-        self.pending_recent_search = Some(self.find_query.clone());
+        if let Some(query) = spec.field_query.as_ref() {
+            self.field_search_history.retain(|entry| entry != query);
+            self.field_search_history.insert(0, query.clone());
+            self.field_search_history.truncate(20);
+            self.pending_recent_field_search = Some(query.clone());
+        } else {
+            let find_query = self.find_query.clone();
+            self.search_history.retain(|query| query != &find_query);
+            self.search_history.insert(0, find_query.clone());
+            self.search_history.truncate(20);
+            self.pending_recent_search = Some(find_query);
+        }
         if let Some(pos) = self.find_pos {
             self.goto_find_match(pos);
         }
@@ -120,21 +315,33 @@ impl LogTab {
         let timeline = Timeline::build_u32(&doc, &[], DEFAULT_BUCKETS);
 
         // Timeline is fixed above the dock; Pinned and Templates begin below Log.
-        let mut dock_state = DockState::new(vec![ViewTab::Log]);
+        let mut dock_state = DockState::new(vec![ViewTab::Log(LogViewId::INITIAL)]);
         let [_main_surface, _bottom_surface] = dock_state.main_surface_mut().split_below(
             egui_dock::NodeIndex::root(),
             0.8,
             vec![ViewTab::Pinned, ViewTab::Templates],
         );
 
+        let initial_view = LogViewState::new(
+            LogViewId::INITIAL,
+            LogViewId::INITIAL.0,
+            embedded_inspector_mode,
+        );
+        let log_views = BTreeMap::from([(LogViewId::INITIAL, initial_view)]);
+
         LogTab {
+            log_views,
+            focused_log_view_id: LogViewId::INITIAL,
+            log_view_mru: vec![LogViewId::INITIAL],
+            next_log_view_id: LogViewId::INITIAL.0 + 1,
             doc: Arc::clone(&doc),
             filters: Vec::new(),
             filter_case_sensitive: Vec::new(),
             filter_exclude: Vec::new(),
             filter_regex: Vec::new(),
             filter_template_ids: Vec::new(),
-            filter_join: logotomy::core::search::FilterJoin::Any,
+            filter_field_queries: Vec::new(),
+            filter_join: haystack::core::search::FilterJoin::Any,
             filter_history: Vec::new(),
             filter_current_range: false,
             matches: Arc::new(Vec::new()),
@@ -143,8 +350,6 @@ impl LogTab {
             matched_filter_doc: Arc::downgrade(&doc),
             matched_filter_doc_key: FilterDocumentKey::of(&doc),
             timeline,
-            context_line: None,
-            pending_scroll: None,
             template_browser: TemplateBrowserState::default(),
             timeline_zoom: None,
             timeline_brush_start: None,
@@ -158,11 +363,13 @@ impl LogTab {
             filter_input_case_sensitive: true,
             filter_input_regex: false,
             filter_input_template_id: false,
+            filter_input_field_mode: false,
             filter_input_regex_validate_at: None,
             filter_input_regex_error: None,
             filter_input_regex_error_dismissed: false,
             highlighter: None,
             search_rx: None,
+            filter_scan_error: None,
             filter_scan_progress: None,
             visible_rx: None,
             tail_rx: None,
@@ -171,78 +378,388 @@ impl LogTab {
             pending_filter_removal: None,
             pending_clear_filters: false,
             timeline_detached: false,
+            log_focus_mode: false,
             visible_lines: None,
             log_font_size: 12.0,
-            log_line_display_mode: logotomy::core::settings::LogLineDisplayMode::default(),
-            wrap_layout: None,
+            log_line_display_mode: haystack::core::settings::LogLineDisplayMode::default(),
             pins: Vec::new(),
             bottom_panel_open: false,
             pin_comment: String::new(),
             pin_modal: None,
             pin_edit_index: None,
-            selection_range: None,
-            pending_selection: None,
-            drag_selecting: false,
-            drag_start_line: None,
-            drag_current_line: None,
-            drag_start_pos: None,
-            selection_popup_pos: None,
-            analysis_popup: None,
-            next_analysis_popup_id: 0,
-            viewport_range: None,
-            log_viewport_height: None,
-            scroll_top_line: None,
-            scroll_fraction: 0.0,
-            pending_scroll_restore: None,
-            preserve_anchor: None,
             applied_filter: None,
-            find_input: String::new(),
-            find_query: String::new(),
-            find_case_sensitive: false,
-            find_regex: false,
-            find_template_id_mode: false,
-            find_template_id: None,
-            find_active_spec: None,
-            find_validate_at: None,
-            find_error: None,
-            find_error_dismissed: false,
-            find_matches: Vec::new(),
-            find_pos: None,
-            find_highlighter: None,
-            find_rx: None,
             search_history: Vec::new(),
+            field_search_history: Vec::new(),
             pending_recent_search: None,
+            pending_recent_field_search: None,
             pending_recent_filter: None,
-            search_suggestions_open: false,
             filter_suggestions_open: false,
-            full_line_inspector: None,
-            keyword_highlight: None,
-            keyword_automaton: None,
-            embedded_detections: Arc::new(Vec::new()),
-            embedded_rx: None,
-            embedded_scan_key: None,
-            embedded_pending_key: None,
-            embedded_pending_at: None,
-            embedded_epoch: 0,
-            embedded_inspector: None,
-            embedded_inspector_anchor: None,
-            embedded_inspector_mode,
-            annotation_hover: None,
-            search_focus_requested: false,
-            search_focus_anim: None,
             filter_highlight: None,
-            occurrence_navigation_animation: None,
             dock_state,
             detached_views: HashSet::new(),
             detached_locations: HashMap::new(),
+            detached_dock_states: HashMap::new(),
             just_closed_viewports: Vec::new(),
             pending_detach: None,
-            saved_dock_state: None,
+            pending_add_log_view: None,
+            active_log_drag: None,
             mcp_serving: false,
             stale: false,
             pending_sidecar_restore: None,
             last_sidecar_snapshot: None,
         }
+    }
+
+    #[allow(dead_code)] // Staged for the MLV3 tab controls.
+    pub fn log_view_count(&self) -> usize {
+        self.log_views.len()
+    }
+
+    pub fn focused_log_view(&self) -> &LogViewState {
+        self.log_views
+            .get(&self.focused_log_view_id)
+            .expect("LogTab must always own its focused Log View")
+    }
+
+    #[allow(dead_code)] // Reserved for explicit shared/view render contexts in MLV6.
+    pub fn focused_log_view_mut(&mut self) -> &mut LogViewState {
+        self.log_views
+            .get_mut(&self.focused_log_view_id)
+            .expect("LogTab must always own its focused Log View")
+    }
+
+    pub fn find_input_widget_id(&self) -> egui::Id {
+        egui::Id::new(("log_find_input", self.focused_log_view_id))
+    }
+
+    pub fn focus_log_view(&mut self, id: LogViewId) -> bool {
+        if !self.log_views.contains_key(&id) {
+            return false;
+        }
+        self.focused_log_view_id = id;
+        self.log_view_mru.retain(|candidate| *candidate != id);
+        self.log_view_mru.insert(0, id);
+        // A Log View owns its selection while the timeline zoom is shared by
+        // the file. Switching views must bring the newly focused selection
+        // back into the current timeline scope when necessary.
+        self.ensure_visible();
+        true
+    }
+
+    /// Create an independent view at the focused view's current location.
+    /// Find, selection, inspectors, popups, and workers intentionally start
+    /// empty; only durable location state is forked.
+    pub fn add_log_view(&mut self) -> LogViewId {
+        let id = LogViewId(self.next_log_view_id);
+        self.next_log_view_id = self.next_log_view_id.saturating_add(1);
+        let source = self.focused_log_view();
+        let view = LogViewState::fork_from(source, id, id.0);
+        self.log_views.insert(id, view);
+        self.focus_log_view(id);
+        id
+    }
+
+    /// Move a Log View to the main dock or another detached native window.
+    /// The main dock is rebuilt into its intentional two-region form after a
+    /// move, so a transferred Log View can never land in the lower utility
+    /// panel.
+    pub fn dock_log_view(&mut self, id: LogViewId, target: LogDockTarget) -> bool {
+        let view_tab = ViewTab::Log(id);
+        if !self.log_views.contains_key(&id) {
+            return false;
+        }
+        let target_window = match target {
+            LogDockTarget::Main => None,
+            LogDockTarget::Detached(window)
+                if matches!(window, ViewTab::Log(_)) && self.detached_views.contains(&window) =>
+            {
+                Some(window)
+            }
+            LogDockTarget::Detached(_) => return false,
+        };
+
+        let source_main = self.dock_state.find_tab(&view_tab).is_some();
+        let source_window = self
+            .detached_dock_states
+            .iter()
+            .find_map(|(window, state)| state.find_tab(&view_tab).map(|_| *window));
+        if !source_main && source_window.is_none() {
+            return false;
+        }
+        if source_window.is_some() && source_window == target_window {
+            return false;
+        }
+
+        if source_main {
+            let location = self
+                .dock_state
+                .find_tab(&view_tab)
+                .expect("located main Log View must still be present");
+            self.dock_state.remove_tab(location);
+        } else if let Some(window) = source_window {
+            let state = self
+                .detached_dock_states
+                .get_mut(&window)
+                .expect("located detached Log View must retain its dock state");
+            let location = state
+                .find_tab(&view_tab)
+                .expect("located detached Log View must still be present");
+            state.remove_tab(location);
+        }
+
+        match target_window {
+            Some(window) => {
+                let state = self
+                    .detached_dock_states
+                    .get_mut(&window)
+                    .expect("validated detached target must retain its dock state");
+                state.push_to_focused_leaf(view_tab);
+                if source_main {
+                    self.normalize_main_dock_layout();
+                }
+            }
+            None => self.dock_log_view_in_main(id),
+        }
+
+        if let Some(window) = source_window {
+            let source_is_empty = self
+                .detached_dock_states
+                .get(&window)
+                .is_some_and(|state| state.iter_all_tabs().next().is_none());
+            if source_is_empty {
+                self.detached_dock_states.remove(&window);
+                self.detached_views.remove(&window);
+                self.detached_locations.remove(&window);
+            }
+        }
+        self.focus_log_view(id);
+        true
+    }
+
+    fn dock_log_view_in_main(&mut self, id: LogViewId) {
+        let mut logs: Vec<_> = self
+            .dock_state
+            .iter_all_tabs()
+            .filter_map(|(_, tab)| match tab {
+                ViewTab::Log(existing) => Some(*existing),
+                _ => None,
+            })
+            .collect();
+        if !logs.contains(&id) {
+            logs.push(id);
+        }
+        self.rebuild_main_dock(logs);
+    }
+
+    /// Restore the only legal main-window arrangement: Log Views in the top
+    /// leaf, with Pinned and Templates sharing the lower leaf. This also
+    /// sanitizes layouts saved before the placement restriction existed.
+    pub fn normalize_main_dock_layout(&mut self) {
+        let logs = self
+            .dock_state
+            .iter_all_tabs()
+            .filter_map(|(_, tab)| match tab {
+                ViewTab::Log(id) if self.log_views.contains_key(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        self.rebuild_main_dock(logs);
+    }
+
+    /// Whether the visible main dock still matches the fixed top-Log / lower
+    /// utility-panel contract. Detached windows intentionally do not use this
+    /// check and stay free-form.
+    pub fn main_dock_layout_is_legal(&self) -> bool {
+        let mut log_leaf = None;
+        let mut utility_leaf = None;
+        let mut pinned = 0usize;
+        let mut templates = 0usize;
+        for (path, tab) in self.dock_state.iter_all_tabs() {
+            match tab {
+                ViewTab::Log(id) if self.log_views.contains_key(id) => {
+                    if log_leaf
+                        .replace(path.node_path())
+                        .is_some_and(|leaf| leaf != path.node_path())
+                    {
+                        return false;
+                    }
+                }
+                ViewTab::Pinned => {
+                    pinned += 1;
+                    if utility_leaf
+                        .replace(path.node_path())
+                        .is_some_and(|leaf| leaf != path.node_path())
+                    {
+                        return false;
+                    }
+                }
+                ViewTab::Templates => {
+                    templates += 1;
+                    if utility_leaf
+                        .replace(path.node_path())
+                        .is_some_and(|leaf| leaf != path.node_path())
+                    {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        pinned == 1
+            && templates == 1
+            && utility_leaf.is_some()
+            && match log_leaf {
+                Some(log_leaf) => Some(log_leaf) != utility_leaf,
+                // The final Log View may be in a detached native window. The
+                // main window then legitimately retains just its utility tabs.
+                None => true,
+            }
+    }
+
+    fn rebuild_main_dock(&mut self, mut logs: Vec<LogViewId>) {
+        logs.sort();
+        logs.dedup();
+        if logs.is_empty() {
+            self.dock_state = DockState::new(vec![ViewTab::Pinned, ViewTab::Templates]);
+            return;
+        }
+        let mut dock_state = DockState::new(logs.into_iter().map(ViewTab::Log).collect());
+        dock_state.main_surface_mut().split_below(
+            egui_dock::NodeIndex::root(),
+            0.8,
+            vec![ViewTab::Pinned, ViewTab::Templates],
+        );
+        if let Some(path) = dock_state.find_tab(&ViewTab::Log(self.focused_log_view_id)) {
+            let _ = dock_state.set_active_tab(path);
+        }
+        self.dock_state = dock_state;
+    }
+
+    /// Permanently remove a Log View. The final view is an invariant and can
+    /// never be removed through model, middle-click, or UI close paths.
+    pub fn close_log_view(&mut self, id: LogViewId) -> bool {
+        if self.log_views.len() <= 1 || !self.log_views.contains_key(&id) {
+            return false;
+        }
+        let view_tab = ViewTab::Log(id);
+        self.detached_views.remove(&view_tab);
+        self.detached_locations.remove(&view_tab);
+        for state in self.detached_dock_states.values_mut() {
+            state.retain_tabs(|candidate| *candidate != view_tab);
+        }
+        self.detached_dock_states
+            .retain(|_, state| state.iter_all_tabs().next().is_some());
+        self.just_closed_viewports
+            .retain(|candidate| *candidate != view_tab);
+        if self.pending_detach == Some(view_tab) {
+            self.pending_detach = None;
+        }
+        self.log_views.remove(&id);
+        self.log_view_mru.retain(|candidate| *candidate != id);
+        if self.focused_log_view_id == id {
+            let replacement = self
+                .log_view_mru
+                .iter()
+                .copied()
+                .find(|candidate| self.log_views.contains_key(candidate))
+                .or_else(|| self.log_views.keys().next().copied())
+                .expect("closing a Log View must leave one survivor");
+            self.focused_log_view_id = replacement;
+            self.log_view_mru
+                .retain(|candidate| *candidate != replacement);
+            self.log_view_mru.insert(0, replacement);
+        }
+        true
+    }
+
+    /// Move one dock item into the app's native detached-viewport registry.
+    /// Each item retains its own best-effort return location.
+    pub fn detach_dock_view(&mut self, view_tab: ViewTab) -> bool {
+        if self.detached_views.contains(&view_tab)
+            || matches!(view_tab, ViewTab::Log(id) if !self.log_views.contains_key(&id))
+        {
+            return false;
+        }
+        let Some(location) = self.dock_state.find_tab(&view_tab) else {
+            return false;
+        };
+        self.detached_locations.insert(view_tab, location);
+        self.detached_views.insert(view_tab);
+        self.detached_dock_states
+            .insert(view_tab, DockState::new(vec![view_tab]));
+        self.dock_state.remove_tab(location);
+        self.normalize_main_dock_layout();
+        true
+    }
+
+    /// Return a native viewport to its recorded dock leaf. If dock edits made
+    /// that leaf invalid while the window was open, use the focused leaf.
+    pub fn redock_view(&mut self, view_tab: ViewTab) -> bool {
+        let was_detached = self.detached_views.remove(&view_tab);
+        let location = self.detached_locations.remove(&view_tab);
+        let detached_state = self.detached_dock_states.remove(&view_tab);
+        if !was_detached
+            || matches!(view_tab, ViewTab::Log(id) if !self.log_views.contains_key(&id))
+        {
+            return false;
+        }
+        let tabs: Vec<_> = detached_state
+            .into_iter()
+            .flat_map(|state| {
+                state
+                    .iter_all_tabs()
+                    .map(|(_, tab)| *tab)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let tabs = if tabs.is_empty() {
+            // Sidecar restores intentionally keep only logical detached
+            // membership; rebuild the initial one-tab panel lazily.
+            vec![view_tab]
+        } else {
+            tabs
+        };
+        if self.dock_state.find_tab(&view_tab).is_some() {
+            return true;
+        }
+        if let Some(location) = location {
+            if location.surface.is_main() {
+                if let Ok(leaf) = self.dock_state.leaf_mut(location.node_path()) {
+                    let index = egui_dock::TabIndex(location.tab.0.min(leaf.tabs().len()));
+                    for (offset, tab) in tabs.into_iter().enumerate() {
+                        leaf.insert_tab(egui_dock::TabIndex(index.0 + offset), tab);
+                    }
+                    self.normalize_main_dock_layout();
+                    return true;
+                }
+            }
+        }
+        for tab in tabs {
+            self.dock_state.main_surface_mut().push_to_focused_leaf(tab);
+        }
+        self.normalize_main_dock_layout();
+        true
+    }
+
+    pub fn cancel_all_log_view_workers(&self) {
+        for view in self.log_views.values() {
+            view.cancel_workers();
+        }
+    }
+
+    /// Poll view-owned workers without treating render order as focus order.
+    pub fn poll_log_view_workers(&mut self) -> bool {
+        let focused = self.focused_log_view_id;
+        let ids: Vec<_> = self.log_views.keys().copied().collect();
+        let mut pending = false;
+        for id in ids {
+            self.focused_log_view_id = id;
+            pending |= self.poll_find();
+            pending |= self.poll_embedded_data();
+            pending |= self.poll_occurrence_overlay_embedded_data();
+        }
+        self.focused_log_view_id = focused;
+        pending
     }
 
     /// Analyze only contiguous physical source intervals around the current
@@ -417,12 +934,47 @@ impl LogTab {
         self.embedded_epoch = self.embedded_epoch.wrapping_add(1);
     }
 
+    pub(super) fn invalidate_all_log_view_embedded_data(&mut self) {
+        let focused = self.focused_log_view_id;
+        let ids: Vec<_> = self.log_views.keys().copied().collect();
+        for id in ids {
+            self.focused_log_view_id = id;
+            self.invalidate_embedded_data();
+            // A document replacement can rebase source rows, so a transient
+            // occurrence snapshot is safer to close than to silently point at
+            // different lines.
+            self.occurrence_overlay = None;
+        }
+        self.focused_log_view_id = focused;
+    }
+
+    fn capture_all_viewport_anchors(&mut self) {
+        for view in self.log_views.values_mut() {
+            view.preserve_anchor = view.viewport_range.map(|(first, _)| first);
+        }
+    }
+
+    fn restart_all_log_view_searches(&mut self) {
+        let focused = self.focused_log_view_id;
+        let searches: Vec<_> = self
+            .log_views
+            .iter()
+            .filter(|(_, view)| !view.find_query.is_empty())
+            .map(|(id, view)| (*id, view.find_query.clone()))
+            .collect();
+        for (id, query) in searches {
+            self.focused_log_view_id = id;
+            self.start_find(query);
+        }
+        self.focused_log_view_id = focused;
+    }
+
     /// Rebuild the filtered visible-lines list based on active lanes.
     /// If all lanes + Everything Else are active, sets visible_lines to None (fast path).
     pub fn rebuild_visible_lines(&mut self) {
         let n = self.doc.total_lines();
         if n == 0 {
-            self.visible_lines = None;
+            self.install_visible_lines(None, n);
             return;
         }
         while self.lane_active.len() < self.filters.len() {
@@ -432,7 +984,7 @@ impl LogTab {
 
         // Capture the top-visible real line so the log viewport can be
         // preserved across a filter change.
-        self.preserve_anchor = self.viewport_range.map(|(first, _)| first);
+        self.capture_all_viewport_anchors();
 
         let visible_lines = build_visible_lines(
             n,
@@ -443,11 +995,7 @@ impl LogTab {
             self.everything_else_active,
             None,
         );
-        self.install_visible_lines(visible_lines, self.preserve_anchor, n);
-
-        if !self.find_query.is_empty() {
-            self.start_find(self.find_query.clone());
-        }
+        self.install_visible_lines(visible_lines, n);
     }
 
     /// Rebuild the potentially multi-million-entry filtered index on a worker
@@ -463,7 +1011,7 @@ impl LogTab {
         }
         self.lane_active.truncate(self.filters.len());
         let n = self.doc.total_lines();
-        let anchor = self.viewport_range.map(|(first, _)| first);
+        self.capture_all_viewport_anchors();
         let matches = Arc::clone(&self.matches);
         let active = self.lane_active.clone();
         let exclude = self.filter_exclude.clone();
@@ -483,17 +1031,34 @@ impl LogTab {
                 Some(&cancel_worker),
             );
             if !cancel_worker.load(Ordering::Relaxed) {
-                let _ = tx.send(VisibleLinesResult {
-                    visible_lines,
-                    preserve_anchor: anchor,
-                });
+                let _ = tx.send(VisibleLinesResult { visible_lines });
             }
         });
         self.visible_rx = Some((rx, cancel));
     }
 
-    fn nearest_visible_line(&self, line: usize, n: usize) -> Option<usize> {
-        match &self.visible_lines {
+    /// Install a rebuilt visible-line index while keeping the current
+    /// selection authoritative. A viewport anchor is used only when there is
+    /// no selection that can be retained or replaced.
+    fn install_visible_lines(&mut self, visible_lines: Option<Arc<Vec<u32>>>, n: usize) {
+        self.visible_lines = visible_lines;
+        let visible_lines = self.visible_lines.clone();
+        for view in self.log_views.values_mut() {
+            Self::reconcile_log_view_visibility(
+                view,
+                visible_lines.as_deref().map(Vec::as_slice),
+                n,
+            );
+        }
+        self.restart_all_log_view_searches();
+    }
+
+    fn reconcile_log_view_visibility(
+        view: &mut LogViewState,
+        visible_lines: Option<&[u32]>,
+        n: usize,
+    ) {
+        let nearest_visible = |line: usize| match visible_lines {
             Some(visible) => {
                 let insertion = visible
                     .binary_search(&(line as u32))
@@ -513,61 +1078,38 @@ impl LogTab {
                 }
             }
             None => (line < n).then_some(line),
-        }
-    }
+        };
 
-    /// Install a rebuilt visible-line index while keeping the current
-    /// selection authoritative. A viewport anchor is used only when there is
-    /// no selection that can be retained or replaced.
-    fn install_visible_lines(
-        &mut self,
-        visible_lines: Option<Arc<Vec<u32>>>,
-        preserve_anchor: Option<usize>,
-        n: usize,
-    ) {
-        self.visible_lines = visible_lines;
-        if let Some(selected) = self.context_line {
+        if let Some(selected) = view.context_line {
             // Selection is a real document line, rather than a virtual-row
             // index. Keep that identity exactly when the filter update still
             // renders it; only a hidden selection is allowed to move.
-            let selected_is_visible = match self.visible_lines.as_deref() {
+            let selected_is_visible = match visible_lines {
                 Some(visible) => visible.binary_search(&(selected as u32)).is_ok(),
                 None => selected < n,
             };
             let replacement = selected_is_visible
                 .then_some(selected)
-                .or_else(|| self.nearest_visible_line(selected, n));
-            self.context_line = replacement;
-            self.preserve_anchor = None;
-            self.pending_scroll = replacement.filter(|&line| {
+                .or_else(|| nearest_visible(selected));
+            view.context_line = replacement;
+            view.preserve_anchor = None;
+            view.pending_scroll = replacement.filter(|&line| {
                 line != selected
-                    || !self
+                    || !view
                         .viewport_range
                         .is_some_and(|(first, last)| first <= line && line <= last)
             });
             return;
         }
 
-        self.preserve_anchor = preserve_anchor;
-        self.resolve_preserve_anchor(n);
-        self.scroll_to_preserved_anchor();
-    }
-
-    fn resolve_preserve_anchor(&mut self, n: usize) {
-        if let Some(anchor) = self.preserve_anchor {
-            let found = self.nearest_visible_line(anchor, n);
+        if let Some(anchor) = view.preserve_anchor {
+            let found = nearest_visible(anchor);
             if !matches!(found, Some(line) if line == anchor) {
-                self.preserve_anchor = found;
+                view.preserve_anchor = found;
             }
         }
-    }
-
-    /// The log scroll area needs an explicit one-shot target after its row
-    /// count changes. A passive offset hint can be overridden by egui's saved
-    /// scroll state, which made lane toggles fall back to the first row.
-    fn scroll_to_preserved_anchor(&mut self) {
-        if let Some(anchor) = self.preserve_anchor.take() {
-            self.pending_scroll = Some(anchor);
+        if let Some(anchor) = view.preserve_anchor.take() {
+            view.pending_scroll = Some(anchor);
         }
     }
 
@@ -600,6 +1142,9 @@ impl LogTab {
         if idx < self.filter_template_ids.len() {
             self.filter_template_ids.remove(idx);
         }
+        if idx < self.filter_field_queries.len() {
+            self.filter_field_queries.remove(idx);
+        }
         self.rescan_filters();
     }
 
@@ -613,6 +1158,7 @@ impl LogTab {
         let exclude = self.filter_exclude.get(idx).copied().unwrap_or(false);
         let regex = self.filter_regex.get(idx).copied().unwrap_or(false);
         let template_id = self.filter_template_ids.get(idx).copied().flatten();
+        let field_query = self.filter_field_queries.get(idx).cloned().flatten();
         self.remove_filter(idx);
         self.undo_delete = Some(UndoDelete::Filter {
             index: idx,
@@ -622,6 +1168,7 @@ impl LogTab {
             exclude,
             regex,
             template_id,
+            field_query,
         });
         self.pending_toast = Some("Filter removed — Cmd/Ctrl+Z to undo".to_string());
     }
@@ -644,6 +1191,17 @@ impl LogTab {
     pub fn set_lane_active(&mut self, idx: usize, active: bool) -> bool {
         if idx >= self.filters.len() {
             return false;
+        }
+        if active {
+            if let Some(error) = self
+                .filter_field_queries
+                .get(idx)
+                .and_then(Option::as_ref)
+                .and_then(|query| query.compile(&self.doc).err())
+            {
+                self.pending_toast = Some(format!("Field filter needs review: {error}"));
+                return false;
+            }
         }
         while self.lane_active.len() < self.filters.len() {
             self.lane_active.push(true);
@@ -714,8 +1272,13 @@ impl LogTab {
                 exclude,
                 regex,
                 template_id,
+                field_query,
             } => {
                 let index = index.min(self.filters.len());
+                let active = active
+                    && field_query
+                        .as_ref()
+                        .is_none_or(|query| query.compile(&self.doc).is_ok());
                 self.filters.insert(index, filter);
                 self.filter_case_sensitive
                     .insert(index.min(self.filter_case_sensitive.len()), case_sensitive);
@@ -725,6 +1288,8 @@ impl LogTab {
                     .insert(index.min(self.filter_regex.len()), regex);
                 self.filter_template_ids
                     .insert(index.min(self.filter_template_ids.len()), template_id);
+                self.filter_field_queries
+                    .insert(index.min(self.filter_field_queries.len()), field_query);
                 self.lane_active
                     .insert(index.min(self.lane_active.len()), active);
                 self.selected_lane = Some(index);
@@ -797,8 +1362,9 @@ impl LogTab {
 
         // When Log and Pinned occupy the same dock leaf, make Log active long
         // enough to consume the scroll request before Pinned takes focus.
-        if !self.detached_views.contains(&ViewTab::Log) {
-            if let Some(path) = self.dock_state.find_tab(&ViewTab::Log) {
+        let focused_log_tab = ViewTab::Log(self.focused_log_view_id);
+        if !self.detached_views.contains(&focused_log_tab) {
+            if let Some(path) = self.dock_state.find_tab(&focused_log_tab) {
                 let _ = self.dock_state.set_active_tab(path);
             }
         }
@@ -864,8 +1430,13 @@ impl LogTab {
         }
         self.lane_active.truncate(self.filters.len());
         let all_active = self.lane_active.iter().all(|&a| a);
-        for flag in &mut self.lane_active {
-            *flag = !all_active;
+        for (index, flag) in self.lane_active.iter_mut().enumerate() {
+            let compatible = self
+                .filter_field_queries
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_none_or(|query| query.compile(&self.doc).is_ok());
+            *flag = !all_active && compatible;
         }
         if !self.lane_active.iter().any(|&a| a) && !self.everything_else_active {
             self.everything_else_active = true;
@@ -879,6 +1450,7 @@ impl LogTab {
             cancel.store(true, Ordering::Relaxed);
         }
         self.filter_scan_progress = None;
+        self.filter_scan_error = None;
         if let Some((_, cancel)) = &self.visible_rx {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -891,6 +1463,7 @@ impl LogTab {
         self.filter_exclude.resize(self.filters.len(), false);
         self.filter_regex.resize(self.filters.len(), false);
         self.filter_template_ids.resize(self.filters.len(), None);
+        self.filter_field_queries.resize(self.filters.len(), None);
 
         let scan_zoom = self
             .filter_current_range
@@ -969,7 +1542,10 @@ impl LogTab {
                     Some(&progress_worker),
                 ) {
                     Ok(matches) => matches,
-                    Err(_) => return,
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        return;
+                    }
                 }
             };
             for ((new_index, lane), spec) in
@@ -979,10 +1555,10 @@ impl LogTab {
                     lane.into_iter()
                         .filter(|&line| {
                             let value = match scan_domain {
-                                logotomy::core::timeline::TimelineDomain::Time { .. } => {
+                                haystack::core::timeline::TimelineDomain::Time { .. } => {
                                     doc.ts_at(line as usize)
                                 }
-                                logotomy::core::timeline::TimelineDomain::Sequence => line as i64,
+                                haystack::core::timeline::TimelineDomain::Sequence => line as i64,
                             };
                             value >= start && value <= end
                         })
@@ -1007,12 +1583,12 @@ impl LogTab {
                 None => Timeline::build_shared_u32(&doc, &matches, DEFAULT_BUCKETS),
             };
             if !cancel_worker.load(Ordering::Relaxed) {
-                let _ = tx.send(FilterScanResult {
+                let _ = tx.send(Ok(FilterScanResult {
                     matches,
                     timeline,
                     specs: filters,
                     scope: scan_zoom,
-                });
+                }));
             }
         });
         self.search_rx = Some((rx, cancel));
@@ -1033,12 +1609,14 @@ impl LogTab {
             // Clone on this worker, not the UI thread. LogDocument::clone
             // deliberately detaches mutable Drain/cache state.
             let mut updated = (*doc).clone();
-            let result = match updated.append_new_data() {
-                Ok(true) => Ok(TailUpdateResult {
+            let result = match updated.append_new_data_detailed() {
+                Ok(Some(update)) => Ok(TailUpdateResult {
                     doc: Box::new(updated),
                     old_line_count,
+                    first_changed_line: update.first_changed_line.saturating_sub(doc.trim_start),
+                    added_lines: update.added_lines,
                 }),
-                Ok(false) => Err("file no longer has appended data".to_string()),
+                Ok(None) => Err("file no longer has appended data".to_string()),
                 Err(error) => Err(error),
             };
             let _ = tx.send(result);
@@ -1070,7 +1648,7 @@ impl LogTab {
     /// Extend completed filter lanes by scanning only appended, trim-relative
     /// lines. The old match vectors stay drawable until this worker installs
     /// the combined lanes and refreshed timeline atomically.
-    fn extend_filters_after_append(&mut self, old_line_count: usize) {
+    fn extend_filters_after_append(&mut self, old_line_count: usize, first_changed_line: usize) {
         if let Some((_, cancel)) = &self.visible_rx {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -1090,11 +1668,11 @@ impl LogTab {
         crate::ui::worker_pool::spawn(move || {
             let appended = if filters.is_empty() {
                 progress_worker.total_lines.store(
-                    doc.total_lines().saturating_sub(old_line_count),
+                    doc.total_lines().saturating_sub(first_changed_line),
                     Ordering::Relaxed,
                 );
                 progress_worker.scanned_lines.store(
-                    doc.total_lines().saturating_sub(old_line_count),
+                    doc.total_lines().saturating_sub(first_changed_line),
                     Ordering::Relaxed,
                 );
                 Vec::new()
@@ -1102,12 +1680,15 @@ impl LogTab {
                 match search::scan_advanced_range(
                     &doc,
                     &filters,
-                    old_line_count..doc.total_lines(),
+                    first_changed_line..doc.total_lines(),
                     &cancel_worker,
                     Some(&progress_worker),
                 ) {
                     Ok(matches) => matches,
-                    Err(_) => return,
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        return;
+                    }
                 }
             };
             if cancel_worker.load(Ordering::Relaxed) {
@@ -1118,8 +1699,10 @@ impl LogTab {
                     .iter()
                     .zip(appended)
                     .map(|(old, new)| {
-                        let mut combined = Vec::with_capacity(old.len() + new.len());
-                        combined.extend_from_slice(old);
+                        let retained =
+                            old.partition_point(|&line| (line as usize) < first_changed_line);
+                        let mut combined = Vec::with_capacity(retained + new.len());
+                        combined.extend_from_slice(&old[..retained]);
                         combined.extend(new);
                         Arc::new(combined)
                     })
@@ -1129,12 +1712,12 @@ impl LogTab {
                 .extend_append(&doc, old_line_count, &matches)
                 .unwrap_or_else(|| Timeline::build_shared_u32(&doc, &matches, DEFAULT_BUCKETS));
             if !cancel_worker.load(Ordering::Relaxed) {
-                let _ = tx.send(FilterScanResult {
+                let _ = tx.send(Ok(FilterScanResult {
                     matches,
                     timeline,
                     specs: filters,
                     scope: None,
-                });
+                }));
             }
         });
         self.search_rx = Some((rx, cancel));
@@ -1147,18 +1730,18 @@ impl LogTab {
         let rx = self.tail_rx.as_ref()?;
         match rx.try_recv() {
             Ok(Ok(result)) => {
-                let new_lines = result
-                    .doc
-                    .total_lines()
-                    .saturating_sub(result.old_line_count);
+                let new_lines = result.added_lines;
                 let file_name = result.doc.file_name.clone();
                 let can_extend = self.can_extend_filters_after_append(result.old_line_count);
                 self.doc = Arc::new(*result.doc);
                 self.tail_rx = None;
                 self.stale = false;
-                self.invalidate_embedded_data();
+                self.invalidate_all_log_view_embedded_data();
                 if can_extend {
-                    self.extend_filters_after_append(result.old_line_count);
+                    self.extend_filters_after_append(
+                        result.old_line_count,
+                        result.first_changed_line,
+                    );
                 } else {
                     self.rescan_filters();
                 }
@@ -1178,7 +1761,7 @@ impl LogTab {
         }
     }
 
-    /// Clamp all doc-positioned view state to the current visible window.
+    /// Clamp all doc-positioned Log View state to the current visible window.
     /// When the MCP dirty-doc sync swaps in a mutated (typically trimmed)
     /// document, `context_line`/`viewport_range`/scroll anchors can still hold
     /// line indices from the previous, larger window — feeding those to the
@@ -1200,23 +1783,32 @@ impl LogTab {
                 }
             }
         };
-        clamp_pos(&mut self.context_line);
-        clamp_pos(&mut self.pending_scroll);
-        clamp_pos(&mut self.preserve_anchor);
-        clamp_pos(&mut self.drag_start_line);
-        clamp_pos(&mut self.drag_current_line);
-        clamp_range(&mut self.viewport_range);
-        clamp_range(&mut self.pin_modal);
-        clamp_range(&mut self.selection_range);
-        clamp_range(&mut self.pending_selection);
-        if let Some(state) = self.analysis_popup.as_mut() {
-            if n == 0 {
-                self.analysis_popup = None;
-            } else {
-                state.range.0 = state.range.0.min(n - 1);
-                state.range.1 = state.range.1.min(n - 1);
+        for view in self.log_views.values_mut() {
+            clamp_pos(&mut view.context_line);
+            clamp_pos(&mut view.pending_scroll);
+            clamp_pos(&mut view.scroll_top_line);
+            clamp_pos(&mut view.preserve_anchor);
+            clamp_pos(&mut view.drag_start_line);
+            clamp_pos(&mut view.drag_current_line);
+            clamp_range(&mut view.viewport_range);
+            clamp_range(&mut view.selection_range);
+            clamp_range(&mut view.pending_selection);
+            view.pending_scroll_restore =
+                view.pending_scroll_restore.and_then(|(line, fraction)| {
+                    (n > 0).then_some((line.min(n.saturating_sub(1)), fraction))
+                });
+            if let Some(state) = view.analysis_popup.as_mut() {
+                if n == 0 {
+                    view.analysis_popup = None;
+                } else {
+                    state.range.0 = state.range.0.min(n - 1);
+                    state.range.1 = state.range.1.min(n - 1);
+                }
             }
+            view.occurrence_overlay = None;
+            view.wrap_layout = None;
         }
+        clamp_range(&mut self.pin_modal);
     }
 
     /// Ensure the timeline zoom window includes the current context_line.
@@ -1226,7 +1818,7 @@ impl LogTab {
             return;
         };
         let v = match self.timeline.domain {
-            logotomy::core::timeline::TimelineDomain::Time { .. } => {
+            haystack::core::timeline::TimelineDomain::Time { .. } => {
                 // context_line can hold a stale index after an MCP doc swap and
                 // exceed the current window; never let the unchecked ts_at index
                 // out of bounds (regression: index 1060 vs len 1000 panic).
@@ -1235,16 +1827,16 @@ impl LogTab {
                     _ => return,
                 }
             }
-            logotomy::core::timeline::TimelineDomain::Sequence => line as i64,
+            haystack::core::timeline::TimelineDomain::Sequence => line as i64,
         };
         if v < 0 {
             return;
         }
         let (full_start, full_end) = match self.timeline.domain {
-            logotomy::core::timeline::TimelineDomain::Time { start_ms, end_ms } => {
+            haystack::core::timeline::TimelineDomain::Time { start_ms, end_ms } => {
                 (start_ms, end_ms)
             }
-            logotomy::core::timeline::TimelineDomain::Sequence => {
+            haystack::core::timeline::TimelineDomain::Sequence => {
                 (0, self.doc.total_lines().saturating_sub(1) as i64)
             }
         };
@@ -1277,8 +1869,11 @@ impl LogTab {
         let Some((first_line, last_line)) = self.viewport_range else {
             return;
         };
+        if first_line >= self.doc.total_lines() || last_line >= self.doc.total_lines() {
+            return;
+        }
         let v0 = match self.timeline.domain {
-            logotomy::core::timeline::TimelineDomain::Time { .. } => {
+            haystack::core::timeline::TimelineDomain::Time { .. } => {
                 // viewport_range can hold a stale index after an MCP doc swap and
                 // exceed the current window — never let ts_at index out of bounds.
                 match self.doc.ts_at_opt(first_line) {
@@ -1286,26 +1881,26 @@ impl LogTab {
                     _ => return,
                 }
             }
-            logotomy::core::timeline::TimelineDomain::Sequence => first_line as i64,
+            haystack::core::timeline::TimelineDomain::Sequence => first_line as i64,
         };
         let v1 = match self.timeline.domain {
-            logotomy::core::timeline::TimelineDomain::Time { .. } => {
+            haystack::core::timeline::TimelineDomain::Time { .. } => {
                 match self.doc.ts_at_opt(last_line) {
                     Some(t) if t >= 0 => t,
                     _ => return,
                 }
             }
-            logotomy::core::timeline::TimelineDomain::Sequence => last_line as i64,
+            haystack::core::timeline::TimelineDomain::Sequence => last_line as i64,
         };
         // Match the shadow renderer: only act when the mapped values are valid.
         if v0 < 0 || v1 < 0 {
             return;
         }
         let (full_start, full_end) = match self.timeline.domain {
-            logotomy::core::timeline::TimelineDomain::Time { start_ms, end_ms } => {
+            haystack::core::timeline::TimelineDomain::Time { start_ms, end_ms } => {
                 (start_ms, end_ms)
             }
-            logotomy::core::timeline::TimelineDomain::Sequence => {
+            haystack::core::timeline::TimelineDomain::Sequence => {
                 (0, self.doc.total_lines().saturating_sub(1) as i64)
             }
         };
@@ -1353,6 +1948,7 @@ impl LogTab {
         }
 
         self.rebase_pinned_lines(previous_start, self.doc.trim_start);
+        self.rebase_all_log_view_lines(previous_start, self.doc.trim_start);
         self.undo_delete = Some(UndoDelete::Trim {
             start: previous_start,
             end_exclusive: previous_end,
@@ -1365,7 +1961,7 @@ impl LogTab {
         self.timeline_zoom = None;
         self.pending_filter_removal = None;
         self.pending_clear_filters = false;
-        self.invalidate_embedded_data();
+        self.invalidate_all_log_view_embedded_data();
         self.clamp_view_state();
         self.pending_toast = Some("Trim applied — Cmd/Ctrl+Z to undo".to_string());
 
@@ -1394,6 +1990,7 @@ impl LogTab {
         let doc = Arc::make_mut(&mut self.doc);
         doc.reset_trim();
         self.rebase_pinned_lines(previous_start, self.doc.trim_start);
+        self.rebase_all_log_view_lines(previous_start, self.doc.trim_start);
         self.undo_delete = Some(UndoDelete::Trim {
             start: previous_start,
             end_exclusive: previous_end,
@@ -1404,7 +2001,7 @@ impl LogTab {
         self.timeline_zoom = None;
         self.pending_filter_removal = None;
         self.pending_clear_filters = false;
-        self.invalidate_embedded_data();
+        self.invalidate_all_log_view_embedded_data();
         self.clamp_view_state();
         self.pending_toast = Some("Trim reset — Cmd/Ctrl+Z to undo".to_string());
 
@@ -1424,16 +2021,17 @@ impl LogTab {
             doc.trim_range(start, end_exclusive - 1);
         }
         self.rebase_pinned_lines(previous_start, self.doc.trim_start);
+        self.rebase_all_log_view_lines(previous_start, self.doc.trim_start);
         self.visible_lines = None;
         self.timeline_zoom = None;
-        self.invalidate_embedded_data();
+        self.invalidate_all_log_view_embedded_data();
         self.clamp_view_state();
         self.rescan_filters();
     }
 
     /// Pin coordinates are trim-relative in memory. Rebase them whenever the
     /// visible window moves so they continue to refer to the same source rows.
-    fn rebase_pinned_lines(&mut self, old_trim_start: usize, new_trim_start: usize) {
+    pub(super) fn rebase_pinned_lines(&mut self, old_trim_start: usize, new_trim_start: usize) {
         // `usize::MAX - original_line` is an internal marker for an anchor
         // outside the current trim. It lets reset/undo restore the anchor
         // exactly without keeping a second, easily-stale pin list.
@@ -1459,13 +2057,68 @@ impl LogTab {
         }
     }
 
+    /// Preserve each view's physical source location when the shared trim
+    /// window moves. Anchors outside the new window clamp to its nearest edge.
+    pub(super) fn rebase_all_log_view_lines(
+        &mut self,
+        old_trim_start: usize,
+        new_trim_start: usize,
+    ) {
+        let n = self.doc.total_lines();
+        let rebase = |line: usize| {
+            (n > 0).then(|| {
+                old_trim_start
+                    .saturating_add(line)
+                    .saturating_sub(new_trim_start)
+                    .min(n.saturating_sub(1))
+            })
+        };
+        let rebase_pos = |position: &mut Option<usize>| {
+            *position = position.and_then(rebase);
+        };
+        let rebase_range = |range: &mut Option<(usize, usize)>| {
+            *range = range.and_then(|(first, last)| Some((rebase(first)?, rebase(last)?)));
+        };
+        for view in self.log_views.values_mut() {
+            view.cancel_workers();
+            view.find_rx = None;
+            view.field_suggestion_rx = None;
+            view.find_matches.clear();
+            view.find_pos = None;
+            rebase_pos(&mut view.context_line);
+            rebase_pos(&mut view.pending_scroll);
+            rebase_pos(&mut view.scroll_top_line);
+            rebase_pos(&mut view.preserve_anchor);
+            rebase_pos(&mut view.drag_start_line);
+            rebase_pos(&mut view.drag_current_line);
+            rebase_range(&mut view.viewport_range);
+            rebase_range(&mut view.selection_range);
+            rebase_range(&mut view.pending_selection);
+            view.pending_scroll_restore = view
+                .pending_scroll_restore
+                .and_then(|(line, fraction)| rebase(line).map(|line| (line, fraction)));
+            if let Some(state) = view.analysis_popup.as_mut() {
+                match (rebase(state.range.0), rebase(state.range.1)) {
+                    (Some(first), Some(last)) => state.range = (first, last),
+                    _ => view.analysis_popup = None,
+                }
+            }
+            view.occurrence_overlay = None;
+            view.wrap_layout = None;
+        }
+    }
+
     /// Poll the background filter scan and install its already-built timeline.
     pub fn poll_search(&mut self) -> bool {
         let Some((rx, _)) = &self.search_rx else {
             return false;
         };
         match rx.try_recv() {
-            Ok(result) => {
+            Ok(Ok(result)) => {
+                let overlay_line = self
+                    .occurrence_overlay
+                    .as_ref()
+                    .map(|overlay| overlay.selected_line);
                 self.matches = result.matches;
                 self.timeline = result.timeline;
                 self.matched_filter_specs = result.specs;
@@ -1475,6 +2128,15 @@ impl LogTab {
                 self.search_rx = None;
                 self.filter_scan_progress = None;
                 self.rebuild_visible_lines();
+                if let Some(line) = overlay_line {
+                    self.open_occurrence_overlay(line);
+                }
+                false
+            }
+            Ok(Err(error)) => {
+                self.filter_scan_error = Some(error);
+                self.search_rx = None;
+                self.filter_scan_progress = None;
                 false
             }
             Err(crossbeam_channel::TryRecvError::Empty) => true,
@@ -1493,15 +2155,8 @@ impl LogTab {
         };
         match rx.try_recv() {
             Ok(result) => {
-                self.install_visible_lines(
-                    result.visible_lines,
-                    result.preserve_anchor,
-                    self.doc.total_lines(),
-                );
+                self.install_visible_lines(result.visible_lines, self.doc.total_lines());
                 self.visible_rx = None;
-                if !self.find_query.is_empty() {
-                    self.start_find(self.find_query.clone());
-                }
                 false
             }
             Err(crossbeam_channel::TryRecvError::Empty) => true,
@@ -1525,6 +2180,19 @@ impl LogTab {
                 polarity: search::FilterPolarity::Include,
                 regex: false,
                 template_id: Some(id),
+                field_query: None,
+            });
+        }
+        if self.find_field_mode {
+            let query =
+                FieldQuery::parse(text, self.find_case_sensitive)?.bind_to_doc(&self.doc)?;
+            return Ok(search::FilterSpec {
+                text: query.expression(),
+                case_sensitive: query.case_sensitive,
+                polarity: search::FilterPolarity::Include,
+                regex: false,
+                template_id: None,
+                field_query: Some(query),
             });
         }
         let spec = search::FilterSpec {
@@ -1533,6 +2201,7 @@ impl LogTab {
             polarity: search::FilterPolarity::Include,
             regex: self.find_regex,
             template_id: None,
+            field_query: None,
         };
         search::validate_matcher(&spec)?;
         Ok(spec)
@@ -1558,10 +2227,17 @@ impl LogTab {
             cancel.store(true, Ordering::Relaxed);
         }
         self.find_query = trimmed.to_string();
-        self.search_history.retain(|entry| entry != trimmed);
-        self.search_history.insert(0, trimmed.to_string());
-        self.search_history.truncate(20);
-        self.pending_recent_search = Some(trimmed.to_string());
+        if let Some(query) = spec.field_query.as_ref() {
+            self.field_search_history.retain(|entry| entry != query);
+            self.field_search_history.insert(0, query.clone());
+            self.field_search_history.truncate(20);
+            self.pending_recent_field_search = Some(query.clone());
+        } else {
+            self.search_history.retain(|entry| entry != trimmed);
+            self.search_history.insert(0, trimmed.to_string());
+            self.search_history.truncate(20);
+            self.pending_recent_search = Some(trimmed.to_string());
+        }
         self.find_template_id = spec.template_id;
         self.find_active_spec = Some(spec.clone());
         self.find_highlighter = search::build_filter_highlighter(&[spec.clone()])
@@ -1570,6 +2246,7 @@ impl LogTab {
         self.find_error = None;
         self.find_error_dismissed = false;
         self.find_matches.clear();
+        self.find_record_count = 0;
         self.find_pos = None;
 
         let doc = Arc::clone(&self.doc);
@@ -1586,8 +2263,7 @@ impl LogTab {
                 subset.as_deref().map(Vec::as_slice),
                 &spec,
                 &cancel_worker,
-            )
-            .unwrap_or_default();
+            );
             let _ = tx.send(result);
         });
         self.find_rx = Some((rx, cancel));
@@ -1599,8 +2275,31 @@ impl LogTab {
             return false;
         };
         match rx.try_recv() {
-            Ok(matches) => {
+            Ok(Ok(matches)) => {
                 self.find_matches = matches;
+                self.find_record_count = if self
+                    .find_active_spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.field_query.is_some())
+                {
+                    let mut last_owner = None;
+                    self.find_matches
+                        .iter()
+                        .filter(|&&line| {
+                            let owner = self
+                                .doc
+                                .record_range_containing(self.doc.trim_start + line as usize)
+                                .map(|record| record.start);
+                            if owner.is_none() || owner == last_owner {
+                                return false;
+                            }
+                            last_owner = owner;
+                            true
+                        })
+                        .count()
+                } else {
+                    0
+                };
                 self.find_rx = None;
                 if self.find_matches.is_empty() {
                     self.find_pos = None;
@@ -1625,6 +2324,12 @@ impl LogTab {
                         );
                     }
                 }
+                false
+            }
+            Ok(Err(error)) => {
+                self.find_error = Some(error);
+                self.find_error_dismissed = false;
+                self.find_rx = None;
                 false
             }
             Err(crossbeam_channel::TryRecvError::Empty) => true,
@@ -1808,6 +2513,7 @@ impl LogTab {
         self.find_rx = None;
         self.find_query.clear();
         self.find_matches.clear();
+        self.find_record_count = 0;
         self.find_pos = None;
         self.find_highlighter = None;
         self.find_template_id = None;
@@ -1822,6 +2528,7 @@ impl LogTab {
     pub fn start_template_id_search(&mut self, template_id: u32) {
         self.find_regex = false;
         self.find_template_id_mode = true;
+        self.find_field_mode = false;
         self.find_input = format!("T{{{template_id}}}");
         self.start_find(self.find_input.clone());
         self.trigger_search_focus();
@@ -1877,7 +2584,8 @@ impl LogTab {
         self.filter_exclude.push(false);
         self.filter_regex.push(regex);
         self.filter_template_ids.push(None);
-        let history_entry = logotomy::core::settings::RecentFilter {
+        self.filter_field_queries.push(None);
+        let history_entry = haystack::core::settings::RecentFilter {
             text: trimmed.to_string(),
             case_sensitive,
             regex,
@@ -1910,6 +2618,7 @@ impl LogTab {
         self.filter_exclude.push(false);
         self.filter_regex.push(false);
         self.filter_template_ids.push(Some(template_id));
+        self.filter_field_queries.push(None);
         self.filter_highlight = Some((idx, Instant::now()));
         self.rescan_filters();
         Some(idx)
@@ -1919,5 +2628,45 @@ impl LogTab {
     pub fn push_template_filter_input(&mut self, input: &str, color: Color32) -> Option<usize> {
         let template_id = search::parse_template_id(input).ok()?;
         self.push_template_filter(template_id, color)
+    }
+
+    /// Add a typed field expression as a record-scoped Timeline lane.
+    pub fn push_field_filter_input(
+        &mut self,
+        input: &str,
+        color: Color32,
+    ) -> Result<usize, String> {
+        let query = FieldQuery::parse(input, self.filter_input_case_sensitive)?;
+        self.push_field_filter(query, color)
+    }
+
+    pub fn push_field_filter(
+        &mut self,
+        query: FieldQuery,
+        color: Color32,
+    ) -> Result<usize, String> {
+        if self.filters.len() >= MAX_FILTERS {
+            return Err("A maximum of 20 filters can be added.".into());
+        }
+        let query = query.bind_to_doc(&self.doc)?;
+        let text = query.expression();
+        if self
+            .filter_field_queries
+            .iter()
+            .flatten()
+            .any(|existing| existing == &query)
+        {
+            return Err("This field filter is already active.".into());
+        }
+        let index = self.filters.len();
+        self.filters.push(Filter { text, color });
+        self.filter_case_sensitive.push(query.case_sensitive);
+        self.filter_exclude.push(false);
+        self.filter_regex.push(false);
+        self.filter_template_ids.push(None);
+        self.filter_field_queries.push(Some(query));
+        self.filter_highlight = Some((index, Instant::now()));
+        self.rescan_filters();
+        Ok(index)
     }
 }

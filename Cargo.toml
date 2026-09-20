@@ -1,19 +1,19 @@
 [package]
-name = "logotomy"
-version = "0.1.4"
+name = "haystack"
+version = "0.1.5"
 edition = "2021"
-description = "High-performance log analysis & visualization. 50MB log file? logotomy happened in there — let's find out."
+description = "High-performance log analysis and visualization: sift giant logs for the needle with clear visual cues and token-efficient AI data."
 
 [features]
 default = ["gui"]
 gui = ["eframe", "rfd", "egui_dock", "resvg", "dep:image", "dep:zip"]
 
 [lib]
-name = "logotomy"
+name = "haystack"
 path = "src/lib.rs"
 
 [[bin]]
-name = "logotomy"
+name = "haystack"
 path = "src/main.rs"
 
 [dependencies]
@@ -66,22 +66,22 @@ codegen-units = 1
 # itself unless `before-packaging-command` is set) — first run
 # `cargo build --release --target <triple>`, then `cargo packager ...`.
 [package.metadata.packager]
-identifier = "com.muntasir-kabir.logotomy"
-product-name = "logotomy"
-version = "0.1.4"
-description = "High-performance log analysis & visualization"
-homepage = "https://github.com/muntasir-kabir/logotomy"
+identifier = "com.muntasir-kabir.haystack"
+product-name = "Haystack"
+version = "0.1.5"
+description = "High-performance log analysis and visualization"
+homepage = "https://github.com/muntasir-kabir/haystack"
 authors = ["MK <muntasir.kabir@gmail.com>"]
 copyright = "Copyright (c) 2026 MK"
 license-file = "LICENSE"
 # PNGs are auto-converted to .ico/.icns by the packager as needed;
-# logotomy.ico is committed for the NSIS installer icon + Windows exe icon.
+# haystack.ico is committed for the NSIS installer icon + Windows exe icon.
 icons = [
-  "assets/icons/logotomy_128.png",
-  "assets/icons/logotomy_256.png",
-  "assets/icons/logotomy_512.png",
+  "assets/icons/haystack_128.png",
+  "assets/icons/haystack_256.png",
+  "assets/icons/haystack_512.png",
 ]
-# Register files that logotomy can open with the native installers. Extensions
+# Register files that haystack can open with the native installers. Extensions
 # omit the leading dot because that is the cargo-packager format.
 file-associations = [
   { extensions = ["log", "txt", "out", "err"], mime-type = "text/plain", name = "Log file", description = "Log file", role = "viewer" },
@@ -99,4 +99,4 @@ minimum-system-version = "10.15"
 
 [package.metadata.packager.nsis]
 installMode = "currentUser"
-installer-icon = "assets/icons/logotomy.ico"
+installer-icon = "assets/icons/haystack.ico"

@@ -1,0 +1,11 @@
+<!-- Chosen direction, retained as a comparison study beside the H alternative. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Haystack log stack with highlighted needle">
+  <rect width="1024" height="1024" rx="216" fill="#202938"/>
+  <g fill="#E6EDF5">
+    <rect x="190" y="258" width="466" height="82" rx="41"/>
+    <rect x="190" y="414" width="624" height="82" rx="41"/>
+    <rect x="190" y="570" width="390" height="82" rx="41"/>
+    <rect x="190" y="726" width="520" height="82" rx="41"/>
+  </g>
+  <rect x="668" y="350" width="88" height="360" rx="44" fill="#D6A34A"/>
+</svg>

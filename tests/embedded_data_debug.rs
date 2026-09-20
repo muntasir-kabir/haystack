@@ -1,11 +1,11 @@
-use logotomy::{AnalysisLimits, EmbeddedDataEngine, LogDocument};
+use haystack::{AnalysisLimits, EmbeddedDataEngine, LogDocument};
 use std::sync::atomic::AtomicBool;
 
-fn detect(input: &str) -> Vec<logotomy::Detection> {
+fn detect(input: &str) -> Vec<haystack::Detection> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
-        "logotomy_embedded_debug_{}_{}_{}.log",
+        "haystack_embedded_debug_{}_{}_{}.log",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed),
         input.len()

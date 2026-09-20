@@ -19,8 +19,8 @@ use crate::ui::app::model::LogTab;
 use crate::ui::icons::{self, Icon};
 use crate::ui::log_view::{line_job, Highlights};
 use crate::ui::theme::Theme;
-use logotomy::core::time::format_ms;
-use logotomy::core::timeline::TimelineDomain;
+use haystack::core::time::format_ms;
+use haystack::core::timeline::TimelineDomain;
 
 /// Format a duration in milliseconds as a human-readable string.
 fn format_duration_ms(ms: i64) -> String {
@@ -48,12 +48,12 @@ fn format_duration_ms(ms: i64) -> String {
 mod tests {
     use super::*;
     use crate::ui::app::model::PinEntry;
-    use logotomy::core::document::LogDocument;
+    use haystack::core::document::LogDocument;
 
     #[test]
     fn text_only_analysis_is_first_in_pin_tab_and_copy_output() {
         let path = std::env::temp_dir().join(format!(
-            "logotomy-pin-analysis-{}-{}.log",
+            "haystack-pin-analysis-{}-{}.log",
             std::process::id(),
             rand::random::<u64>()
         ));

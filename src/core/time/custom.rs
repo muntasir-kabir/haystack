@@ -159,6 +159,10 @@ impl TimeFormat for CustomTimeFormat {
         };
         Some((comps.epoch_ms()?, m.range()))
     }
+
+    fn recognize(&self, line: &str) -> Option<Range<usize>> {
+        self.regex.find(window(line)).map(|matched| matched.range())
+    }
 }
 /// The per-component breakdown of a parsed custom timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +181,7 @@ impl TimeComponents {
     /// Epoch millis, treating the parsed wall-clock as UTC (matching the
     /// other naive time families in this crate).
     pub fn epoch_ms(&self) -> Option<i64> {
+        chrono::NaiveDate::from_ymd_opt(self.year as i32, self.month as u32, self.day as u32)?;
         let days = days_from_civil(self.year, self.month, self.day);
         Some(
             days * 86_400_000

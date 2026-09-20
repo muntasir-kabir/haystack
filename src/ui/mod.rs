@@ -1,11 +1,13 @@
 pub mod app;
 pub mod custom_date;
+mod field_query_ui;
 mod filters;
 pub mod fonts;
 pub mod icons;
 pub mod instance;
 mod log_view;
 mod pin_viewer;
+mod record_format;
 mod settings;
 pub mod template_view;
 pub mod theme;

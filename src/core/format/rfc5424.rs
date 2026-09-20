@@ -3,7 +3,8 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use crate::core::time::{Iso, TimeFormat};
+use crate::core::record::{HeaderTime, RecordClassification};
+use crate::core::time::{Iso, TimeFormat, TimeFormatKind};
 
 use super::{FormatContext, LogFormat, Normalized};
 
@@ -35,12 +36,65 @@ impl LogFormat for Rfc5424 {
         if b.get(i) != Some(&b'>') {
             return false;
         }
-        // After ">" comes the VERSION digit (e.g. "1").
-        matches!(b.get(i + 1), Some(c) if c.is_ascii_digit())
+        // After ">" comes VERSION, then TIMESTAMP/HOST/APP/PROCID/MSGID.
+        let rest = &line.trim_start()[i + 1..];
+        let mut fields = rest.splitn(7, ' ');
+        let version = fields.next().unwrap_or_default();
+        !version.is_empty()
+            && version.bytes().all(|byte| byte.is_ascii_digit())
+            && fields.next().is_some()
+            && (0..4).all(|_| fields.next().is_some())
     }
 
     fn time_formats(&self) -> &'static [&'static dyn TimeFormat] {
         RFC5424_TIMES
+    }
+
+    fn classify_header(
+        &self,
+        line: &str,
+        time_format: Option<&TimeFormatKind>,
+    ) -> Option<RecordClassification> {
+        if !self.matches(line) {
+            return None;
+        }
+        let leading = line.len() - line.trim_start().len();
+        let trimmed = &line[leading..];
+        let greater = trimmed.find('>')?;
+        let after_pri = greater + 1;
+        let version_end = trimmed[after_pri..].find(' ')? + after_pri;
+        let timestamp_start = version_end + 1;
+        let timestamp_end = trimmed[timestamp_start..]
+            .find(' ')
+            .map_or(trimmed.len(), |offset| timestamp_start + offset);
+        let token = &trimmed[timestamp_start..timestamp_end];
+        let source_span = leading + timestamp_start..leading + timestamp_end;
+        let time = if token == "-" {
+            HeaderTime::Missing
+        } else {
+            let parser = time_format?;
+            match parser.recognize(token) {
+                Some(span) if span.start == 0 && span.end == token.len() => {
+                    match parser.extract(token) {
+                        Some((value, extracted)) if extracted == span => HeaderTime::Known {
+                            value,
+                            span: source_span,
+                        },
+                        _ => HeaderTime::Invalid {
+                            span: Some(source_span),
+                        },
+                    }
+                }
+                _ => HeaderTime::Invalid {
+                    span: Some(source_span),
+                },
+            }
+        };
+        Some(RecordClassification::Header {
+            time,
+            header_span: leading..timestamp_end,
+            message_span: timestamp_end..line.len(),
+        })
     }
 
     fn normalize<'a>(

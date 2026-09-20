@@ -1,9 +1,9 @@
-use logotomy::{AnalysisLimits, EmbeddedDataEngine, LogDocument};
+use haystack::{AnalysisLimits, EmbeddedDataEngine, LogDocument};
 use std::sync::atomic::AtomicBool;
 
 fn ids(input: &str) -> Vec<&'static str> {
     let path = std::env::temp_dir().join(format!(
-        "logotomy_embedded_encoded_{}_{}.log",
+        "haystack_embedded_encoded_{}_{}.log",
         std::process::id(),
         input.len()
     ));

@@ -1,6 +1,6 @@
-//! Timeline bucketing: turns per-line timestamps (or, for timeless files,
-//! plain line numbers) into a fixed-resolution histogram that the UI can
-//! paint in O(buckets) instead of O(lines).
+//! Source-order timeline bucketing. Physical line positions are always the x
+//! axis; event timestamps remain metadata for labels, queries, and anomaly
+//! annotations rather than coordinates that can reorder the file.
 
 use crate::core::document::LogDocument;
 use std::sync::Arc;
@@ -25,9 +25,10 @@ impl<T> MatchLane<T> for Arc<Vec<T>> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimelineDomain {
-    /// X axis is wall-clock time (epoch millis).
+    /// Legacy/explicit analytical wall-clock domain. Primary GUI timelines do
+    /// not construct this variant.
     Time { start_ms: i64, end_ms: i64 },
-    /// X axis is line number (file has no usable timestamps).
+    /// X axis is the zero-based physical source-line position.
     Sequence,
 }
 
@@ -43,12 +44,11 @@ pub struct Timeline {
     /// x-value is read from `LogDocument` during resolution instead of being
     /// duplicated for every hit.
     pub filter_lines: Vec<Vec<u32>>,
-    /// True when the document's valid timestamps are non-decreasing in line
-    /// order. The adaptive resolver can then binary-search the document's
-    /// existing timestamp index without duplicating it.
+    /// Compatibility metadata for explicit legacy time-domain timelines.
+    /// Source-line timelines do not require timestamp monotonicity.
     pub timestamps_monotonic: bool,
-    /// X-sorted line-ID fallback used only for timestamped logs whose
-    /// timestamps move backwards. Timestamps remain owned by the document.
+    /// Compatibility storage for explicit legacy time-domain timelines. The
+    /// source-line builder leaves it empty and never allocates a sorted copy.
     pub out_of_order_density_lines: Arc<Vec<u32>>,
     pub max_density: u32,
     sequence_end: i64,
@@ -93,13 +93,7 @@ impl Timeline {
         M: MatchLane<T>,
     {
         let n_lines = doc.total_lines();
-        let domain = match doc.time_range {
-            Some((a, b)) if b > a => TimelineDomain::Time {
-                start_ms: a,
-                end_ms: b,
-            },
-            _ => TimelineDomain::Sequence,
-        };
+        let domain = TimelineDomain::Sequence;
         let nb = n_buckets.clamp(16, 8192);
 
         let bucket_of = |v: i64| -> usize {
@@ -122,22 +116,21 @@ impl Timeline {
             }
         };
 
+        // The overview's unit is records, not physical lines. Rank queries
+        // make this exact in O(bucket count), regardless of record length.
         let mut density = vec![0u32; nb];
-        let mut timestamps_monotonic = true;
-        let mut previous_timestamp: Option<i64> = None;
-        for i in 0..n_lines {
-            let v = x_of_line(i);
-            if v < 0 {
-                continue; // before first known timestamp
+        if n_lines > 0 {
+            for (bucket, count) in density.iter_mut().enumerate() {
+                let (start, end) = discrete_bin_bounds(0, n_lines as i64 - 1, bucket, nb);
+                *count = doc
+                    .count_records(
+                        doc.trim_start + start.max(0) as usize,
+                        doc.trim_start + end.max(0) as usize,
+                    )
+                    .min(u32::MAX as usize) as u32;
             }
-            if matches!(domain, TimelineDomain::Time { .. }) {
-                if previous_timestamp.is_some_and(|previous| v < previous) {
-                    timestamps_monotonic = false;
-                }
-                previous_timestamp = Some(v);
-            }
-            density[bucket_of(v)] += 1;
         }
+        let timestamps_monotonic = true;
         let max_density = density.iter().copied().max().unwrap_or(0);
 
         let mut filter_buckets = Vec::with_capacity(filter_matches.len());
@@ -157,26 +150,8 @@ impl Timeline {
                 kb[bucket_of(v)] += 1;
                 lines.push(ln as u32);
             }
-            // Match lists are line-ordered for navigation, but timeline range
-            // queries must be x-ordered (timestamps may move backwards).
-            if !timestamps_monotonic {
-                lines.sort_unstable_by_key(|&line| (x_of_line(line as usize), line));
-            }
             filter_buckets.push(kb);
             filter_lines.push(lines);
-        }
-
-        let mut out_of_order_density_lines = Vec::new();
-        if matches!(domain, TimelineDomain::Time { .. }) && !timestamps_monotonic {
-            out_of_order_density_lines.reserve(n_lines);
-            for line in 0..n_lines {
-                let x = doc.ts_at(line);
-                if x >= 0 {
-                    out_of_order_density_lines.push(line as u32);
-                }
-            }
-            out_of_order_density_lines
-                .sort_unstable_by_key(|&line| (doc.ts_at(line as usize), line));
         }
 
         Timeline {
@@ -186,7 +161,7 @@ impl Timeline {
             filter_buckets,
             filter_lines,
             timestamps_monotonic,
-            out_of_order_density_lines: Arc::new(out_of_order_density_lines),
+            out_of_order_density_lines: Arc::new(Vec::new()),
             max_density,
             sequence_end: n_lines.saturating_sub(1) as i64,
         }
@@ -235,21 +210,15 @@ impl Timeline {
                 buckets[self.bucket_for(x, total_lines)] += 1;
                 lines.push(line);
             }
-            if !self.timestamps_monotonic {
-                lines.sort_unstable_by_key(|&line| (self.x_of_line(doc, line), line));
-            }
             self.filter_buckets.push(buckets);
             self.filter_lines.push(lines);
         }
         self
     }
 
-    /// Extend a chronological or sequence-domain timeline after a live
-    /// append. The coarse whole-file histogram is reprojected from its fixed
-    /// bucket summary and only appended document lines are read; adaptive
-    /// viewport resolution remains exact because it reads document indexes.
-    /// Returns `None` for a domain change or newly out-of-order timestamps,
-    /// where a full rebuild is required for correctness.
+    /// Extend a source-line timeline after append. Overview bins are rebuilt
+    /// exactly from record-rank queries in O(bucket count); no old line or
+    /// timestamp index is scanned and clock disorder is irrelevant.
     pub fn extend_append(
         mut self,
         doc: &LogDocument,
@@ -257,65 +226,24 @@ impl Timeline {
         filter_matches: &[Arc<Vec<u32>>],
     ) -> Option<Self> {
         let new_line_count = doc.total_lines();
-        if old_line_count > new_line_count || !self.timestamps_monotonic {
+        if old_line_count > new_line_count {
             return None;
         }
-        let new_domain = match doc.time_range {
-            Some((start_ms, end_ms)) if end_ms > start_ms => {
-                TimelineDomain::Time { start_ms, end_ms }
-            }
-            _ => TimelineDomain::Sequence,
-        };
-        if !matches!(
-            (self.domain, new_domain),
-            (TimelineDomain::Time { .. }, TimelineDomain::Time { .. })
-                | (TimelineDomain::Sequence, TimelineDomain::Sequence)
-        ) {
+        if self.domain != TimelineDomain::Sequence {
             return None;
         }
-        if matches!(new_domain, TimelineDomain::Time { .. }) && old_line_count > 0 {
-            let mut previous = doc.ts_at(old_line_count - 1);
-            for line in old_line_count..new_line_count {
-                let timestamp = doc.ts_at(line);
-                if timestamp >= 0 && previous >= 0 && timestamp < previous {
-                    return None;
-                }
-                if timestamp >= 0 {
-                    previous = timestamp;
-                }
-            }
-        }
-
-        let old_density = std::mem::take(&mut self.density);
-        let old_domain = self.domain;
-        self.domain = new_domain;
         self.sequence_end = new_line_count.saturating_sub(1) as i64;
         self.density = vec![0; self.n_buckets];
-        for (bucket, count) in old_density.into_iter().enumerate() {
-            if count == 0 {
-                continue;
-            }
-            let old_center = match old_domain {
-                TimelineDomain::Time { start_ms, end_ms } => {
-                    let span = (end_ms - start_ms).max(1);
-                    start_ms + span * bucket as i64 / (self.n_buckets as i64 - 1).max(1)
-                }
-                TimelineDomain::Sequence => {
-                    old_line_count.saturating_sub(1) as i64 * bucket as i64
-                        / (self.n_buckets as i64 - 1).max(1)
-                }
-            };
-            let target = self.bucket_for(old_center, new_line_count);
-            self.density[target] = self.density[target].saturating_add(count);
-        }
-        for line in old_line_count..new_line_count {
-            let x = match self.domain {
-                TimelineDomain::Time { .. } => doc.ts_at(line),
-                TimelineDomain::Sequence => line as i64,
-            };
-            if x >= 0 {
-                let bucket = self.bucket_for(x, new_line_count);
-                self.density[bucket] = self.density[bucket].saturating_add(1);
+        if new_line_count > 0 {
+            for (bucket, count) in self.density.iter_mut().enumerate() {
+                let (start, end) =
+                    discrete_bin_bounds(0, new_line_count as i64 - 1, bucket, self.n_buckets);
+                *count = doc
+                    .count_records(
+                        doc.trim_start + start.max(0) as usize,
+                        doc.trim_start + end.max(0) as usize,
+                    )
+                    .min(u32::MAX as usize) as u32;
             }
         }
         self.max_density = self.density.iter().copied().max().unwrap_or(0);
@@ -573,7 +501,7 @@ impl Timeline {
                 let total = doc.total_lines() as i64;
                 let lo = start.clamp(0, total);
                 let hi = end.clamp(0, total);
-                hi.saturating_sub(lo) as usize
+                doc.count_records(doc.trim_start + lo as usize, doc.trim_start + hi as usize)
             }
             TimelineDomain::Time { .. } if self.timestamps_monotonic => {
                 let lo = lower_bound_document_timestamp(doc, start);
@@ -668,7 +596,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "logotomy_timeline_test_{}_{}.log",
+            "haystack_timeline_test_{}_{}.log",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -680,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn buckets_cover_all_timestamped_lines() {
+    fn record_overview_covers_all_headers_in_source_line_domain() {
         let mut content = String::new();
         for i in 0..1000 {
             content.push_str(&format!(
@@ -692,9 +620,9 @@ mod tests {
         }
         let doc = doc_with(&content);
         let tl = Timeline::build(&doc, &[], 128);
-        assert!(matches!(tl.domain, TimelineDomain::Time { .. }));
+        assert_eq!(tl.domain, TimelineDomain::Sequence);
         let sum: u32 = tl.density.iter().sum();
-        assert_eq!(sum as usize, doc.total_lines());
+        assert_eq!(sum as usize, doc.record_count());
     }
 
     #[test]
@@ -703,7 +631,7 @@ mod tests {
         let tl = Timeline::build(&doc, &[], 16);
         assert_eq!(tl.domain, TimelineDomain::Sequence);
         let sum: u32 = tl.density.iter().sum();
-        assert_eq!(sum, 3);
+        assert_eq!(sum, 0, "unresolved files use neutral record coverage");
     }
 
     #[test]
@@ -765,10 +693,9 @@ mod tests {
             .expect("chronological append should be incremental");
         assert_eq!(extended.density.iter().sum::<u32>(), 4);
         assert_eq!(extended.filter_lines, vec![vec![0, 2]]);
-        let (start, end) = new_doc.time_range.unwrap();
         assert_eq!(
             extended
-                .resolve_density_bins(&new_doc, start, end, 64)
+                .resolve_density_bins(&new_doc, 0, 3, 64)
                 .iter()
                 .sum::<u32>(),
             4
@@ -822,9 +749,8 @@ mod tests {
              2026-07-19T10:00:00.004Z e\n",
         );
         let tl = Timeline::build(&doc, &[], 16);
-        let (start, end) = doc.time_range.unwrap();
         for columns in [1, 2, 5, 64] {
-            let bins = tl.resolve_density_bins(&doc, start, end, columns);
+            let bins = tl.resolve_density_bins(&doc, 0, 4, columns);
             assert_eq!(bins.iter().sum::<u32>(), 5, "columns={columns}");
         }
     }
@@ -837,20 +763,18 @@ mod tests {
              2026-07-19T10:00:00.002Z hit\n",
         );
         let tl = Timeline::build(&doc, &[vec![0, 1, 2]], 16);
-        let (start, end) = doc.time_range.unwrap();
-
-        let coarse = tl.resolve_filter_bins(&doc, 0, start, end, 1);
+        let coarse = tl.resolve_filter_bins(&doc, 0, 0, 2, 1);
         assert_eq!(coarse[0].count, 3);
         assert_eq!(coarse[0].sole_point, None);
 
-        let fine = tl.resolve_filter_bins(&doc, 0, start, end, 3);
+        let fine = tl.resolve_filter_bins(&doc, 0, 0, 2, 3);
         assert_eq!(fine.iter().map(|bin| bin.count).sum::<u32>(), 3);
         assert!(fine
             .iter()
             .filter(|bin| bin.count == 1)
             .all(|bin| bin.sole_point.is_some()));
 
-        let wide = tl.resolve_filter_bins(&doc, 0, start, end, 101);
+        let wide = tl.resolve_filter_bins(&doc, 0, 0, 2, 101);
         let occupied: Vec<usize> = wide
             .iter()
             .enumerate()
@@ -860,44 +784,47 @@ mod tests {
     }
 
     #[test]
-    fn identical_timestamps_remain_an_exact_cluster() {
+    fn identical_timestamps_keep_distinct_source_positions() {
         let doc = doc_with(
             "2026-07-19T10:00:00.000Z hit a\n\
              2026-07-19T10:00:00.000Z hit b\n\
              2026-07-19T10:00:00.001Z tail\n",
         );
         let tl = Timeline::build(&doc, &[vec![0, 1]], 16);
-        let timestamp = doc.ts_at(0);
-        let bins = tl.resolve_filter_bins(&doc, 0, timestamp, timestamp, 1);
-        assert_eq!(bins[0].count, 2);
-        assert_eq!(bins[0].first_x, timestamp);
-        assert_eq!(bins[0].last_x, timestamp);
+        let bins = tl.resolve_filter_bins(&doc, 0, 0, 1, 2);
+        assert_eq!(bins.iter().map(|bin| bin.count).sum::<u32>(), 2);
+        assert_eq!(bins[0].first_x, 0);
+        assert_eq!(bins[1].last_x, 1);
     }
 
     #[test]
-    fn out_of_order_timestamps_use_sorted_resolution_fallback() {
+    fn out_of_order_timestamps_never_reorder_source_positions() {
         let doc = doc_with(
             "2026-07-19T10:00:02.000Z late\n\
              2026-07-19T10:00:00.000Z early\n\
              2026-07-19T10:00:01.000Z middle\n",
         );
         let tl = Timeline::build(&doc, &[vec![0, 1, 2]], 16);
-        assert!(!tl.timestamps_monotonic);
-        assert_eq!(tl.out_of_order_density_lines.as_slice(), &[1, 2, 0]);
-        let (start, end) = doc.time_range.unwrap();
+        assert_eq!(tl.domain, TimelineDomain::Sequence);
+        assert!(tl.out_of_order_density_lines.is_empty());
+        assert_eq!(tl.filter_lines[0], vec![0, 1, 2]);
         assert_eq!(
-            tl.resolve_density_bins(&doc, start, end, 3)
-                .iter()
-                .sum::<u32>(),
+            tl.resolve_density_bins(&doc, 0, 2, 3).iter().sum::<u32>(),
             3
         );
-        assert_eq!(tl.point_count_in_range(&doc, 0, start, end), 3);
-        assert_eq!(tl.nearest_match_line_in_filter(&doc, 0, start), Some(1));
+        assert_eq!(tl.point_count_in_range(&doc, 0, 0, 2), 3);
+        assert_eq!(tl.nearest_match_line_in_filter(&doc, 0, 0), Some(0));
     }
 
     #[test]
     fn sequence_resolution_counts_exact_lines() {
-        let doc = doc_with("a\nb\nc\nd\ne\n");
+        let doc = doc_with(
+            "2026-07-19T10:00:00Z a\n\
+             2026-07-19T10:00:01Z b\n\
+             2026-07-19T10:00:02Z c\n\
+             2026-07-19T10:00:03Z d\n\
+             2026-07-19T10:00:04Z e\n",
+        );
         let tl = Timeline::build(&doc, &[vec![0, 4]], 16);
         let bins = tl.resolve_density_bins(&doc, 0, 2, 8);
         assert_eq!(bins.iter().sum::<u32>(), 3);

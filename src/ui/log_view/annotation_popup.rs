@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, RichText, Stroke};
 
-use logotomy::core::embedded_data::{DataNode, Detection};
-use logotomy::core::time::format_ms;
+use haystack::core::embedded_data::{DataNode, Detection};
+use haystack::core::time::format_ms;
 
 use super::embedded::presentation;
 use super::view::{inspector_mode_for, inspector_mode_for_open};
@@ -311,52 +311,64 @@ pub(crate) fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
     let mut copy_source = false;
     let mut secondary_action = false;
-    let area = egui::Area::new(egui::Id::new(("annotation_hover_bubble", key)))
-        .order(egui::Order::Foreground)
-        .default_size(size)
-        .constrain_to(screen.shrink(POPUP_INSET))
-        .fixed_pos(Pos2::new(x, y))
-        .show(ui.ctx(), |ui| {
-            egui::Frame::NONE
-                .fill(scaled_alpha(theme.surface, ANNOTATION_POPUP_SURFACE_ALPHA))
-                .stroke(Stroke::new(1.0, scaled_alpha(accent, 0.72)))
-                .corner_radius(6.0)
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_width(bubble_width - 20.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(badge).strong().color(accent));
-                        ui.label(RichText::new(title).strong().color(theme.text));
-                    });
-                    ui.label(RichText::new(summary).small().color(theme.text_muted));
-                    egui::ScrollArea::vertical()
-                        .max_height((estimated_height - POPUP_HEADER_HEIGHT).max(24.0))
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for line in &lines {
-                                ui.label(RichText::new(line).monospace().color(theme.text));
-                            }
-                        });
-                    ui.horizontal(|ui| {
-                        copy_source = icons::action_button(
-                            ui,
-                            Icon::Copy,
-                            "Copy source",
-                            theme.text,
-                            "Copy the exact source text",
-                        )
-                        .clicked();
-                        secondary_action = icons::action_button(
-                            ui,
-                            Icon::Info,
-                            secondary_label,
-                            theme.text,
-                            secondary_label,
-                        )
-                        .clicked();
-                    });
+    let _shield = crate::ui::app::overlay::input_shield(
+        ui.ctx(),
+        ("annotation_hover_shield", tab.focused_log_view_id, key),
+    );
+    let area = egui::Area::new(egui::Id::new((
+        "annotation_hover_bubble",
+        tab.focused_log_view_id,
+        key,
+    )))
+    .order(egui::Order::Tooltip)
+    .default_size(size)
+    .constrain_to(screen.shrink(POPUP_INSET))
+    .fixed_pos(Pos2::new(x, y))
+    .show(ui.ctx(), |ui| {
+        egui::Frame::NONE
+            .fill(scaled_alpha(theme.surface, ANNOTATION_POPUP_SURFACE_ALPHA))
+            .stroke(Stroke::new(1.0, scaled_alpha(accent, 0.72)))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(bubble_width - 20.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(badge).strong().color(accent));
+                    ui.label(RichText::new(title).strong().color(theme.text));
                 });
-        });
+                ui.label(RichText::new(summary).small().color(theme.text_muted));
+                egui::ScrollArea::vertical()
+                    .max_height((estimated_height - POPUP_HEADER_HEIGHT).max(24.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for line in &lines {
+                            ui.label(
+                                RichText::new(line)
+                                    .family(crate::ui::fonts::log_font_family())
+                                    .color(theme.text),
+                            );
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    copy_source = icons::action_button(
+                        ui,
+                        Icon::Copy,
+                        "Copy source",
+                        theme.text,
+                        "Copy the exact source text",
+                    )
+                    .clicked();
+                    secondary_action = icons::action_button(
+                        ui,
+                        Icon::Info,
+                        secondary_label,
+                        theme.text,
+                        secondary_label,
+                    )
+                    .clicked();
+                });
+            });
+    });
 
     let bubble_rect = area.response.rect;
     if let Some(state) = tab.annotation_hover.as_mut() {
@@ -496,7 +508,7 @@ fn should_dismiss(escape: bool, click: Option<Pos2>, bubble: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logotomy::core::embedded_data::{DataNode, SourcePos, SourceSpan};
+    use haystack::core::embedded_data::{DataNode, SourcePos, SourceSpan};
 
     fn candidate(key: AnnotationHoverKey) -> Candidate {
         Candidate {
@@ -589,11 +601,11 @@ mod tests {
     #[test]
     fn visible_popup_ignores_competing_highlights_until_grace_expires() {
         let path = std::env::temp_dir().join(format!(
-            "logotomy_annotation_popup_{}.log",
+            "haystack_annotation_popup_{}.log",
             std::process::id()
         ));
         std::fs::write(&path, "INFO value=one other=two\n").unwrap();
-        let doc = logotomy::core::document::LogDocument::open(&path).unwrap();
+        let doc = haystack::core::document::LogDocument::open(&path).unwrap();
         let mut tab = LogTab::new(doc);
         let first = candidate(embedded_key(5));
         let second = candidate(embedded_key(15));

@@ -14,7 +14,8 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use crate::core::time::{Iso, TimeFormat};
+use crate::core::record::{HeaderTime, RecordClassification};
+use crate::core::time::{Iso, TimeFormat, TimeFormatKind};
 
 use super::{FormatContext, LogFormat, Normalized};
 
@@ -63,6 +64,38 @@ impl LogFormat for OsLog {
 
     fn time_formats(&self) -> &'static [&'static dyn TimeFormat] {
         OS_LOG_TIMES
+    }
+
+    fn classify_header(
+        &self,
+        line: &str,
+        time_format: Option<&TimeFormatKind>,
+    ) -> Option<RecordClassification> {
+        if !self.matches(line) {
+            return None;
+        }
+        let leading = line.len() - line.trim_start().len();
+        let trimmed = &line[leading..];
+        let parser = time_format?;
+        let span = parser.recognize(trimmed)?;
+        if span.start != 0 {
+            return None;
+        }
+        let source_span = leading + span.start..leading + span.end;
+        let time = match parser.extract(trimmed) {
+            Some((value, extracted)) if extracted == span => HeaderTime::Known {
+                value,
+                span: source_span,
+            },
+            _ => HeaderTime::Invalid {
+                span: Some(source_span),
+            },
+        };
+        Some(RecordClassification::Header {
+            time,
+            header_span: leading..leading + span.end,
+            message_span: leading + span.end..line.len(),
+        })
     }
 
     fn normalize<'a>(

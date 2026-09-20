@@ -1,25 +1,25 @@
 # MCP integration guide
 
-Logotomy gives local AI agents token-efficient access to logs through one MCP server configuration. Configure `logotomy --mcp` once. The same stdio server works in two runtime modes:
+Haystack gives local AI agents token-efficient access to logs through one MCP server configuration. Configure `haystack --mcp` once. The same stdio server works in two runtime modes:
 
 | Mode | How it starts | Log selection |
 |---|---|---|
 | `standalone` | Default | Agent calls `load_log` and retains its `log_id` |
-| `gui_attached` | Agent calls `attach_gui_session` with the temporary ID copied from Logotomy | The GUI's selected tab; no `load_log` or `log_id` |
+| `gui_attached` | Agent calls `attach_gui_session` with the temporary ID copied from Haystack | The GUI's selected tab; no `load_log` or `log_id` |
 
-There is no HTTP MCP transport and no temporary MCP server to add to an agent. The GUI uses authenticated private local IPC internally, but agents always communicate with `logotomy --mcp` through stdio.
+There is no HTTP MCP transport and no temporary MCP server to add to an agent. The GUI uses authenticated private local IPC internally, but agents always communicate with `haystack --mcp` through stdio.
 
 ## Configure once
 
-Replace `/absolute/path/to/logotomy` with the executable path shown by **Settings → Integrate with AI Assistant**.
+Replace `/absolute/path/to/haystack` with the executable path shown by **Settings → Integrate with AI Assistant**.
 
 ### Codex CLI, desktop app, and VS Code extension
 
 Add this to `~/.codex/config.toml`, or `.codex/config.toml` for project scope:
 
 ```toml
-[mcp_servers.logotomy]
-command = "/absolute/path/to/logotomy"
+[mcp_servers.haystack]
+command = "/absolute/path/to/haystack"
 args = ["--mcp"]
 startup_timeout_sec = 20
 ```
@@ -33,8 +33,8 @@ Open **Settings → Developer → Edit Config** and merge this entry into `mcpSe
 ```json
 {
   "mcpServers": {
-    "logotomy": {
-      "command": "/absolute/path/to/logotomy",
+    "haystack": {
+      "command": "/absolute/path/to/haystack",
       "args": ["--mcp"]
     }
   }
@@ -45,10 +45,10 @@ The file is normally `~/Library/Application Support/Claude/claude_desktop_config
 
 ### Claude Code CLI and VS Code extension
 
-Run this once with user scope so Logotomy is available across projects:
+Run this once with user scope so Haystack is available across projects:
 
 ```sh
-claude mcp add --scope user logotomy -- /absolute/path/to/logotomy --mcp
+claude mcp add --scope user haystack -- /absolute/path/to/haystack --mcp
 claude mcp list
 ```
 
@@ -61,8 +61,8 @@ Add this to `.cline/mcp.json` for project scope or `~/.cline/mcp.json` for user 
 ```json
 {
   "mcpServers": {
-    "logotomy": {
-      "command": "/absolute/path/to/logotomy",
+    "haystack": {
+      "command": "/absolute/path/to/haystack",
       "args": ["--mcp"],
       "disabled": false,
       "autoApprove": []
@@ -75,8 +75,8 @@ See [Cline MCP configuration](https://docs.cline.bot/mcp/configuring-mcp-servers
 
 ## Use a log from the GUI
 
-1. Configure `logotomy --mcp` once using the relevant client instructions above.
-2. Open a log in Logotomy and select the tab to share.
+1. Configure `haystack --mcp` once using the relevant client instructions above.
+2. Open a log in Haystack and select the tab to share.
 3. Click **Start MCP**.
 4. Click **Copy GUI session instruction** and paste it into the agent conversation.
 5. The agent calls `attach_gui_session` with that temporary session ID, then calls `session_info` and confirms `mode: "gui_attached"`.
@@ -107,11 +107,11 @@ Standalone documents remain loaded if the process temporarily attaches to and la
 
 ## Agent contract
 
-Logotomy exposes a stable tool catalog in both modes, so clients may safely cache discovery. Runtime rules come from:
+Haystack exposes a stable tool catalog in both modes, so clients may safely cache discovery. Runtime rules come from:
 
 - `session_info` — authoritative mode, lifecycle, active-log, and filter state;
-- `logotomy://session` — the same state for clients that consume MCP resources;
-- `logotomy://guide` — compact investigation guidance.
+- `haystack://session` — the same state for clients that consume MCP resources;
+- `haystack://guide` — compact investigation guidance.
 
 Suggested investigation approach:
 
@@ -199,15 +199,15 @@ prioritized next work.
 - Each GUI start creates a cryptographically random 12-character hexadecimal (48-bit) session ID.
 - The GUI publishes a private, atomic local session manifest; Unix permissions are user-only.
 - The internal IPC socket binds only to loopback and rejects requests without the matching ID.
-- The ID and manifest expire when MCP stops or Logotomy exits.
-- Logotomy does not log or return the session ID.
+- The ID and manifest expire when MCP stops or Haystack exits.
+- Haystack does not log or return the session ID.
 - A cloud-only agent cannot launch a local stdio command; use its local CLI, desktop app, or VS Code extension.
 
 `--mcp-gui` remains a deprecated compatibility alias for older configurations. New and updated integrations must use `--mcp` plus explicit `attach_gui_session`.
 
 ## Protocol compatibility
 
-Logotomy supports discovery-based MCP `2026-07-28` and initialization-based revisions `2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` over stdio. Modern clients call `server/discover`; existing clients call `initialize`, then `tools/list`.
+Haystack supports discovery-based MCP `2026-07-28` and initialization-based revisions `2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` over stdio. Modern clients call `server/discover`; existing clients call `initialize`, then `tools/list`.
 
 ## Smoke test and troubleshooting
 
@@ -215,7 +215,7 @@ Logotomy supports discovery-based MCP `2026-07-28` and initialization-based revi
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  | logotomy --mcp
+  | haystack --mcp
 ```
 
 | Symptom | Resolution |
@@ -225,6 +225,6 @@ printf '%s\n' \
 | `load_log` is rejected | Call `session_info`; while `gui_attached`, analyze the selected tab without `log_id` |
 | Analysis returns `{"comment":"no log"}` | Pass `with_filtered_log:false` or add a keyword filter |
 | Large result is truncated | Narrow line/time bounds or paginate before calling `raw_log` |
-| Agent cannot see Logotomy | Confirm it runs locally and its configured command points to the current executable |
+| Agent cannot see Haystack | Confirm it runs locally and its configured command points to the current executable |
 
 When reporting a problem, include the client/surface, requested MCP version, method, mode from `session_info`, and error text. Redact the session ID and log contents.

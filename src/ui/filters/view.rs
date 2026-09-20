@@ -11,13 +11,14 @@ use crate::ui::icons::{self, Icon};
 use crate::ui::theme::Theme;
 use crate::ui::util::error_bubble::{error_bubble, BubbleAlign};
 use crate::ui::util::suggestion_row;
-use logotomy::core::search::{parse_template_id, validate_regex};
+use haystack::core::field_query::FieldQuery;
+use haystack::core::search::{parse_template_id, validate_regex};
 
 /// Compact Add Filter section for the timeline header.
 pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     const REGEX_DEBOUNCE: Duration = Duration::from_millis(150);
     let at_cap = tab.filters.len() >= MAX_FILTERS;
-    if !tab.filter_input_regex && !tab.filter_input_template_id {
+    if !tab.filter_input_regex && !tab.filter_input_template_id && !tab.filter_input_field_mode {
         tab.filter_input_regex_validate_at = None;
         tab.filter_input_regex_error = None;
         tab.filter_input_regex_error_dismissed = false;
@@ -28,6 +29,10 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         let input = tab.filter_input.trim();
         tab.filter_input_regex_error = if input.is_empty() {
             None
+        } else if tab.filter_input_field_mode {
+            FieldQuery::parse(input, tab.filter_input_case_sensitive)
+                .and_then(|query| query.bind_to_doc(&tab.doc))
+                .err()
         } else if tab.filter_input_template_id {
             parse_template_id(input).err()
         } else {
@@ -45,19 +50,22 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
         ui.add(icons::icon_image(ui.ctx(), Icon::Filter, 14.0, theme.text_muted))
             .on_hover_text("Add a timeline filter");
-        ui.label("Filter")
-            .on_hover_text("Enter a phrase, regular expression, or Template ID.");
+        ui.label("Add filter")
+            .on_hover_text("Enter text, a regular expression, Template ID, or a captured-field query.");
         let input = ui
             .add_enabled_ui(!at_cap, |ui| {
                 ui.add_sized(
                     egui::vec2(225.0, icons::ACTION_HEIGHT),
                     egui::TextEdit::singleline(&mut tab.filter_input)
+                        .id(egui::Id::new("timeline_filter_input"))
                         .hint_text(if at_cap {
                             "Max 20 filters"
                         } else if tab.filter_input_template_id {
-                            "42, T42, or T{42} + Enter"
+                            "42, T42, or T{42}"
+                        } else if tab.filter_input_field_mode {
+                            "b >= 9 or loglevel = \"FAULT\""
                         } else {
-                            "filter + Enter"
+                            "text or expression"
                         })
                         .desired_width(225.0),
                 )
@@ -65,7 +73,7 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             .inner
             .on_hover_text("Type a phrase, regular expression, or Template ID. Press Enter or Add to create the filter.");
         input_rect = Some(input.rect);
-        if input.has_focus() && tab.filter_input.trim().is_empty() && !at_cap && !tab.filter_input_template_id {
+        if input.has_focus() && tab.filter_input.trim().is_empty() && !at_cap && !tab.filter_input_template_id && !tab.filter_input_field_mode {
             tab.filter_suggestions_open = true;
         }
         input_has_focus = input.has_focus();
@@ -75,8 +83,9 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         show_recent_suggestions = tab.filter_suggestions_open
             && tab.filter_input.trim().is_empty()
             && !at_cap
-            && !tab.filter_input_template_id;
-        if input.changed() && (tab.filter_input_regex || tab.filter_input_template_id) {
+            && !tab.filter_input_template_id
+            && !tab.filter_input_field_mode;
+        if input.changed() && (tab.filter_input_regex || tab.filter_input_template_id || tab.filter_input_field_mode) {
             tab.filter_input_regex_validate_at = Some(Instant::now() + REGEX_DEBOUNCE);
             tab.filter_input_regex_error = None;
             tab.filter_input_regex_error_dismissed = false;
@@ -103,20 +112,25 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 "Add this filter and start a background scan."
             },
         );
+
         let mode_label = if tab.filter_input_template_id {
             "Template ID"
+        } else if tab.filter_input_field_mode {
+            "Field"
         } else if tab.filter_input_regex {
             "Regex"
-        } else if tab.filter_input_case_sensitive {
-            "Text (Aa)"
+            } else if tab.filter_input_case_sensitive {
+            "Text (case-sensitive)"
         } else {
-            "Text (Ab)"
+            "Text (ignore case)"
         };
         // `selectable_value` needs a real mutable value. Binding it directly
         // to a tuple expression creates a temporary, so selections looked
         // clickable but were discarded at the end of the frame.
         let original_mode = if tab.filter_input_template_id {
             3_u8
+        } else if tab.filter_input_field_mode {
+            4_u8
         } else if tab.filter_input_regex {
             2_u8
         } else if tab.filter_input_case_sensitive {
@@ -127,19 +141,21 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         let mut mode = original_mode;
         egui::ComboBox::from_id_salt("filter_input_match_mode")
             .selected_text(mode_label)
-            .width(108.0)
+            .width(150.0)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut mode, 0, "Text (Aa)")
+                ui.selectable_value(&mut mode, 0, "Text (case-sensitive)")
                     .on_hover_text("Plain text; match upper- and lower-case letters exactly.")
                     ;
-                ui.selectable_value(&mut mode, 1, "Text (Ab)")
-                    .on_hover_text("Plain text; match ASCII upper- and lower-case letters alike.")
+                ui.selectable_value(&mut mode, 1, "Text (ignore case)")
+                    .on_hover_text("Plain text; match upper- and lower-case letters alike.")
                     ;
                 ui.selectable_value(&mut mode, 2, "Regex")
                     .on_hover_text("Rust regular expression; case follows the previous Text mode and is linear-time and size-limited.")
                     ;
                 ui.selectable_value(&mut mode, 3, "Template ID")
                     .on_hover_text("Mined Drain template ID. Enter digits (for example 42), T42, or T{42}.");
+                ui.selectable_value(&mut mode, 4, "Field")
+                    .on_hover_text("Query one captured field, for example b >= 9 or loglevel = \"FAULT\".");
             })
             .response
             .on_hover_text("Choose text, regular-expression, or Drain Template ID matching.");
@@ -149,30 +165,56 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 0 => {
                     tab.filter_input_regex = false;
                     tab.filter_input_template_id = false;
+                    tab.filter_input_field_mode = false;
                     tab.filter_input_case_sensitive = true;
                 }
                 1 => {
                     tab.filter_input_regex = false;
                     tab.filter_input_template_id = false;
+                    tab.filter_input_field_mode = false;
                     tab.filter_input_case_sensitive = false;
                 }
                 2 => {
                     tab.filter_input_regex = true;
                     tab.filter_input_template_id = false;
+                    tab.filter_input_field_mode = false;
+                }
+                3 => {
+                    tab.filter_input_regex = false;
+                    tab.filter_input_template_id = true;
+                    tab.filter_input_field_mode = false;
+                    tab.filter_suggestions_open = false;
                 }
                 _ => {
                     tab.filter_input_regex = false;
-                    tab.filter_input_template_id = true;
+                    tab.filter_input_template_id = false;
+                    tab.filter_input_field_mode = true;
                     tab.filter_suggestions_open = false;
                 }
             }
         }
+        let field_case_changed = tab.filter_input_field_mode
+            && ui.checkbox(&mut tab.filter_input_case_sensitive, "Case-sensitive")
+                .on_hover_text("Match captured text/path values with exact case; turn off for case-insensitive matching.")
+                .clicked();
+        if field_case_changed {
+            // checkbox already toggled the state
+        }
 
         if (enter && can_add) || add.clicked() {
             let color = theme.filter_colors[tab.filters.len() % theme.filter_colors.len()];
-            if tab.filter_input_template_id {
+            let added = if tab.filter_input_template_id {
                 let text = tab.filter_input.trim().to_string();
-                tab.push_template_filter_input(&text, color);
+                tab.push_template_filter_input(&text, color).is_some()
+            } else if tab.filter_input_field_mode {
+                let text = tab.filter_input.trim().to_string();
+                match tab.push_field_filter_input(&text, color) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        tab.filter_input_regex_error = Some(error);
+                        false
+                    }
+                }
             } else {
                 let text = tab.filter_input.trim().to_string();
                 tab.push_filter_with_options(
@@ -180,13 +222,15 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     color,
                     tab.filter_input_case_sensitive,
                     tab.filter_input_regex,
-                );
+                ).is_some()
+            };
+            if added {
+                tab.filter_input.clear();
+                input.request_focus();
             }
-            tab.filter_input.clear();
-            input.request_focus();
         }
-        if mode_changed {
-            if tab.filter_input_regex || tab.filter_input_template_id {
+        if mode_changed || field_case_changed {
+            if tab.filter_input_regex || tab.filter_input_template_id || tab.filter_input_field_mode {
                 tab.filter_input_regex_validate_at = Some(Instant::now() + REGEX_DEBOUNCE);
                 tab.filter_input_regex_error = None;
                 tab.filter_input_regex_error_dismissed = false;
@@ -222,19 +266,47 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         }
     });
 
+    if tab.filter_input_field_mode && input_has_focus && !at_cap {
+        let current = tab.filter_input.clone();
+        tab.refresh_field_suggestions(&current);
+        if let Some(anchor) = input_rect {
+            if let Some(completed) = crate::ui::field_query_ui::show(
+                ui,
+                "filter_field_completion",
+                &tab.doc,
+                &current,
+                tab.field_suggestions.as_ref(),
+                tab.filter_input_regex_error.as_deref(),
+                anchor,
+            ) {
+                tab.filter_input = completed;
+                tab.filter_input_regex_validate_at = Some(Instant::now() + REGEX_DEBOUNCE);
+                ui.ctx().request_repaint_after(REGEX_DEBOUNCE);
+            }
+        }
+    }
+
     if tab.filter_input_regex_validate_at.is_some() {
         ui.ctx().request_repaint_after(REGEX_DEBOUNCE);
-    } else if let (Some(error), Some(anchor)) = (&tab.filter_input_regex_error, input_rect) {
-        let mut bubble_open = !tab.filter_input_regex_error_dismissed;
-        error_bubble(
-            ui.ctx(),
-            "filter_input_regex_error",
-            anchor,
-            BubbleAlign::Below,
-            error,
-            &mut bubble_open,
+    } else if !(tab.filter_input_field_mode && input_has_focus) {
+        if let (Some(error), Some(anchor)) = (&tab.filter_input_regex_error, input_rect) {
+            let mut bubble_open = !tab.filter_input_regex_error_dismissed;
+            error_bubble(
+                ui.ctx(),
+                "filter_input_regex_error",
+                anchor,
+                BubbleAlign::Below,
+                error,
+                &mut bubble_open,
+            );
+            tab.filter_input_regex_error_dismissed = !bubble_open;
+        }
+    }
+    if let Some(error) = &tab.filter_scan_error {
+        ui.colored_label(
+            theme.warning,
+            format!("Filter scan was not applied: {error}"),
         );
-        tab.filter_input_regex_error_dismissed = !bubble_open;
     }
 
     // Suggestions deliberately live in a floating area instead of a nested
@@ -278,9 +350,9 @@ pub fn add_filter_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 }
 
 fn recent_filter_suggestions(
-    history: &[logotomy::core::settings::RecentFilter],
+    history: &[haystack::core::settings::RecentFilter],
     active_filters: &[Filter],
-) -> Vec<logotomy::core::settings::RecentFilter> {
+) -> Vec<haystack::core::settings::RecentFilter> {
     history
         .iter()
         .filter(|entry| {
@@ -296,7 +368,7 @@ fn recent_filter_suggestions(
 mod tests {
     use super::*;
     use eframe::egui::Color32;
-    use logotomy::core::settings::RecentFilter;
+    use haystack::core::settings::RecentFilter;
 
     #[test]
     fn recent_filter_suggestions_omit_already_added_filters() {

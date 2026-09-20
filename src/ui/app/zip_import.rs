@@ -8,7 +8,7 @@ use eframe::egui;
 use crate::ui::icons::{self, Icon};
 
 use super::archive::{extract_zip, ExtractionProgress};
-use super::model::LogotomyApp;
+use super::model::HaystackApp;
 
 struct ExtractionJob {
     path: PathBuf,
@@ -32,6 +32,10 @@ impl Drop for ZipImports {
 }
 
 impl ZipImports {
+    pub(super) fn has_interactive_surface(&self) -> bool {
+        self.active.is_some() || self.error.is_some()
+    }
+
     pub fn enqueue(&mut self, path: PathBuf) {
         if !self.pending.contains(&path)
             && !self.active.as_ref().is_some_and(|job| job.path == path)
@@ -41,7 +45,7 @@ impl ZipImports {
     }
 }
 
-impl LogotomyApp {
+impl HaystackApp {
     pub(super) fn zip_import_ui(&mut self, ctx: &egui::Context) {
         // Serialize archives and dialogs, even when several ZIPs are dropped together.
         if self.zip_imports.active.is_none() && self.zip_imports.error.is_none() {
@@ -94,11 +98,12 @@ impl LogotomyApp {
             ctx.request_repaint();
         }
         if let Some(job) = &self.zip_imports.active {
-            egui::Window::new("Extracting ZIP")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
+            super::overlay::modal(
+                ctx,
+                "zip_progress_modal",
+                "Extracting ZIP",
+                egui::vec2(480.0, 200.0),
+                |ui| {
                     ui.label(job.path.file_name().unwrap_or_default().to_string_lossy());
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -132,17 +137,17 @@ impl LogotomyApp {
                     {
                         job.progress.cancel.store(true, Ordering::Relaxed);
                     }
-                });
+                },
+            );
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
         if let Some(error) = self.zip_imports.error.clone() {
-            let mut open = true;
-            egui::Window::new("Could not extract ZIP")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
+            super::overlay::modal(
+                ctx,
+                "zip_error_modal",
+                "Could not extract ZIP",
+                egui::vec2(520.0, 220.0),
+                |ui| {
                     ui.label(error);
                     ui.label(
                         "The archive may be damaged or use an unsupported compression method.",
@@ -159,10 +164,8 @@ impl LogotomyApp {
                     {
                         self.zip_imports.error = None;
                     }
-                });
-            if !open {
-                self.zip_imports.error = None;
-            }
+                },
+            );
         }
     }
 }

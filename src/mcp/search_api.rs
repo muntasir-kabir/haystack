@@ -48,6 +48,7 @@ pub(super) fn matcher_from_args(
         case_sensitive,
         regex,
         template_id,
+        field_query: None,
         polarity: search::FilterPolarity::Include,
     };
     search::validate_matcher(&spec)?;

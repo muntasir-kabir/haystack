@@ -11,8 +11,10 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
-/// Current sidecar schema.  Readers must continue accepting older versions.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+use crate::core::record::RecordProfile;
+
+/// Current sidecar schema. Pre-release schemas are intentionally not migrated.
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// The serialized state belonging to one source file.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -28,14 +30,16 @@ pub struct InvestigationState {
     pub selected_filter: Option<String>,
     #[serde(default)]
     pub applied_filter: Option<String>,
-    #[serde(default)]
-    pub search: SearchState,
-    #[serde(default)]
-    pub selected_line: Option<LineAnchor>,
-    #[serde(default)]
-    pub scroll: ScrollState,
+    #[serde(default = "default_log_views")]
+    pub log_views: Vec<LogViewState>,
+    #[serde(default = "default_log_view_id")]
+    pub focused_log_view_id: u64,
     #[serde(default)]
     pub timeline_zoom: Option<TimelineZoomState>,
+    /// Embedded snapshot of the explicitly selected parsing profile. The
+    /// source remains reproducible even if a named preset is later removed.
+    #[serde(default)]
+    pub record_profile: Option<RecordProfile>,
     #[serde(default)]
     pub pins: Vec<PinState>,
     #[serde(default)]
@@ -53,9 +57,10 @@ pub struct InvestigationState {
     #[serde(default)]
     pub dock_layout: Option<serde_json::Value>,
     #[serde(default)]
-    pub pre_detach_dock_layout: Option<serde_json::Value>,
+    pub detached_views: Vec<DetachedViewState>,
+    /// Serialized `Vec<(ViewTab, TabPath)>`; opaque here to keep core GUI-free.
     #[serde(default)]
-    pub detached_views: Vec<String>,
+    pub detached_locations: Option<serde_json::Value>,
     #[serde(default)]
     pub timeline_detached: bool,
 }
@@ -72,6 +77,12 @@ fn default_templates_width() -> f32 {
 fn default_log_font_size() -> f32 {
     12.0
 }
+fn default_log_view_id() -> u64 {
+    1
+}
+fn default_log_views() -> Vec<LogViewState> {
+    vec![LogViewState::default()]
+}
 
 impl Default for InvestigationState {
     fn default() -> Self {
@@ -82,10 +93,10 @@ impl Default for InvestigationState {
             everything_else_active: true,
             selected_filter: None,
             applied_filter: None,
-            search: SearchState::default(),
-            selected_line: None,
-            scroll: ScrollState::default(),
+            log_views: default_log_views(),
+            focused_log_view_id: default_log_view_id(),
             timeline_zoom: None,
+            record_profile: None,
             pins: Vec::new(),
             trim: None,
             show_templates: false,
@@ -93,11 +104,43 @@ impl Default for InvestigationState {
             bottom_panel_open: false,
             log_font_size: default_log_font_size(),
             dock_layout: None,
-            pre_detach_dock_layout: None,
             detached_views: Vec::new(),
+            detached_locations: None,
             timeline_detached: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LogViewState {
+    pub id: u64,
+    pub display_number: u64,
+    #[serde(default)]
+    pub search: SearchState,
+    #[serde(default)]
+    pub selected_line: Option<LineAnchor>,
+    #[serde(default)]
+    pub scroll: ScrollState,
+}
+
+impl Default for LogViewState {
+    fn default() -> Self {
+        Self {
+            id: default_log_view_id(),
+            display_number: 1,
+            search: SearchState::default(),
+            selected_line: None,
+            scroll: ScrollState::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DetachedViewState {
+    Log { id: u64 },
+    Pinned,
+    Templates,
 }
 
 /// File identity used to decide whether line anchors can be applied safely.
@@ -122,6 +165,8 @@ pub struct FilterState {
     /// A typed Drain-template filter. Older sidecars omit this and remain text filters.
     #[serde(default)]
     pub template_id: Option<u32>,
+    #[serde(default)]
+    pub field_query: Option<crate::core::field_query::FieldQuery>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -136,6 +181,10 @@ pub struct SearchState {
     pub regex: bool,
     #[serde(default)]
     pub template_id_mode: bool,
+    #[serde(default)]
+    pub field_mode: bool,
+    #[serde(default)]
+    pub field_query: Option<crate::core::field_query::FieldQuery>,
     #[serde(default)]
     pub selected_line: Option<LineAnchor>,
 }
@@ -210,7 +259,7 @@ pub fn path_for(source: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_else(|| std::borrow::Cow::Borrowed("unknown"));
-    parent.join(format!(".{name}.logotomy"))
+    parent.join(format!(".{name}.haystack"))
 }
 
 /// Read the sidecar and classify it against the current source metadata.
@@ -221,9 +270,16 @@ pub fn load_for(source: &Path) -> Result<Option<LoadedState>, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
     };
-    let mut state: InvestigationState = serde_json::from_str(&text)
+    #[derive(Deserialize)]
+    struct SchemaHeader {
+        #[serde(default)]
+        schema_version: u32,
+    }
+    let header: SchemaHeader = serde_json::from_str(&text)
         .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-    migrate(&mut state)?;
+    validate_schema(header.schema_version)?;
+    let state: InvestigationState = serde_json::from_str(&text)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
 
     let current = source_identity(source)?;
     let status = if state.source == current {
@@ -236,6 +292,7 @@ pub fn load_for(source: &Path) -> Result<Option<LoadedState>, String> {
 
 /// Save a sidecar using a temporary sibling followed by rename.
 pub fn save_for(source: &Path, state: &InvestigationState) -> Result<(), String> {
+    validate_schema(state.schema_version)?;
     let path = path_for(source);
     let parent = path
         .parent()
@@ -244,7 +301,7 @@ pub fn save_for(source: &Path, state: &InvestigationState) -> Result<(), String>
         .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     let text = serde_json::to_vec_pretty(state)
         .map_err(|error| format!("failed to encode {}: {error}", path.display()))?;
-    let temporary = path.with_extension(format!("logotomy.tmp-{}", std::process::id()));
+    let temporary = path.with_extension(format!("haystack.tmp-{}", std::process::id()));
     fs::write(&temporary, text)
         .map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
     if let Err(error) = fs::rename(&temporary, &path) {
@@ -307,16 +364,19 @@ pub fn source_identity(source: &Path) -> Result<SourceIdentity, String> {
     })
 }
 
-fn migrate(state: &mut InvestigationState) -> Result<(), String> {
-    if state.schema_version > CURRENT_SCHEMA_VERSION {
+fn validate_schema(schema_version: u32) -> Result<(), String> {
+    if schema_version > CURRENT_SCHEMA_VERSION {
         return Err(format!(
             "sidecar schema {} is newer than supported schema {}",
-            state.schema_version, CURRENT_SCHEMA_VERSION
+            schema_version, CURRENT_SCHEMA_VERSION
         ));
     }
-    // Version 1 is the initial schema. Future migrations should be explicit
-    // and finish by setting `schema_version` to CURRENT_SCHEMA_VERSION.
-    state.schema_version = CURRENT_SCHEMA_VERSION;
+    if schema_version < CURRENT_SCHEMA_VERSION {
+        return Err(format!(
+            "development sidecar schema {} is not migrated; expected schema {}",
+            schema_version, CURRENT_SCHEMA_VERSION
+        ));
+    }
     Ok(())
 }
 
@@ -328,7 +388,7 @@ mod tests {
     fn temp_path() -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
-            "logotomy_sidecar_test_{}_{}",
+            "haystack_sidecar_test_{}_{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
@@ -338,7 +398,7 @@ mod tests {
     fn sidecar_path_uses_the_full_source_filename() {
         assert_eq!(
             path_for(Path::new("/tmp/app.log")),
-            PathBuf::from("/tmp/.app.log.logotomy")
+            PathBuf::from("/tmp/.app.log.haystack")
         );
     }
 
@@ -346,6 +406,7 @@ mod tests {
     fn schema_round_trips_and_missing_fields_default() {
         let mut state = InvestigationState::default();
         state.source.canonical_path = PathBuf::from("/tmp/app.log");
+        state.record_profile = Some(RecordProfile::text("test:layout", "Layout", "{time} {log}"));
         state.filters.push(FilterState {
             text: "T{42}".into(),
             active: false,
@@ -353,27 +414,46 @@ mod tests {
             exclude: false,
             regex: false,
             template_id: Some(42),
+            field_query: None,
         });
         let text = serde_json::to_string(&state).unwrap();
         let decoded: InvestigationState = serde_json::from_str(&text).unwrap();
         assert_eq!(decoded, state);
 
-        let old: InvestigationState = serde_json::from_str(
-            r#"{"source":{"canonical_path":"/tmp/app.log","file_size":1,"mtime_unix_nanos":2}}"#,
+        let minimal: InvestigationState = serde_json::from_str(
+            r#"{"schema_version":4,"source":{"canonical_path":"/tmp/app.log","file_size":1,"mtime_unix_nanos":2}}"#,
         )
         .unwrap();
-        assert_eq!(old.schema_version, CURRENT_SCHEMA_VERSION);
-        assert!(old.everything_else_active);
-        assert_eq!(old.log_font_size, 12.0);
+        assert_eq!(minimal.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(minimal.log_views, vec![LogViewState::default()]);
+        assert!(minimal.record_profile.is_none());
+        assert!(minimal.everything_else_active);
+        assert_eq!(minimal.log_font_size, 12.0);
     }
 
     #[test]
     fn newer_schema_is_rejected() {
-        let mut state: InvestigationState = serde_json::from_str(
-            r#"{"schema_version":99,"source":{"canonical_path":"/tmp/app.log","file_size":1,"mtime_unix_nanos":2}}"#,
-        )
-        .unwrap();
-        assert!(migrate(&mut state).is_err());
+        assert!(validate_schema(99).is_err());
+    }
+
+    #[test]
+    fn older_development_schema_is_rejected_without_migration() {
+        let source = temp_path();
+        fs::write(&source, "one\n").unwrap();
+        for version in 1..CURRENT_SCHEMA_VERSION {
+            fs::write(
+                path_for(&source),
+                format!(
+                    r#"{{"schema_version":{version},"source":{{"canonical_path":"ignored","file_size":1,"mtime_unix_nanos":2}}}}"#
+                ),
+            )
+            .unwrap();
+            let error = load_for(&source).unwrap_err();
+            assert!(error.contains("is not migrated"));
+            assert!(error.contains("expected schema 4"));
+        }
+        fs::remove_file(path_for(&source)).ok();
+        fs::remove_file(source).ok();
     }
 
     #[test]

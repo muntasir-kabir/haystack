@@ -1,6 +1,6 @@
-//! Persistent settings for logotomy — stored as `~/.logotomy/settings.json`.
+//! Persistent settings for haystack — stored as `~/.haystack/settings.json`.
 //!
-//! Tracks recent files (last 20), dark/light mode preference, and provides the
+//! Tracks recent files (last 20), theme preference, and provides the
 //! log directory path for file-based logging.
 
 use std::path::PathBuf;
@@ -8,6 +8,33 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::core::time::CustomDateFormat;
+
+/// The persisted application theme preference.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    Light,
+    Dark,
+    System,
+}
+
+impl ThemeMode {
+    pub const ALL: [Self; 3] = [Self::Light, Self::Dark, Self::System];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+            Self::System => "System",
+        }
+    }
+}
+
+impl Default for ThemeMode {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
 
 /// Maximum number of recent files to remember.
 const MAX_RECENT: usize = 20;
@@ -73,6 +100,9 @@ pub struct Settings {
     /// Most-recently executed Log View search terms, most recent first.
     #[serde(default)]
     pub recent_searches: Vec<String>,
+    /// Typed searches are separate so replay never treats them as plain text.
+    #[serde(default)]
+    pub recent_field_searches: Vec<crate::core::field_query::FieldQuery>,
     /// Most-recently added Timeline filters, including their match mode.
     #[serde(default)]
     pub recent_filters: Vec<RecentFilter>,
@@ -85,9 +115,9 @@ pub struct Settings {
     /// Canonical path of the active tab from the previous GUI session.
     #[serde(default)]
     pub active_file: Option<PathBuf>,
-    /// Whether dark mode is enabled (default: true).
-    #[serde(default = "default_dark")]
-    pub dark_mode: bool,
+    /// Theme choice. Older settings files with `dark_mode` are migrated when loaded.
+    #[serde(default)]
+    pub theme_mode: ThemeMode,
     /// Default filter set to apply to new tabs.
     #[serde(default)]
     pub default_filter: Option<String>,
@@ -110,9 +140,6 @@ pub struct Settings {
     pub embedded_inspector_mode: String,
 }
 
-fn default_dark() -> bool {
-    true
-}
 fn default_sim_threshold() -> f64 {
     0.5
 }
@@ -131,11 +158,12 @@ impl Default for Settings {
         Self {
             recent_files: Vec::new(),
             recent_searches: Vec::new(),
+            recent_field_searches: Vec::new(),
             recent_filters: Vec::new(),
             log_line_display_mode: LogLineDisplayMode::default(),
             open_files: Vec::new(),
             active_file: None,
-            dark_mode: true,
+            theme_mode: ThemeMode::default(),
             default_filter: None,
             sim_threshold: default_sim_threshold(),
             header_sample_lines: default_header_sample_lines(),
@@ -147,14 +175,14 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Root data directory (`~/.logotomy`).
+    /// Root data directory (`~/.haystack`).
     pub fn home_dir() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".logotomy")
+            .join(".haystack")
     }
 
-    /// Path to the filters directory (`~/.logotomy/filters/`).
+    /// Path to the filters directory (`~/.haystack/filters/`).
     pub fn filters_dir() -> PathBuf {
         Self::home_dir().join("filters")
     }
@@ -164,14 +192,20 @@ impl Settings {
         Self::home_dir().join("settings.json")
     }
 
-    /// Path to the logs directory (`~/.logotomy/logs/`).
+    /// Path to the logs directory (`~/.haystack/logs/`).
     pub fn log_dir() -> PathBuf {
         Self::home_dir().join("logs")
     }
 
-    /// Path to the user-defined date-format list (`~/.logotomy/custom_date_format_list.json`).
+    /// Path to the user-defined date-format list (`~/.haystack/custom_date_format_list.json`).
     pub fn custom_date_formats_path() -> PathBuf {
         Self::home_dir().join("custom_date_format_list.json")
+    }
+
+    /// Versioned reusable log-format templates. Selected definitions are also
+    /// embedded in per-file sidecars so deleting a preset cannot alter a file.
+    pub fn record_profiles_path() -> PathBuf {
+        Self::home_dir().join("record_profiles.json")
     }
 
     /// Load the user-defined custom date formats (empty list if missing/unparsable).
@@ -221,8 +255,13 @@ impl Settings {
             return Self::default();
         }
         match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str(&text) {
-                Ok(s) => s,
+            Ok(text) => match Self::from_persisted_json(&text) {
+                Ok((s, migrated)) => {
+                    if migrated {
+                        s.save();
+                    }
+                    s
+                }
                 Err(e) => {
                     log::warn!(
                         "failed to parse settings file ({}), using defaults: {e}",
@@ -241,7 +280,26 @@ impl Settings {
         }
     }
 
-    /// Save settings to disk. Creates the `~/.logotomy/` directory if needed.
+    /// Parse settings while translating the pre-theme-mode boolean schema.
+    /// The bool is deliberately not a field on `Settings`; after the first
+    /// successful load, saving writes only the explicit theme choice.
+    fn from_persisted_json(text: &str) -> Result<(Self, bool), serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        let legacy_dark_mode = value.get("dark_mode").and_then(serde_json::Value::as_bool);
+        let has_theme_mode = value.get("theme_mode").is_some();
+        let mut settings: Self = serde_json::from_value(value)?;
+        let migrated = !has_theme_mode && legacy_dark_mode.is_some();
+        if let Some(dark_mode) = legacy_dark_mode.filter(|_| !has_theme_mode) {
+            settings.theme_mode = if dark_mode {
+                ThemeMode::Dark
+            } else {
+                ThemeMode::Light
+            };
+        }
+        Ok((settings, migrated))
+    }
+
+    /// Save settings to disk. Creates the `~/.haystack/` directory if needed.
     pub fn save(&self) {
         let dir = Self::home_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -285,6 +343,12 @@ impl Settings {
         self.recent_searches.retain(|entry| entry != query);
         self.recent_searches.insert(0, query.to_owned());
         self.recent_searches.truncate(MAX_RECENT_QUERIES);
+    }
+
+    pub fn add_recent_field_search(&mut self, query: crate::core::field_query::FieldQuery) {
+        self.recent_field_searches.retain(|entry| entry != &query);
+        self.recent_field_searches.insert(0, query);
+        self.recent_field_searches.truncate(MAX_RECENT_QUERIES);
     }
 
     /// Remember an added filter, including the mode necessary to replay it.
@@ -362,17 +426,41 @@ mod tests {
         settings.add_recent_search(" error ");
         settings.add_recent_search("warning");
         settings.add_recent_search("error");
+        let field = crate::core::field_query::FieldQuery::parse("b >= 9", true).unwrap();
+        settings.add_recent_field_search(field.clone());
+        settings.add_recent_field_search(field.clone());
         settings.add_recent_filter(RecentFilter {
             text: "panic".to_owned(),
             case_sensitive: false,
             regex: false,
         });
         assert_eq!(settings.recent_searches, ["error", "warning"]);
+        assert_eq!(settings.recent_field_searches, [field]);
         assert_eq!(settings.recent_filters[0].text, "panic");
 
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(restored.log_line_display_mode, LogLineDisplayMode::Wrap);
         assert_eq!(restored.recent_searches, ["error", "warning"]);
+        assert_eq!(
+            restored.recent_field_searches,
+            settings.recent_field_searches
+        );
+    }
+
+    #[test]
+    fn legacy_dark_mode_settings_migrate_to_explicit_theme_mode() {
+        let (light, migrated) = Settings::from_persisted_json(r#"{"dark_mode":false}"#).unwrap();
+        assert!(migrated);
+        assert_eq!(light.theme_mode, ThemeMode::Light);
+
+        let (dark, migrated) = Settings::from_persisted_json(r#"{"dark_mode":true}"#).unwrap();
+        assert!(migrated);
+        assert_eq!(dark.theme_mode, ThemeMode::Dark);
+
+        let (explicit, migrated) =
+            Settings::from_persisted_json(r#"{"dark_mode":false,"theme_mode":"system"}"#).unwrap();
+        assert!(!migrated);
+        assert_eq!(explicit.theme_mode, ThemeMode::System);
     }
 }

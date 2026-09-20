@@ -16,7 +16,7 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            # NSIS → native Windows installer: logotomy-<version>-setup.exe
+            # NSIS → native Windows installer: haystack-<version>-setup.exe
             formats: nsis
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -40,7 +40,7 @@ jobs:
         shell: bash
         run: |
           package_version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "logotomy") | .version')
+            | jq -r '.packages[] | select(.name == "haystack") | .version')
           packager_version=$(awk '
             /^\[package\.metadata\.packager\]$/ { in_packager=1; next }
             /^\[/ { in_packager=0 }
@@ -66,7 +66,7 @@ jobs:
           expected='["csv","err","json","log","md","out","txt","xml"]'
           actual=$(cargo metadata --no-deps --format-version 1 \
             | jq -c '[.packages[]
-              | select(.name == "logotomy")
+              | select(.name == "haystack")
               | .metadata.packager["file-associations"][]
               | .extensions[]] | sort')
           test "$actual" = "$expected" || {
@@ -107,7 +107,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "# logotomy benchmark"
+            echo "# haystack benchmark"
             echo "target: ${{ matrix.target }}"
             echo "tag: ${{ github.ref_name }}"
             echo "runner: ${{ matrix.os }}"
@@ -122,7 +122,7 @@ jobs:
       - name: Smoke-test built binary
         shell: bash
         run: |
-          BIN="./target/${{ matrix.target }}/release/logotomy"
+          BIN="./target/${{ matrix.target }}/release/haystack"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then BIN="${BIN}.exe"; fi
           "$BIN" --help
       # cargo-packager reads [package.metadata.packager] from Cargo.toml,
@@ -140,14 +140,14 @@ jobs:
           mkdir -p artifacts
           # Copy installers out of dist/ (excludes the .app bundle dir + the
           # packager's internal .cargo-packager staging) and rename them to a
-          # collision-free, explicit scheme: logotomy-<tag>-<target>.<ext>.
+          # collision-free, explicit scheme: haystack-<tag>-<target>.<ext>.
           for f in dist/*; do
             [ -f "$f" ] || continue
             case "$f" in
               *.exe|*.deb|*.dmg|*.AppImage) ;;
               *) continue ;;
             esac
-            cp "$f" "artifacts/logotomy-${{ github.ref_name }}-${{ matrix.target }}.${f##*.}"
+            cp "$f" "artifacts/haystack-${{ github.ref_name }}-${{ matrix.target }}.${f##*.}"
           done
           cp "benchmark-${{ matrix.target }}.txt" artifacts/
           echo "--- installers ---"
@@ -157,12 +157,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          test -f "target/${{ matrix.target }}/release/logotomy.exe" \
-            && echo "OK: Windows binary is logotomy.exe" || { echo "ERROR: expected .exe"; exit 1; }
+          test -f "target/${{ matrix.target }}/release/haystack.exe" \
+            && echo "OK: Windows binary is haystack.exe" || { echo "ERROR: expected .exe"; exit 1; }
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: logotomy-${{ matrix.target }}
+          name: haystack-${{ matrix.target }}
           path: artifacts/
           if-no-files-found: error
 
@@ -176,7 +176,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: logotomy-*
+          pattern: haystack-*
           merge-multiple: true
       - name: Combine benchmark results
         shell: bash
@@ -197,7 +197,7 @@ jobs:
       - name: Generate checksums
         shell: bash
         run: |
-          sha256sum logotomy* benchmark-results.txt > checksums.sha256
+          sha256sum haystack* benchmark-results.txt > checksums.sha256
           cat checksums.sha256
       - name: Generate release notes
         shell: bash
@@ -209,15 +209,15 @@ jobs:
 
           ### macOS
 
-          The current macOS builds are not code-signed or notarized. After opening the DMG, drag `logotomy.app` to Applications. On the first launch, right-click the app, choose **Open**, and confirm **Open**.
+          The current macOS builds are not code-signed or notarized. After opening the DMG, drag `haystack.app` to Applications. On the first launch, right-click the app, choose **Open**, and confirm **Open**.
 
           If macOS still blocks the app, use this command after verifying the checksum and download source:
 
           ```bash
-          xattr -d com.apple.quarantine /Applications/logotomy.app
+          xattr -d com.apple.quarantine /Applications/haystack.app
           ```
 
-          Do not use Recovery-mode `csrutil` commands; Logotomy is a normal user-space application and does not require kernel/system extensions.
+          Do not use Recovery-mode `csrutil` commands; Haystack is a normal user-space application and does not require kernel/system extensions.
 
           ### Windows
 
@@ -228,14 +228,14 @@ jobs:
           For the `.deb` package:
 
           ```bash
-          sudo apt install ./logotomy-*.deb
+          sudo apt install ./haystack-*.deb
           ```
 
           For the AppImage:
 
           ```bash
-          chmod +x logotomy-*.AppImage
-          ./logotomy-*.AppImage
+          chmod +x haystack-*.AppImage
+          ./haystack-*.AppImage
           ```
 
           ## Benchmark results
@@ -254,9 +254,9 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            logotomy-*.exe
-            logotomy-*.deb
-            logotomy-*.dmg
-            logotomy-*.AppImage
+            haystack-*.exe
+            haystack-*.deb
+            haystack-*.dmg
+            haystack-*.AppImage
             benchmark-results.txt
             checksums.sha256

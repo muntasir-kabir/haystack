@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use logotomy::{AnalysisLimits, EmbeddedDataEngine, LogDocument, RootKind};
+use haystack::{AnalysisLimits, EmbeddedDataEngine, LogDocument, RootKind};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -21,7 +21,7 @@ fn embedded_json_detector_satisfies_fixture_contract() {
 
     for case in cases {
         let path = std::env::temp_dir().join(format!(
-            "logotomy_embedded_json_{}_{}.log",
+            "haystack_embedded_json_{}_{}.log",
             std::process::id(),
             case.id
         ));

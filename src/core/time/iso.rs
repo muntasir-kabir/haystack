@@ -29,6 +29,10 @@ impl TimeFormat for Iso {
         let m = RE_ISO.find(window(line))?;
         Some((parse_iso(m.as_str())?, m.range()))
     }
+
+    fn recognize(&self, line: &str) -> Option<Range<usize>> {
+        RE_ISO.find(window(line)).map(|matched| matched.range())
+    }
 }
 
 fn parse_iso(raw: &str) -> Option<i64> {
@@ -143,6 +147,7 @@ fn parse_iso_fast(raw: &str) -> Option<i64> {
         };
         offset_ms = sign * (zh * 3_600_000 + zm * 60_000);
     }
+    chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)?;
     let days = days_from_civil(year, month, day);
     let epoch_ms =
         days * 86_400_000 + hour * 3_600_000 + min * 60_000 + sec * 1_000 + ms - offset_ms;

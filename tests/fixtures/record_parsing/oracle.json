@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "payload_dates_and_clock_reversal",
+      "profile": "{time} {log}",
+      "source": "2026-09-11 10:00:00.100 ERROR request failed\n    payload={\"retry_at\":\"2035-01-01T00:00:00Z\"}\n    at Handler.run(Handler.java:42)\n2026-09-11 10:00:00.098 INFO recovery started\n    upstream last_seen=2020-01-01T00:00:00Z\n2026-09-11 10:00:01.000 INFO complete\n",
+      "lines": [
+        { "class": "header", "owner": 1, "time": "explicit", "timestamp": "2026-09-11 10:00:00.100", "span": [0, 23] },
+        { "class": "continuation", "owner": 1, "time": "inherited" },
+        { "class": "continuation", "owner": 1, "time": "inherited" },
+        { "class": "header", "owner": 4, "time": "explicit", "timestamp": "2026-09-11 10:00:00.098", "span": [0, 23] },
+        { "class": "continuation", "owner": 4, "time": "inherited" },
+        { "class": "header", "owner": 6, "time": "explicit", "timestamp": "2026-09-11 10:00:01.000", "span": [0, 23] }
+      ]
+    },
+    {
+      "id": "detailed_template",
+      "profile": "{time} - [{log_level}] - {thread_id} {file}:{line} {log}",
+      "source": "2026-09-11 10:00:00.100 - [ERROR] - worker-7 Handler.rs:42 request failed\n    payload.retry_at=2035-01-01T00:00:00Z\n    at Handler.run()\n2026-09-11 10:00:00.098 - [INFO] - worker-12 C:\\\\src\\\\Handler.rs:57 recovering\n",
+      "lines": [
+        { "class": "header", "owner": 1, "time": "explicit", "timestamp": "2026-09-11 10:00:00.100", "span": [0, 23] },
+        { "class": "continuation", "owner": 1, "time": "inherited" },
+        { "class": "continuation", "owner": 1, "time": "inherited" },
+        { "class": "header", "owner": 4, "time": "explicit", "timestamp": "2026-09-11 10:00:00.098", "span": [0, 23] }
+      ]
+    },
+    {
+      "id": "prefixed_time_and_preamble",
+      "profile": "[{thread_id}] {log_level} {time} {log}",
+      "source": "service startup banner\n[worker-7] INFO 2026-09-11 10:00:00.100 started\n    created_at=2035-01-01T00:00:00Z\n[worker-12] ERROR 2026-09-11 10:00:01.200 failed\n",
+      "lines": [
+        { "class": "unassigned", "time": "unknown" },
+        { "class": "header", "owner": 2, "time": "explicit", "timestamp": "2026-09-11 10:00:00.100", "span": [16, 39] },
+        { "class": "continuation", "owner": 2, "time": "inherited" },
+        { "class": "header", "owner": 4, "time": "explicit", "timestamp": "2026-09-11 10:00:01.200", "span": [18, 41] }
+      ]
+    },
+    {
+      "id": "missing_and_invalid_header_time",
+      "profile": "rfc5424",
+      "source": "<134>1 2026-09-11T10:00:00Z host app 1 id - first\n  continuation\n<134>1 - host app 1 id - missing time but header\n  payload date=2035-01-01T00:00:00Z\n<134>1 2026-02-30T10:00:00Z host app 1 id - invalid time\n  final continuation\n",
+      "lines": [
+        { "class": "header", "owner": 1, "time": "explicit", "timestamp": "2026-09-11T10:00:00Z", "span": [7, 27] },
+        { "class": "continuation", "owner": 1, "time": "inherited" },
+        { "class": "header", "owner": 3, "time": "missing" },
+        { "class": "continuation", "owner": 3, "time": "unknown" },
+        { "class": "header", "owner": 5, "time": "invalid", "timestamp": "2026-02-30T10:00:00Z", "span": [7, 27] },
+        { "class": "continuation", "owner": 5, "time": "unknown" }
+      ]
+    },
+    {
+      "id": "json_event_field_not_payload",
+      "profile": "json-lines:time",
+      "source": "{\"msg\":\"payload says 2035-01-01T00:00:00Z\",\"time\":\"2026-09-11T10:00:00Z\"}\n{\"msg\":\"missing event time\",\"nested\":{\"time\":\"2040-01-01T00:00:00Z\"}}\n{\"timestamp\":\"2026-09-11T10:00:02Z\",\"msg\":\"different key must not replace selected source\"}\n",
+      "lines": [
+        { "class": "header", "owner": 1, "time": "explicit", "timestamp": "2026-09-11T10:00:00Z", "span": [51, 71] },
+        { "class": "header", "owner": 2, "time": "missing" },
+        { "class": "header", "owner": 3, "time": "missing" }
+      ]
+    }
+  ]
+}

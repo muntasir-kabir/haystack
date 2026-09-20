@@ -1,0 +1,78 @@
+{
+  "contract_version": 1,
+  "profile_schema_version": 2,
+  "notes": "Human-authored expectations for the inline-format parser and preview. A null match means the line is a continuation or a mismatch, not an empty capture.",
+  "cases": [
+    {
+      "id": "myapp_compact",
+      "template": "{time} MyApp[{a}:{b:number}] <{loglevel}> {log}",
+      "line": "2026-07-15 22:26:39.907481+0300 MyApp[12345:9] <FAULT> CameraService.swift:295 EXC_CRASH (SIGKILL) — jetsam killed process after memory limit exceeded (11743MB)",
+      "fields": {
+        "time": "2026-07-15 22:26:39.907481+0300",
+        "a": "12345",
+        "b": "9",
+        "loglevel": "FAULT",
+        "log": "CameraService.swift:295 EXC_CRASH (SIGKILL) — jetsam killed process after memory limit exceeded (11743MB)"
+      }
+    },
+    {
+      "id": "windows_path",
+      "template": "{time} source=\"{source:path}\" {log}",
+      "line": "2026-07-15 22:26:39.907481+0300 source=\"C:\\Program Files\\MyApp\\log.txt\" open failed",
+      "fields": {
+        "time": "2026-07-15 22:26:39.907481+0300",
+        "source": "C:\\Program Files\\MyApp\\log.txt",
+        "log": "open failed"
+      }
+    },
+    {
+      "id": "unix_path",
+      "template": "{time} source={source:path} {log}",
+      "line": "2026-07-15 22:26:39.907481+0300 source=/var/log/myapp/app.log open failed",
+      "fields": {
+        "time": "2026-07-15 22:26:39.907481+0300",
+        "source": "/var/log/myapp/app.log",
+        "log": "open failed"
+      }
+    },
+    {
+      "id": "unquoted_path_with_clear_separator",
+      "template": "{time} source={source:path} status={status:number} {log}",
+      "line": "2026-07-15 22:26:39.907481+0300 source=/var/log/My App/app.log status=500 failed",
+      "fields": {
+        "time": "2026-07-15 22:26:39.907481+0300",
+        "source": "/var/log/My App/app.log",
+        "status": "500",
+        "log": "failed"
+      }
+    },
+    {
+      "id": "url_with_port_and_query",
+      "template": "{time} url={url:path} status={status:number} {log}",
+      "line": "2026-07-15 22:26:39.907481+0300 url=https://example.org:8443/api?q=x#section status=503 retrying",
+      "fields": {
+        "time": "2026-07-15 22:26:39.907481+0300",
+        "url": "https://example.org:8443/api?q=x#section",
+        "status": "503",
+        "log": "retrying"
+      }
+    },
+    {
+      "id": "signed_exponent_and_text",
+      "template": "{time} amount={amount:number} note=\"{note:text}\" {log}",
+      "line": "2026-07-15 22:26:39.907481+0300 amount=-1.25e3 note=\"memory limit exceeded\" stopped",
+      "fields": {
+        "time": "2026-07-15 22:26:39.907481+0300",
+        "amount": "-1.25e3",
+        "note": "memory limit exceeded",
+        "log": "stopped"
+      }
+    },
+    {
+      "id": "invalid_number",
+      "template": "{time} worker={worker:number} {log}",
+      "line": "2026-07-15 22:26:39.907481+0300 worker=worker-9 stopped",
+      "fields": null
+    }
+  ]
+}

@@ -3,10 +3,10 @@
 use std::ops::Range;
 use std::sync::LazyLock;
 
-use chrono::{Datelike, Local, NaiveDateTime};
+use chrono::{Datelike, NaiveDateTime};
 use regex::Regex;
 
-use super::{window, TimeFormat};
+use super::{window, TimeFormat, YearlessReference};
 
 static RE_GLOG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[IWEF]\d{4}\s\d{2}:\d{2}:\d{2}(?:\.\d+)?").unwrap());
@@ -24,21 +24,25 @@ impl TimeFormat for Glog {
     }
 
     fn extract(&self, line: &str) -> Option<(i64, Range<usize>)> {
-        let m = RE_GLOG.find(window(line))?;
-        Some((parse_glog(m.as_str())?, m.range()))
+        extract_at(line, YearlessReference::now())
     }
 }
 
+pub(super) fn extract_at(line: &str, reference: YearlessReference) -> Option<(i64, Range<usize>)> {
+    let m = RE_GLOG.find(window(line))?;
+    Some((parse_glog_at(m.as_str(), reference)?, m.range()))
+}
+
 /// Glog `I0715 22:00:01.123456`: level letter + MMDD + clock, no year.
-fn parse_glog(raw: &str) -> Option<i64> {
-    let year = Local::now().year();
+fn parse_glog_at(raw: &str, reference: YearlessReference) -> Option<i64> {
+    let year = reference.year;
     // Rewrite `I0715 ...` → `2026-07-15 ...` for a single strptime call.
     let mm = raw.get(1..3)?;
     let dd = raw.get(3..5)?;
     let clock = raw.get(6..)?;
     let normalized = format!("{year}-{mm}-{dd} {clock}");
     let mut n = NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f").ok()?;
-    if n.and_utc().timestamp() > Local::now().timestamp() + 86_400 {
+    if reference.roll_back_future && n.and_utc().timestamp() > reference.epoch_seconds + 86_400 {
         n = n.with_year(year - 1)?;
     }
     Some(n.and_utc().timestamp_millis())
@@ -48,6 +52,7 @@ fn parse_glog(raw: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::core::time::format_ms;
+    use chrono::Local;
 
     #[test]
     fn matches_positive() {

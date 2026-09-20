@@ -371,55 +371,58 @@ pub fn icon_image(
     egui::Image::new(source).fit_to_exact_size(Vec2::splat(size))
 }
 
-/// Decoded RGBA pixels of the application logo (`logotomy_256.png`), decoded
-/// once on first use and reused across frames.
-static APP_LOGO: std::sync::OnceLock<ColorImage> = std::sync::OnceLock::new();
+/// Texture cache for the full-colour in-app brand mark.
+static APP_MARK_TEX_CACHE: Mutex<Option<((Color32, u32), TextureHandle)>> = Mutex::new(None);
 
-/// Texture handle cache for the app logo, so it's uploaded to the GPU once per
-/// render size instead of every frame.
-static APP_LOGO_TEX_CACHE: Mutex<Option<(u32, TextureHandle)>> = Mutex::new(None);
-
-/// Render the application logo (the embedded `logotomy_256.png`) as a cached
-/// egui image. The PNG is decoded at first use via the `image` crate and
-/// loaded directly into a texture, so it doesn't depend on egui's built-in
-/// (optional) image loaders — it always renders even when those loaders are
-/// not compiled in.
-pub fn app_logo(ctx: &egui::Context, size: f32) -> egui::Image<'static> {
+/// Render the full-colour Haystack mark used inside the application chrome.
+/// This has its own source rather than joining `Icon`: it is brand identity,
+/// not a member of the 24px action-icon system.
+pub fn app_mark(ctx: &egui::Context, size: f32, color: Color32) -> egui::Image<'static> {
     let size_px = size.max(1.0).ceil() as u32;
-
-    // Reuse a previously created texture for the same size.
-    if let Ok(cache) = APP_LOGO_TEX_CACHE.lock() {
-        if let Some((s, tex)) = cache.as_ref() {
-            if *s == size_px {
-                let cached = egui::load::SizedTexture::new(tex.id(), tex.size_vec2());
+    if let Ok(cache) = APP_MARK_TEX_CACHE.lock() {
+        if let Some(((cached_color, cached_size), texture)) = cache.as_ref() {
+            if *cached_color == color && *cached_size == size_px {
+                let cached = egui::load::SizedTexture::new(texture.id(), texture.size_vec2());
                 return egui::Image::new(cached).fit_to_exact_size(Vec2::splat(size));
             }
         }
     }
 
-    let logo = APP_LOGO.get_or_init(|| {
-        let bytes: &[u8] = include_bytes!("icons/logotomy_256.png");
-        match image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
-            Ok(img) => {
-                let rgba = img.to_rgba8();
+    let color_hex = format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b());
+    let options = resvg::usvg::Options {
+        style_sheet: Some(format!("svg {{ color: {color_hex}; }}")),
+        ..Default::default()
+    };
+    let texture = resvg::usvg::Tree::from_data(include_bytes!("icons/brand-mark.svg"), &options)
+        .ok()
+        .and_then(|tree| {
+            let scale = size_px as f32 / tree.size().width().max(1.0);
+            let height_px = (tree.size().height() * scale).max(1.0).ceil() as u32;
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(size_px, height_px)?;
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::from_scale(scale, scale),
+                &mut pixmap.as_mut(),
+            );
+            Some(ctx.load_texture(
+                format!("app_mark_{color_hex}_{size_px}"),
                 ColorImage::from_rgba_unmultiplied(
-                    [rgba.width() as usize, rgba.height() as usize],
-                    rgba.as_raw(),
-                )
-            }
-            Err(_) => ColorImage::filled([1, 1], Color32::WHITE), // degenerate fallback
-        }
-    });
-
-    let texture = ctx.load_texture(
-        format!("app_logo_{size_px}"),
-        logo.clone(),
-        egui::TextureOptions::LINEAR,
-    );
-    if let Ok(mut cache) = APP_LOGO_TEX_CACHE.lock() {
-        *cache = Some((size_px, texture.clone()));
+                    [size_px as usize, height_px as usize],
+                    pixmap.data(),
+                ),
+                egui::TextureOptions::LINEAR,
+            ))
+        })
+        .unwrap_or_else(|| {
+            ctx.load_texture(
+                "app_mark_fallback",
+                ColorImage::filled([1, 1], color),
+                egui::TextureOptions::LINEAR,
+            )
+        });
+    if let Ok(mut cache) = APP_MARK_TEX_CACHE.lock() {
+        *cache = Some(((color, size_px), texture.clone()));
     }
-
     let source = egui::load::SizedTexture::new(texture.id(), texture.size_vec2());
     egui::Image::new(source).fit_to_exact_size(Vec2::splat(size))
 }

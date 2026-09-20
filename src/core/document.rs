@@ -16,16 +16,27 @@ use std::ops::{Index, IndexMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::Sender;
 use memchr::memchr_iter;
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 
-use crate::core::drain::Drain;
-use crate::core::format::{learn_header_slots, FormatContext, FormatDetector, LogFormat};
+use crate::core::drain::{Drain, DrainUndo};
+use crate::core::format::{
+    classify_value_with_time_key, detect_time_key, learn_header_slots, normalize_json_value,
+    FormatContext, FormatDetector, LogFormat,
+};
 use crate::core::masking::{LogMasker, MaskCache};
-use crate::core::time::{CustomTimeFormat, TimeFormatKind};
+use crate::core::record::{
+    discovery_line_indices, resolve_profile_time, CompiledProfile, DetectionConfidence,
+    DetectionDiagnostics, HeaderTime, LineTimeState, RecordClassification, RecordProfile,
+    RecordStateMachine, TemplateMatch, TimeProvenance, TimestampSelection, DISCOVERY_MAX_BYTES,
+    DISCOVERY_MAX_LINE_BYTES,
+};
+use crate::core::time::{
+    CustomTimeFormat, TimeDetector, TimeFormatKind, YearlessReference, TIME_FORMATS,
+};
 
 /// Tunables for the log-parsing pipeline (template mining + header learning).
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +57,47 @@ impl Default for ParsingConfig {
             drain_depth: 4,
         }
     }
+}
+
+/// Optional, reproducible stage timings for the production loading pipeline.
+///
+/// Normal loads do not collect these values, avoiding per-line clock reads in
+/// the application. Benchmark/profile examples opt in through
+/// [`LogDocument::open_profiled`]. Durations are stage totals rather than a
+/// claim that nested work can be added to obtain wall-clock time.
+#[derive(Clone, Debug, Default)]
+pub struct LoadProfile {
+    pub bytes: u64,
+    pub physical_lines: usize,
+    pub explicit_timestamps: usize,
+    pub index_build: Duration,
+    pub profile_discovery: Duration,
+    pub header_learning: Duration,
+    pub line_decode: Duration,
+    pub timestamp_extract: Duration,
+    pub normalization_and_masking: Duration,
+    pub drain_mining: Duration,
+    pub analysis_wall: Duration,
+    pub total_wall: Duration,
+}
+
+/// Exact source interval changed by one append transaction. `added_lines` may
+/// be zero when bytes only extend the previously unterminated physical line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppendUpdate {
+    pub first_changed_line: usize,
+    pub added_lines: usize,
+}
+
+#[derive(Clone)]
+struct TailTransaction {
+    line: usize,
+    drain_undo: DrainUndo,
+    prior_time_range: Option<(i64, i64)>,
+    prior_invalid_count: usize,
+    prior_invalid_sample_len: usize,
+    prior_overflow_len: usize,
+    prior_max_line_width: usize,
 }
 
 /// Report progress at most every 4 MiB so the channel stays quiet.
@@ -184,6 +236,99 @@ impl<T: Clone> IndexMut<usize> for ChunkedIndex<T> {
     }
 }
 
+// One packed, line-relative (start, length) pair per field per record. The
+// uncommon >4 GiB span uses a side table; neither path retains field strings.
+const MISSING_FIELD_SPAN: u64 = u64::MAX;
+const OVERFLOW_FIELD_SPAN: u64 = u64::MAX - 1;
+
+#[derive(Clone, Debug)]
+struct OverflowFieldSpan {
+    ordinal: u32,
+    field: u8,
+    start: u64,
+    len: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FieldCaptureStore {
+    columns: Vec<ChunkedIndex<u64>>,
+    overflow: Vec<OverflowFieldSpan>,
+}
+
+impl FieldCaptureStore {
+    fn new(field_count: usize) -> Self {
+        Self {
+            columns: (0..field_count).map(|_| ChunkedIndex::default()).collect(),
+            overflow: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.columns.first().map_or(0, ChunkedIndex::len)
+    }
+
+    fn push(&mut self, matched: &TemplateMatch) {
+        let ordinal = self.len() as u32;
+        for (field, column) in self.columns.iter_mut().enumerate() {
+            let packed = matched
+                .captures
+                .span_at(field)
+                .map_or(MISSING_FIELD_SPAN, |span| {
+                    let len = span.len();
+                    if span.start < u32::MAX as usize && len <= u32::MAX as usize {
+                        ((span.start as u64) << 32) | len as u64
+                    } else {
+                        self.overflow.push(OverflowFieldSpan {
+                            ordinal,
+                            field: field as u8,
+                            start: span.start as u64,
+                            len: len as u64,
+                        });
+                        OVERFLOW_FIELD_SPAN
+                    }
+                });
+            column.push(packed);
+        }
+    }
+
+    fn pop(&mut self) {
+        let Some(last) = self.len().checked_sub(1) else {
+            return;
+        };
+        for column in &mut self.columns {
+            column.pop();
+        }
+        while self
+            .overflow
+            .last()
+            .is_some_and(|span| span.ordinal as usize == last)
+        {
+            self.overflow.pop();
+        }
+    }
+
+    fn span(&self, ordinal: usize, field: usize) -> Option<std::ops::Range<u64>> {
+        let packed = *self.columns.get(field)?.get(ordinal)?;
+        match packed {
+            MISSING_FIELD_SPAN => None,
+            OVERFLOW_FIELD_SPAN => {
+                let index = self
+                    .overflow
+                    .binary_search_by_key(&(ordinal as u32, field as u8), |span| {
+                        (span.ordinal, span.field)
+                    })
+                    .ok()?;
+                let span = &self.overflow[index];
+                Some(span.start..span.start.checked_add(span.len)?)
+            }
+            _ => {
+                let start = packed >> 32;
+                Some(start..start + (packed & u32::MAX as u64))
+            }
+        }
+    }
+}
+
 fn pack_timestamp_span(span: std::ops::Range<usize>) -> u32 {
     let len = span.end.saturating_sub(span.start);
     if len == 0 || span.start > u16::MAX as usize || len > u16::MAX as usize {
@@ -199,6 +344,28 @@ fn unpack_timestamp_span(packed: u32) -> Option<std::ops::Range<usize>> {
     let start = (packed >> 16) as usize;
     let len = (packed & u16::MAX as u32) as usize;
     Some(start..start + len)
+}
+
+fn set_packed_time_state(words: &mut ChunkedIndex<u64>, line: usize, state: LineTimeState) {
+    let word_index = line / 32;
+    let shift = (line % 32) * 2;
+    let mask = 0b11u64 << shift;
+    words[word_index] = (words[word_index] & !mask) | ((state as u64) << shift);
+}
+
+fn packed_time_state(words: &ChunkedIndex<u64>, line: usize) -> LineTimeState {
+    let shift = (line % 32) * 2;
+    let bits = words
+        .get(line / 32)
+        .map_or(0, |word| ((word >> shift) & 0b11) as u8);
+    LineTimeState::from_bits(bits)
+}
+
+#[derive(Clone, Debug)]
+struct OverflowTimestampSpan {
+    line: u32,
+    start: u64,
+    len: u32,
 }
 
 /// Flattened, export-friendly view of one mined template.
@@ -270,6 +437,15 @@ pub struct LogDocument {
     /// annotation lookup allocation-free without rerunning parsers while the
     /// UI paints.
     timestamp_spans: ChunkedIndex<u32>,
+    /// Rare timestamp spans that cannot fit the packed 16-bit start/length.
+    timestamp_span_overflow: Vec<OverflowTimestampSpan>,
+    /// Two-bit known/missing/invalid/unknown time status per physical line.
+    time_states: ChunkedIndex<u64>,
+    /// Cumulative record starts before every 512-line block.
+    record_rank: ChunkedIndex<u32>,
+    /// Total invalid header timestamps and a bounded representative sample.
+    pub invalid_time_count: usize,
+    pub invalid_time_lines: Vec<u32>,
     /// Per-line Drain template cluster ID.
     /// Indexed by *original* (untrimmed) line index. Use `template_at` for
     /// trim-relative access.
@@ -290,6 +466,16 @@ pub struct LogDocument {
     log_format: &'static dyn LogFormat,
     /// Detected timestamp family for this format (`None` when timeless).
     time_format: Option<TimeFormatKind>,
+    /// Explicit text profile, when one was selected for this document.
+    record_profile: Option<Arc<CompiledProfile>>,
+    /// Packed captures for explicit-profile record starts, in record order.
+    field_captures: Option<FieldCaptureStore>,
+    /// Reversible contribution of the final unterminated physical line.
+    tail_transaction: Option<TailTransaction>,
+    /// One top-level JSON event-time field, resolved once per document.
+    json_time_key: Option<String>,
+    /// Bounded evidence and confidence for the locked parser selection.
+    pub detection: DetectionDiagnostics,
     /// Mined templates, ordered by cluster ID.
     pub templates: Vec<TemplateInfo>,
     /// (min, max) extracted timestamp in the file, if any.
@@ -319,6 +505,11 @@ impl Clone for LogDocument {
             ts_ff: self.ts_ff.clone(),
             record_starts: self.record_starts.clone(),
             timestamp_spans: self.timestamp_spans.clone(),
+            timestamp_span_overflow: self.timestamp_span_overflow.clone(),
+            time_states: self.time_states.clone(),
+            record_rank: self.record_rank.clone(),
+            invalid_time_count: self.invalid_time_count,
+            invalid_time_lines: self.invalid_time_lines.clone(),
             template_ids: self.template_ids.clone(),
             drain: Arc::new(Mutex::new(self.drain.lock().unwrap().clone())),
             masker: self.masker.clone(),
@@ -326,6 +517,11 @@ impl Clone for LogDocument {
             mask_cache: self.mask_cache.clone(),
             log_format: self.log_format,
             time_format: self.time_format.clone(),
+            record_profile: self.record_profile.clone(),
+            field_captures: self.field_captures.clone(),
+            tail_transaction: self.tail_transaction.clone(),
+            json_time_key: self.json_time_key.clone(),
+            detection: self.detection.clone(),
             templates: self.templates.clone(),
             time_range: self.time_range,
             file_size: self.file_size,
@@ -346,6 +542,73 @@ impl LogDocument {
     /// Number of lines in the original, untrimmed file.
     pub fn total_lines_untrimmed(&self) -> usize {
         self.line_offsets.len().saturating_sub(1)
+    }
+
+    /// Count record-start markers in the current trim window.
+    pub fn record_count(&self) -> usize {
+        self.count_records(self.trim_start, self.trim_end)
+    }
+
+    /// Fraction of physical log lines recognized as headers by an explicitly
+    /// applied record profile. This deliberately uses the whole source, not
+    /// the current trim, so the Format warning cannot disappear while browsing.
+    pub fn record_profile_match_rate(&self) -> Option<(usize, usize)> {
+        self.record_profile.as_ref().map(|_| {
+            (
+                self.count_records(0, self.total_lines_untrimmed()),
+                self.total_lines_untrimmed(),
+            )
+        })
+    }
+
+    /// Count record starts in an original-source half-open line interval.
+    pub fn count_records(&self, start: usize, end: usize) -> usize {
+        let end = end.min(self.total_lines_untrimmed());
+        let start = start.min(end);
+        self.record_rank_at(end)
+            .saturating_sub(self.record_rank_at(start))
+    }
+
+    /// Whether a trim-relative physical line begins a classified record.
+    pub fn is_record_start_at(&self, rel: usize) -> bool {
+        let Some(real) = self.trim_start.checked_add(rel) else {
+            return false;
+        };
+        real < self.trim_end
+            && self
+                .record_starts
+                .get(real / 64)
+                .is_some_and(|word| word & (1u64 << (real % 64)) != 0)
+    }
+
+    fn record_rank_at(&self, line: usize) -> usize {
+        let line = line.min(self.total_lines_untrimmed());
+        let block = line / 512;
+        let mut count = self.record_rank.get(block).copied().unwrap_or(0) as usize;
+        let block_start = block * 512;
+        for current in block_start..line {
+            if self
+                .record_starts
+                .get(current / 64)
+                .is_some_and(|word| word & (1u64 << (current % 64)) != 0)
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Logical retained bytes in the compact per-line indexes.
+    /// Excludes vector capacity, chunk metadata, mmap residency, Drain/cache,
+    /// filters, and GUI allocations; it is deliberately not an RSS estimate.
+    pub fn index_payload_bytes(&self) -> usize {
+        self.line_offsets.len() * std::mem::size_of::<u64>()
+            + self.ts_ff.len() * std::mem::size_of::<i64>()
+            + self.record_starts.len() * std::mem::size_of::<u64>()
+            + self.timestamp_spans.len() * std::mem::size_of::<u32>()
+            + self.template_ids.len() * std::mem::size_of::<u32>()
+            + self.time_states.len() * std::mem::size_of::<u64>()
+            + self.record_rank.len() * std::mem::size_of::<u32>()
     }
 
     /// Zero-copy line access straight from the mmap (lossy if invalid UTF-8).
@@ -381,13 +644,155 @@ impl LogDocument {
         if real >= self.trim_end {
             return None;
         }
-        let span = unpack_timestamp_span(*self.timestamp_spans.get(real)?)?;
+        if self.time_provenance_untrimmed(real) != TimeProvenance::Explicit {
+            return None;
+        }
+        let span = self.timestamp_span_untrimmed(real)?;
         Some((*self.ts_ff.get(real)?, span))
     }
 
-    /// Original-file bounds of the timestamp-delimited record containing
+    pub fn time_provenance_at(&self, rel: usize) -> Option<TimeProvenance> {
+        let real = self.trim_start.checked_add(rel)?;
+        (real < self.trim_end).then(|| self.time_provenance_untrimmed(real))
+    }
+
+    fn time_provenance_untrimmed(&self, real: usize) -> TimeProvenance {
+        let record_start = self
+            .record_starts
+            .get(real / 64)
+            .is_some_and(|word| word & (1u64 << (real % 64)) != 0);
+        match (packed_time_state(&self.time_states, real), record_start) {
+            (LineTimeState::Known, true) => TimeProvenance::Explicit,
+            (LineTimeState::Known, false) => TimeProvenance::Inherited,
+            (LineTimeState::MissingHeader, true) => TimeProvenance::Missing,
+            (LineTimeState::InvalidHeader, true) => TimeProvenance::Invalid,
+            _ => TimeProvenance::Unknown,
+        }
+    }
+
+    fn timestamp_span_untrimmed(&self, real: usize) -> Option<std::ops::Range<usize>> {
+        if let Some(span) = self
+            .timestamp_spans
+            .get(real)
+            .and_then(|packed| unpack_timestamp_span(*packed))
+        {
+            return Some(span);
+        }
+        let line = u32::try_from(real).ok()?;
+        let overflow = self
+            .timestamp_span_overflow
+            .binary_search_by_key(&line, |span| span.line)
+            .ok()
+            .and_then(|index| self.timestamp_span_overflow.get(index))?;
+        let start = usize::try_from(overflow.start).ok()?;
+        Some(start..start.saturating_add(overflow.len as usize))
+    }
+
+    pub fn record_profile(&self) -> Option<&RecordProfile> {
+        self.record_profile
+            .as_ref()
+            .map(|compiled| compiled.profile.as_ref())
+    }
+
+    /// Ordered names and types of fields retained from the applied profile.
+    pub fn record_field_schema(&self) -> Vec<(&str, &str)> {
+        self.record_profile
+            .as_ref()
+            .map_or_else(Vec::new, |profile| {
+                (0..profile.field_count())
+                    .filter_map(|index| {
+                        Some((profile.field_name(index)?, profile.field_type_label(index)?))
+                    })
+                    .collect()
+            })
+    }
+
+    /// Type of a field, accepting the inline schema's documented aliases.
+    pub fn record_field_type(&self, name: &str) -> Option<&'static str> {
+        let profile = self.record_profile.as_ref()?;
+        profile.field_type_label(profile.field_index(name)?)
+    }
+
+    /// Exact mapped-file byte span for a field on the containing record.
+    /// Preamble has no owner; an empty `{log}` has an empty (not missing) span.
+    pub fn record_field_span(
+        &self,
+        original_line: usize,
+        name: &str,
+    ) -> Option<std::ops::Range<u64>> {
+        let profile = self.record_profile.as_ref()?;
+        let field = profile.field_index(name)?;
+        let start_line = self.record_start_at_or_before(original_line)?;
+        if original_line >= self.total_lines_untrimmed() {
+            return None;
+        }
+        let ordinal = self.record_rank_at(start_line);
+        let relative = self.field_captures.as_ref()?.span(ordinal, field)?;
+        let base = self.line_offsets[start_line];
+        Some(base.checked_add(relative.start)?..base.checked_add(relative.end)?)
+    }
+
+    /// Valid explicit event time of the containing record, independent of trim.
+    pub fn explicit_time_untrimmed(&self, original_line: usize) -> Option<i64> {
+        let start = self.record_start_at_or_before(original_line)?;
+        if original_line >= self.total_lines_untrimmed()
+            || self.time_provenance_untrimmed(start) != TimeProvenance::Explicit
+        {
+            return None;
+        }
+        self.ts_ff.get(start).copied()
+    }
+
+    /// Source segments for a field. `{log}` includes subsequent continuation
+    /// lines; other fields have one segment. Returned ranges borrow no text.
+    pub fn record_field_segments(
+        &self,
+        original_line: usize,
+        name: &str,
+    ) -> Option<Vec<std::ops::Range<u64>>> {
+        let profile = self.record_profile.as_ref()?;
+        let field = profile.field_index(name)?;
+        let mut segments = vec![self.record_field_span(original_line, name)?];
+        if profile.field_type_label(field) == Some("message") {
+            let record = self.record_range_containing(original_line)?;
+            for line in record.start + 1..record.end {
+                let start = self.line_offsets[line];
+                let end = start + self.line_bytes_untrimmed(line).len() as u64;
+                segments.push(start..end);
+            }
+        }
+        Some(segments)
+    }
+
+    /// The part of a captured field physically present on one source line.
+    /// Non-message fields live only on their header; `{log}` also spans each
+    /// continuation line without building the complete segment list.
+    pub fn record_field_span_on_line(
+        &self,
+        original_line: usize,
+        name: &str,
+    ) -> Option<std::ops::Range<u64>> {
+        let record = self.record_range_containing(original_line)?;
+        if original_line == record.start {
+            return self.record_field_span(original_line, name);
+        }
+        if self.record_field_type(name) != Some("message") {
+            return None;
+        }
+        let start = self.line_offsets[original_line];
+        Some(start..start + self.line_bytes_untrimmed(original_line).len() as u64)
+    }
+
+    /// Read a retained single segment without copying; invalid UTF-8 remains
+    /// available through the returned bytes.
+    pub fn source_bytes(&self, span: std::ops::Range<u64>) -> Option<&[u8]> {
+        self.data
+            .get(usize::try_from(span.start).ok()?..usize::try_from(span.end).ok()?)
+    }
+
+    /// Original-file bounds of the header-delimited record containing
     /// `original_line`. The end is exclusive. Returns `None` before the first
-    /// explicit timestamp or for timeless files.
+    /// recognized record header.
     pub fn record_range_containing(&self, original_line: usize) -> Option<std::ops::Range<usize>> {
         if original_line >= self.total_lines_untrimmed() {
             return None;
@@ -399,37 +804,58 @@ impl LogDocument {
         Some(start..end)
     }
 
+    pub fn record_start_line(&self, ordinal: usize) -> Option<usize> {
+        self.select_record_start(ordinal)
+    }
+
     fn record_start_at_or_before(&self, line: usize) -> Option<usize> {
-        let mut word_idx = line / 64;
-        let bit = line % 64;
-        let mut word = *self.record_starts.get(word_idx)?;
-        word &= if bit == 63 {
-            u64::MAX
-        } else {
-            (1u64 << (bit + 1)) - 1
-        };
-        loop {
-            if word != 0 {
-                return Some(word_idx * 64 + (63 - word.leading_zeros() as usize));
-            }
-            word_idx = word_idx.checked_sub(1)?;
-            word = self.record_starts[word_idx];
-        }
+        let rank = self.record_rank_at(line.saturating_add(1));
+        rank.checked_sub(1)
+            .and_then(|ordinal| self.select_record_start(ordinal))
     }
 
     fn record_start_after(&self, line: usize) -> Option<usize> {
         let next = line.checked_add(1)?;
-        let mut word_idx = next / 64;
-        let bit = next % 64;
-        let mut word = *self.record_starts.get(word_idx)? & (u64::MAX << bit);
-        loop {
-            if word != 0 {
-                let found = word_idx * 64 + word.trailing_zeros() as usize;
-                return (found < self.total_lines_untrimmed()).then_some(found);
-            }
-            word_idx += 1;
-            word = *self.record_starts.get(word_idx)?;
+        let ordinal = self.record_rank_at(next);
+        self.select_record_start(ordinal)
+    }
+
+    /// Return the zero-based `ordinal` record start. The rank directory finds
+    /// its 512-line block logarithmically, then at most eight bitset words are
+    /// inspected. This keeps boundary lookup bounded even for giant records.
+    fn select_record_start(&self, ordinal: usize) -> Option<usize> {
+        let blocks = self.record_rank.len().checked_sub(1)?;
+        if ordinal >= self.record_rank.get(blocks).copied()? as usize {
+            return None;
         }
+        let mut low = 0usize;
+        let mut high = blocks;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.record_rank[middle + 1] as usize <= ordinal {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let block = low;
+        let mut remaining = ordinal - self.record_rank[block] as usize;
+        let first_word = block * 8;
+        for word_index in first_word..(first_word + 8).min(self.record_starts.len()) {
+            let mut word = self.record_starts[word_index];
+            let starts = word.count_ones() as usize;
+            if remaining >= starts {
+                remaining -= starts;
+                continue;
+            }
+            while remaining > 0 {
+                word &= word - 1;
+                remaining -= 1;
+            }
+            let line = word_index * 64 + word.trailing_zeros() as usize;
+            return (line < self.total_lines_untrimmed()).then_some(line);
+        }
+        None
     }
 
     /// Drain template cluster ID for a trim-relative line index.
@@ -558,12 +984,66 @@ impl LogDocument {
         }
     }
 
+    fn rebuild_record_rank_from(&mut self, first_changed_line: usize) {
+        let total = self.total_lines_untrimmed();
+        let blocks = total.div_ceil(512);
+        let start_block = (first_changed_line / 512).min(blocks);
+        let mut count = self.record_rank.get(start_block).copied().unwrap_or(0);
+        self.record_rank.resize(start_block + 1, 0);
+        for block in start_block..blocks {
+            let start_word = block * 8;
+            for word in start_word..(start_word + 8).min(self.record_starts.len()) {
+                count = count.saturating_add(self.record_starts[word].count_ones());
+            }
+            self.record_rank.push(count);
+        }
+    }
+
+    fn undo_provisional_tail(&mut self, old_last_line: usize) -> Result<(), String> {
+        let transaction = self
+            .tail_transaction
+            .take()
+            .ok_or("missing provisional-tail transaction")?;
+        if transaction.line != old_last_line {
+            return Err("provisional-tail transaction is out of date".into());
+        }
+        self.drain.lock().unwrap().undo_line(transaction.drain_undo);
+        self.ts_ff.pop();
+        self.timestamp_spans.pop();
+        self.template_ids.pop();
+        set_packed_time_state(&mut self.time_states, old_last_line, LineTimeState::Unknown);
+        self.time_states.resize(old_last_line.div_ceil(32), 0);
+        let tail_mask = 1u64 << (old_last_line % 64);
+        let was_header = self.record_starts[old_last_line / 64] & tail_mask != 0;
+        self.record_starts[old_last_line / 64] &= !tail_mask;
+        if was_header {
+            if let Some(store) = self.field_captures.as_mut() {
+                store.pop();
+            }
+        }
+        self.record_starts.resize(old_last_line.div_ceil(64), 0);
+        self.timestamp_span_overflow
+            .truncate(transaction.prior_overflow_len);
+        self.invalid_time_count = transaction.prior_invalid_count;
+        self.invalid_time_lines
+            .truncate(transaction.prior_invalid_sample_len);
+        self.max_line_width = transaction.prior_max_line_width;
+        self.time_range = transaction.prior_time_range;
+        Ok(())
+    }
+
     /// Checks for appended data and incrementally loads it.
     /// Returns `Ok(true)` if new data was loaded, `Ok(false)` if no change.
     pub fn append_new_data(&mut self) -> Result<bool, String> {
+        Ok(self.append_new_data_detailed()?.is_some())
+    }
+
+    /// Append with an exact changed-row boundary for incremental consumers.
+    /// A partial-tail extension reports its old row even if no line was added.
+    pub fn append_new_data_detailed(&mut self) -> Result<Option<AppendUpdate>, String> {
         let change = self.file_change()?;
         match change {
-            FileChange::Unchanged => return Ok(false),
+            FileChange::Unchanged => return Ok(None),
             FileChange::Shrunk => {
                 return Err("file has shrunk on disk; a full reload is required".to_string());
             }
@@ -592,17 +1072,33 @@ impl LogDocument {
 
         let old_file_size = self.file_size as usize;
         let old_line_count = self.total_lines_untrimmed();
+        let was_trimmed = self.trim_start > 0 || self.trim_end < old_line_count;
+        let old_tail_partial =
+            old_file_size == 0 || (old_file_size > 0 && self.data[old_file_size - 1] != b'\n');
+        let first_changed_line = if old_tail_partial {
+            old_line_count.saturating_sub(1)
+        } else {
+            old_line_count
+        };
+
+        // Map the observed size before mutating any old indexes. A failed map
+        // leaves the current document usable; bytes appended concurrently
+        // after this snapshot belong to the next append transaction.
+        let new_mmap = unsafe {
+            MmapOptions::new()
+                .len(new_size as usize)
+                .map(&*self.file_handle)
+        }
+        .map_err(|e| format!("mmap failed on append: {e}"))?;
 
         // If the old file did NOT end with a newline, the last "line" is partial.
         // We must pop the old file size marker from the offsets list so the new
         // scan can correctly extend this partial line.
-        if old_file_size > 0 && self.data[old_file_size - 1] != b'\n' {
+        if old_tail_partial {
+            self.undo_provisional_tail(first_changed_line)?;
             self.line_offsets.pop();
         }
 
-        // Re-map the file to the new size.
-        let new_mmap = unsafe { Mmap::map(&*self.file_handle) }
-            .map_err(|e| format!("mmap failed on append: {e}"))?;
         self.data = Arc::new(new_mmap);
 
         // --- Pass 1: Index new lines ---
@@ -621,7 +1117,7 @@ impl LogDocument {
         // Create dummy progress reporters since this is not a background load with UI.
         let (tx, _) = crossbeam_channel::unbounded();
         let cancel = AtomicBool::new(false);
-        self.analyze_chunk(old_line_count, new_line_count, &tx, &cancel)?;
+        self.analyze_chunk(first_changed_line, new_line_count, &tx, &cancel, None)?;
 
         // Update templates from the modified Drain instance
         let drain = self.drain.lock().unwrap();
@@ -635,6 +1131,7 @@ impl LogDocument {
                 example_line: c.example_line,
             })
             .collect();
+        drop(drain);
 
         // Update document state
         self.file_size = new_size;
@@ -642,8 +1139,16 @@ impl LogDocument {
         if self.trim_end == old_line_count {
             self.trim_end = new_line_count;
         }
+        if was_trimmed {
+            // Trim is a visible source interval; appended records outside a
+            // right trim must not leak into its time bounds or template counts.
+            self.rebuild_trimmed_arrays();
+        }
 
-        Ok(true)
+        Ok(Some(AppendUpdate {
+            first_changed_line,
+            added_lines: new_line_count.saturating_sub(old_line_count),
+        }))
     }
 
     /// Check the backing file without changing the mmap or any indexes.
@@ -690,7 +1195,88 @@ impl LogDocument {
         custom: &[CustomTimeFormat],
     ) -> Result<Self, String> {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        Self::load_inner(path, &tx, &AtomicBool::new(false), config, custom)
+        Self::load_inner(
+            path,
+            &tx,
+            &AtomicBool::new(false),
+            config,
+            custom,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Load with an explicitly compiled text record profile and resolved date
+    /// parser. Explicit selection bypasses Auto popularity thresholds.
+    pub fn open_with_record_profile(
+        path: &Path,
+        config: ParsingConfig,
+        custom: &[CustomTimeFormat],
+        record_profile: Arc<CompiledProfile>,
+        time_format: Option<TimeFormatKind>,
+    ) -> Result<Self, String> {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        Self::load_inner(
+            path,
+            &tx,
+            &AtomicBool::new(false),
+            config,
+            custom,
+            Some(record_profile),
+            time_format,
+            None,
+            None,
+        )
+    }
+
+    /// Load with an explicitly selected record profile and a previously
+    /// persisted Drain state.  This is used by the standalone template
+    /// extractor so that template IDs remain stable between processes.
+    pub fn open_with_record_profile_and_drain(
+        path: &Path,
+        config: ParsingConfig,
+        custom: &[CustomTimeFormat],
+        record_profile: Arc<CompiledProfile>,
+        drain: Drain,
+    ) -> Result<Self, String> {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        Self::load_inner(
+            path,
+            &tx,
+            &AtomicBool::new(false),
+            config,
+            custom,
+            Some(record_profile),
+            None,
+            None,
+            Some(drain),
+        )
+    }
+
+    /// Blocking load with opt-in timings from the actual production pipeline.
+    /// This intentionally performs per-line clock reads and is for benchmarks,
+    /// diagnostics, and regression comparisons rather than interactive loads.
+    pub fn open_profiled(
+        path: &Path,
+        config: ParsingConfig,
+        custom: &[CustomTimeFormat],
+    ) -> Result<(Self, LoadProfile), String> {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut profile = LoadProfile::default();
+        let document = Self::load_inner(
+            path,
+            &tx,
+            &AtomicBool::new(false),
+            config,
+            custom,
+            None,
+            None,
+            Some(&mut profile),
+            None,
+        )?;
+        Ok((document, profile))
     }
 
     /// Load on a background thread with progress reporting and cancellation.
@@ -716,12 +1302,42 @@ impl LogDocument {
         tx: Sender<LoadProgress>,
         cancel: Arc<AtomicBool>,
     ) {
-        match Self::load_inner(path, &tx, &cancel, config, custom) {
+        match Self::load_inner(path, &tx, &cancel, config, custom, None, None, None, None) {
             Ok(doc) => {
                 let _ = tx.send(LoadProgress::Done(Box::new(doc)));
             }
             Err(e) => {
                 let _ = tx.send(LoadProgress::Error(e));
+            }
+        }
+    }
+
+    /// Background load with a selected record profile. The compiled choice is
+    /// locked for this document and never replaced opportunistically on tail.
+    pub fn load_with_record_profile(
+        path: &Path,
+        config: ParsingConfig,
+        custom: &[CustomTimeFormat],
+        record_profile: Arc<CompiledProfile>,
+        tx: Sender<LoadProgress>,
+        cancel: Arc<AtomicBool>,
+    ) {
+        match Self::load_inner(
+            path,
+            &tx,
+            &cancel,
+            config,
+            custom,
+            Some(record_profile),
+            None,
+            None,
+            None,
+        ) {
+            Ok(doc) => {
+                let _ = tx.send(LoadProgress::Done(Box::new(doc)));
+            }
+            Err(error) => {
+                let _ = tx.send(LoadProgress::Error(error));
             }
         }
     }
@@ -733,12 +1349,9 @@ impl LogDocument {
         end_line: usize,
         tx: &Sender<LoadProgress>,
         cancel: &AtomicBool,
+        mut profile: Option<&mut LoadProfile>,
     ) -> Result<(), String> {
-        let mut last_ts = if start_line > 0 {
-            self.ts_ff[start_line - 1]
-        } else {
-            -1
-        };
+        let analysis_started = Instant::now();
         let mut min_ts = self.time_range.map_or(i64::MAX, |(min, _)| min);
         let mut max_ts = self.time_range.map_or(i64::MIN, |(_, max)| max);
         let mut last_report = if start_line > 0 {
@@ -756,10 +1369,34 @@ impl LogDocument {
         let header_slots = self.header_slots.clone();
         let log_format = self.log_format;
         let time_format = self.time_format.clone();
+        let record_profile = self.record_profile.clone();
+        let mut record_state =
+            if start_line > 0 && self.record_start_at_or_before(start_line - 1).is_some() {
+                let active_time = (packed_time_state(&self.time_states, start_line - 1)
+                    == LineTimeState::Known)
+                    .then_some(self.ts_ff[start_line - 1])
+                    .filter(|time| *time >= 0);
+                RecordStateMachine::with_prior_record(active_time)
+            } else {
+                RecordStateMachine::default()
+            };
         let needed_words = end_line.div_ceil(64);
         self.record_starts.resize(needed_words, 0);
+        self.time_states.resize(end_line.div_ceil(32), 0);
 
         for i in start_line..end_line {
+            let is_provisional_tail = i + 1 == end_line
+                && end_line == self.total_lines_untrimmed()
+                && self.data.last().is_none_or(|byte| *byte != b'\n');
+            let tail_before = is_provisional_tail.then(|| {
+                (
+                    (min_ts <= max_ts).then_some((min_ts, max_ts)),
+                    self.invalid_time_count,
+                    self.invalid_time_lines.len(),
+                    self.timestamp_span_overflow.len(),
+                    self.max_line_width,
+                )
+            });
             if i % 65_536 == 0 {
                 if cancel.load(Ordering::Relaxed) {
                     return Err("load cancelled".to_string());
@@ -775,52 +1412,185 @@ impl LogDocument {
                 }
             }
 
-            let (line_len, ts, timestamp_span, template_id) = {
+            let (line_len, classified, template_id, drain_undo, template_match) = {
+                let decode_started = Instant::now();
                 let line = self.line_untrimmed(i);
                 let line_len = line.len();
-                let ts_hint = time_format.as_ref().and_then(|e| e.extract(&line));
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.line_decode += decode_started.elapsed();
+                }
+
+                let timestamp_started = Instant::now();
+                let template_match = record_profile.as_ref().and_then(|compiled| {
+                    compiled.match_line(self.line_bytes_untrimmed(i), i == 0, time_format.as_ref())
+                });
+                // JSON classification and normalization share this decode. A
+                // structured line is never parsed twice in the production
+                // pass merely to establish its boundary and Drain content.
+                let json_value = if record_profile.is_none() && log_format.name() == "json" {
+                    serde_json::from_str::<serde_json::Value>(&line).ok()
+                } else {
+                    None
+                };
+                let classification = if let Some(matched) = template_match.as_ref() {
+                    RecordClassification::from_template(
+                        matched.clone(),
+                        record_profile
+                            .as_ref()
+                            .is_some_and(|compiled| compiled.field_index("time").is_some()),
+                    )
+                } else if record_profile.is_some() {
+                    RecordClassification::Continuation
+                } else if log_format.name() == "plain" {
+                    classify_plain_header(&line, time_format.as_ref())
+                        .unwrap_or(RecordClassification::Continuation)
+                } else if log_format.name() == "json" {
+                    json_value
+                        .as_ref()
+                        .and_then(|value| {
+                            classify_value_with_time_key(
+                                value,
+                                &line,
+                                self.json_time_key.as_deref(),
+                            )
+                        })
+                        .unwrap_or(RecordClassification::Continuation)
+                } else {
+                    log_format
+                        .classify_header(&line, time_format.as_ref())
+                        .unwrap_or(RecordClassification::Continuation)
+                };
+                let ts_hint = match &classification {
+                    RecordClassification::Header {
+                        time: HeaderTime::Known { value, span },
+                        ..
+                    } => Some((*value, span.clone())),
+                    _ => None,
+                };
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.timestamp_extract += timestamp_started.elapsed();
+                }
                 // Delegate to the detected format: it strips the timestamp,
                 // normalizes the structure, and masks dynamic values before
                 // Drain clustering.
+                let normalize_started = Instant::now();
                 let mut ctx = FormatContext {
                     masker: &masker,
                     mask_cache: &mut mask_cache,
                     header_slots: &header_slots,
                 };
-                let normalized = log_format.normalize(&line, ts_hint, &mut ctx);
-                let template_id = drain.add_line(&normalized.content, i);
-                let (ts, timestamp_span) =
-                    normalized.ts.map_or((None, None), |(timestamp, span)| {
-                        (Some(timestamp), Some(span))
-                    });
-                (line_len, ts, timestamp_span, template_id)
+                let normalized_content = if let (Some(compiled), Some(matched)) =
+                    (record_profile.as_ref(), template_match.as_ref())
+                {
+                    normalize_profile_header(
+                        compiled,
+                        matched,
+                        self.line_bytes_untrimmed(i),
+                        &mut ctx,
+                    )
+                } else if record_profile.is_some() {
+                    ctx.masker.mask_with_header(&line, &[], ctx.mask_cache)
+                } else if let Some(value) = json_value.as_ref() {
+                    normalize_json_value(value, &line, &mut ctx).content
+                } else {
+                    log_format.normalize(&line, ts_hint, &mut ctx).content
+                };
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.normalization_and_masking += normalize_started.elapsed();
+                }
+
+                let drain_started = Instant::now();
+                let (template_id, drain_undo) = if is_provisional_tail {
+                    let (id, undo) = drain.add_line_with_undo(&normalized_content, i);
+                    (id, Some(undo))
+                } else {
+                    (drain.add_line(&normalized_content, i), None)
+                };
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.drain_mining += drain_started.elapsed();
+                }
+                let classified = record_state.classify(&classification);
+                (
+                    line_len,
+                    classified,
+                    template_id,
+                    drain_undo,
+                    template_match,
+                )
             };
 
+            if let (Some(drain_undo), Some(before)) = (drain_undo, tail_before) {
+                self.tail_transaction = Some(TailTransaction {
+                    line: i,
+                    drain_undo,
+                    prior_time_range: before.0,
+                    prior_invalid_count: before.1,
+                    prior_invalid_sample_len: before.2,
+                    prior_overflow_len: before.3,
+                    prior_max_line_width: before.4,
+                });
+            }
+
             self.max_line_width = self.max_line_width.max(line_len);
-            if let Some(t) = ts {
-                last_ts = t;
+            if classified.provenance == TimeProvenance::Explicit {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.explicit_timestamps += 1;
+                }
+                let t = classified.timestamp.expect("explicit time has a value");
                 min_ts = min_ts.min(t);
                 max_ts = max_ts.max(t);
             }
             let record_word = i / 64;
             let record_mask = 1u64 << (i % 64);
-            if ts.is_some() {
+            if classified.record_start {
                 self.record_starts[record_word] |= record_mask;
+                if let (Some(store), Some(matched)) =
+                    (self.field_captures.as_mut(), template_match.as_ref())
+                {
+                    store.push(matched);
+                }
             } else {
                 self.record_starts[record_word] &= !record_mask;
             }
-            self.timestamp_spans
-                .push(timestamp_span.map_or(0, pack_timestamp_span));
-            self.ts_ff.push(last_ts);
+            let packed_span = classified
+                .timestamp_span
+                .clone()
+                .map_or(0, |span| pack_timestamp_span(span.clone()));
+            if packed_span == 0 {
+                if let Some(span) = classified.timestamp_span.as_ref() {
+                    self.timestamp_span_overflow.push(OverflowTimestampSpan {
+                        line: i as u32,
+                        start: span.start as u64,
+                        len: span.len().min(u32::MAX as usize) as u32,
+                    });
+                }
+            }
+            self.timestamp_spans.push(packed_span);
+            set_packed_time_state(&mut self.time_states, i, classified.time_state);
+            if classified.time_state == LineTimeState::InvalidHeader {
+                self.invalid_time_count += 1;
+                if self.invalid_time_lines.len() < 64 {
+                    self.invalid_time_lines.push(i as u32);
+                }
+            }
+            self.ts_ff.push(classified.timestamp.unwrap_or(-1));
             self.template_ids.push(template_id);
         }
 
+        drop(drain);
         self.mask_cache = mask_cache;
+        self.rebuild_record_rank_from(start_line);
+        if let Some(store) = &self.field_captures {
+            debug_assert_eq!(store.len(), self.record_rank_at(end_line));
+        }
         self.time_range = if min_ts <= max_ts {
             Some((min_ts, max_ts))
         } else {
             self.time_range
         };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.analysis_wall += analysis_started.elapsed();
+        }
         Ok(())
     }
 
@@ -830,7 +1600,12 @@ impl LogDocument {
         cancel: &AtomicBool,
         config: ParsingConfig,
         custom: &[CustomTimeFormat],
+        record_profile: Option<Arc<CompiledProfile>>,
+        forced_time: Option<TimeFormatKind>,
+        mut profile: Option<&mut LoadProfile>,
+        initial_drain: Option<Drain>,
     ) -> Result<Self, String> {
+        let total_started = Instant::now();
         let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
 
         // On Windows: LockFile is mandatory, so a shared lock would block log writers
@@ -854,6 +1629,7 @@ impl LogDocument {
         let total = mmap.len() as u64;
 
         // ---- Pass 1: line-offset index via SIMD memchr ----
+        let index_started = Instant::now();
         let mut offsets: Vec<u64> = Vec::with_capacity((total / 48) as usize + 2);
         offsets.push(0);
         let mut last_report = 0u64;
@@ -875,8 +1651,14 @@ impl LogDocument {
         if n_lines > u32::MAX as usize {
             return Err("log has more than the supported 4,294,967,295 lines".to_string());
         }
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.bytes = total;
+            profile.physical_lines = n_lines;
+            profile.index_build = index_started.elapsed();
+        }
 
         // ---- Format + timestamp detection on a sample ----
+        let discovery_started = Instant::now();
         let line_at = |i: usize| -> Cow<'_, str> {
             let start = offsets[i] as usize;
             let mut end = offsets[i + 1] as usize;
@@ -885,23 +1667,146 @@ impl LogDocument {
             }
             String::from_utf8_lossy(&mmap[start..end])
         };
-        let sample: Vec<Cow<'_, str>> = (0..n_lines)
-            .map(|i| line_at(i))
-            .filter(|l| !l.trim().is_empty())
-            .take(512)
-            .collect();
-        let log_format = FormatDetector::detect(sample.iter().map(|l| l.as_ref()));
-        let time_format = FormatDetector::detect_time_custom(
-            sample.iter().map(|l| l.as_ref()),
-            log_format,
-            custom,
-        );
+        let discovery_indexes = discovery_line_indices(n_lines);
+        let mut sample: Vec<Cow<'_, str>> = Vec::with_capacity(discovery_indexes.len());
+        let mut sampled_bytes = 0usize;
+        let mut truncated_lines = 0usize;
+        let mut byte_limit_reached = false;
+        for index in discovery_indexes.iter().copied() {
+            if sample.len() % 256 == 0 && cancel.load(Ordering::Relaxed) {
+                return Err("load cancelled".to_string());
+            }
+            let start = offsets[index] as usize;
+            let mut end = offsets[index + 1] as usize;
+            while end > start && (mmap[end - 1] == b'\n' || mmap[end - 1] == b'\r') {
+                end -= 1;
+            }
+            if end == start {
+                continue;
+            }
+            let available = DISCOVERY_MAX_BYTES.saturating_sub(sampled_bytes);
+            if available == 0 {
+                byte_limit_reached = true;
+                break;
+            }
+            let inspected = (end - start).min(DISCOVERY_MAX_LINE_BYTES).min(available);
+            truncated_lines += usize::from(inspected < end - start);
+            sample.push(String::from_utf8_lossy(&mmap[start..start + inspected]));
+            sampled_bytes += inspected;
+            if sampled_bytes == DISCOVERY_MAX_BYTES {
+                byte_limit_reached = true;
+                break;
+            }
+        }
+        let log_format: &'static dyn LogFormat = if record_profile.is_some() {
+            &crate::core::format::Plain
+        } else {
+            FormatDetector::detect_sparse(sample.iter().map(|l| l.as_ref()))
+        };
+        let (time_format, mut detection) = if let Some(forced) = forced_time {
+            let mut diagnostics = DetectionDiagnostics {
+                profile_id: record_profile
+                    .as_ref()
+                    .map(|profile| profile.profile.id.clone()),
+                time_format: Some(forced.name()),
+                confidence: DetectionConfidence::Explicit,
+                ..DetectionDiagnostics::default()
+            };
+            let supporting_headers = record_profile.as_ref().map_or(0, |profile| {
+                sample
+                    .iter()
+                    .filter(|line| profile.match_text(line, false, Some(&forced)).is_some())
+                    .count()
+            });
+            diagnostics.supporting_headers = supporting_headers;
+            (Some(forced), diagnostics)
+        } else if let Some(profile) = record_profile.as_ref() {
+            resolve_profile_time(profile, sample.iter().map(|line| line.as_ref()), custom)
+        } else if log_format.name() == "plain" {
+            detect_plain_time(sample.iter().map(|line| line.as_ref()), custom)
+        } else {
+            let header_lines = sample
+                .iter()
+                .map(|line| line.as_ref())
+                .filter(|line| log_format.matches(line));
+            match TimeDetector::detect_any_from_headers(
+                header_lines,
+                log_format.time_formats(),
+                custom,
+            ) {
+                Some((format, hits, conflicts)) => (
+                    Some(format.clone()),
+                    DetectionDiagnostics {
+                        profile_id: Some(format!("builtin:{}", log_format.name())),
+                        time_format: Some(format.name()),
+                        confidence: if hits >= 2 {
+                            DetectionConfidence::High
+                        } else {
+                            DetectionConfidence::Low
+                        },
+                        supporting_headers: hits,
+                        conflicting_candidates: conflicts,
+                        ..DetectionDiagnostics::default()
+                    },
+                ),
+                None => (
+                    None,
+                    DetectionDiagnostics {
+                        profile_id: Some(format!("builtin:{}", log_format.name())),
+                        confidence: if log_format.time_formats().is_empty() {
+                            DetectionConfidence::High
+                        } else {
+                            DetectionConfidence::Unresolved
+                        },
+                        ..DetectionDiagnostics::default()
+                    },
+                ),
+            }
+        };
+        if let Some(profile) = record_profile.as_ref() {
+            if matches!(
+                profile.profile.timestamp,
+                TimestampSelection::BuiltIn(_) | TimestampSelection::Custom(_)
+            ) && time_format.is_none()
+            {
+                return Err(format!(
+                    "selected timestamp format is unavailable for profile {:?}",
+                    profile.profile.name
+                ));
+            }
+        }
+        let reference = record_profile
+            .as_ref()
+            .and_then(|profile| profile.profile.yearless_year)
+            .map_or_else(YearlessReference::now, |year| {
+                YearlessReference::now().with_explicit_year(year)
+            });
+        let time_format = time_format.map(|format| format.pin_yearless(reference));
+        detection.yearless_reference_year = time_format
+            .as_ref()
+            .and_then(TimeFormatKind::yearless_reference)
+            .map(|reference| reference.year);
+        detection.sampled_lines = sample.len();
+        detection.sampled_bytes = sampled_bytes;
+        detection.line_limit_reached = discovery_indexes.len() < n_lines;
+        detection.byte_limit_reached = byte_limit_reached;
+        detection.truncated_lines = truncated_lines;
+        let json_time_key = (log_format.name() == "json")
+            .then(|| detect_time_key(sample.iter().map(|line| line.as_ref())))
+            .flatten();
+        if log_format.name() == "json" {
+            detection.time_format = json_time_key.as_ref().map(|key| format!("json:{key}"));
+        }
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.profile_discovery = discovery_started.elapsed();
+        }
 
         // ---- Learn the common header shape from a sample of leading lines ----
         // (plain format only) — for each leading token position, if most
         // sampled lines carry the same *dynamic* value class there (e.g. a
         // host, pid, or thread id), that position becomes a forced mask slot.
-        let header_slots = if log_format.uses_learned_header() {
+        let header_started = Instant::now();
+        let header_slots = if record_profile.is_none() && log_format.uses_learned_header() {
             let sample_n = config.header_sample_lines.min(n_lines);
             let mut stripped: Vec<String> = Vec::with_capacity(sample_n);
             for i in 0..sample_n {
@@ -909,20 +1814,19 @@ impl LogDocument {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let s = match time_format.as_ref().and_then(|e| e.extract(&line)) {
-                    Some((_, span)) => {
-                        let mut owned = line.into_owned();
-                        owned.replace_range(span, "");
-                        owned
-                    }
-                    None => line.into_owned(),
-                };
-                stripped.push(s);
+                if let Some(RecordClassification::Header { message_span, .. }) =
+                    classify_plain_header(&line, time_format.as_ref())
+                {
+                    stripped.push(line[message_span].to_string());
+                }
             }
             learn_header_slots(&stripped)
         } else {
             Vec::new()
         };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.header_learning = header_started.elapsed();
+        }
 
         let file_name = path
             .file_name()
@@ -949,18 +1853,27 @@ impl LogDocument {
             ts_ff: ChunkedIndex::default(),
             record_starts: ChunkedIndex::default(),
             timestamp_spans: ChunkedIndex::default(),
+            timestamp_span_overflow: Vec::new(),
+            time_states: ChunkedIndex::default(),
+            record_rank: ChunkedIndex::default(),
+            invalid_time_count: 0,
+            invalid_time_lines: Vec::new(),
             template_ids: ChunkedIndex::default(),
-            drain: Arc::new(Mutex::new(Drain::new(
-                config.drain_depth,
-                config.sim_threshold,
-                100,
-                20_000,
-            ))),
+            drain: Arc::new(Mutex::new(initial_drain.unwrap_or_else(|| {
+                Drain::new(config.drain_depth, config.sim_threshold, 100, 20_000)
+            }))),
             masker: LogMasker::default(),
             header_slots,
             mask_cache: MaskCache::default(),
             log_format,
             time_format,
+            field_captures: record_profile
+                .as_ref()
+                .map(|profile| FieldCaptureStore::new(profile.field_count())),
+            record_profile,
+            tail_transaction: None,
+            json_time_key,
+            detection,
             templates: Vec::new(),
             time_range: None,
             file_size: total,
@@ -971,7 +1884,7 @@ impl LogDocument {
         };
 
         // --- Pass 2: analysis (timestamps + Drain templates) ----
-        doc.analyze_chunk(0, n_lines, tx, cancel)?;
+        doc.analyze_chunk(0, n_lines, tx, cancel, profile.as_deref_mut())?;
 
         {
             let drain = doc.drain.lock().unwrap();
@@ -987,8 +1900,162 @@ impl LogDocument {
                 .collect();
         }
 
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.total_wall = total_started.elapsed();
+        }
         Ok(doc)
     }
+}
+
+fn classify_plain_header(
+    line: &str,
+    time_format: Option<&TimeFormatKind>,
+) -> Option<RecordClassification> {
+    let parser = time_format?;
+    let span = parser.recognize(line)?;
+    let bytes = line.as_bytes();
+    let family = parser.name();
+    let (header_start, timestamp_span, mut message_start) = if span.start == 0 {
+        (0, span.clone(), span.end)
+    } else if family == "ISO-8601 12h AM/PM"
+        && span.start == '\u{a0}'.len_utf8()
+        && line.starts_with('\u{a0}')
+    {
+        // Some Apple console exports prefix every row with a non-breaking
+        // space. Treat that exact decoration like a file-format prefix; do
+        // not generalize this to ordinary indentation, which is continuation
+        // evidence for multiline text.
+        (0, span.clone(), span.end)
+    } else if span.start == 1 && bytes.first() == Some(&b'[') && bytes.get(span.end) == Some(&b']')
+    {
+        (0, span.clone(), span.end + 1)
+    } else if family == "glog"
+        && span.start == 1
+        && bytes
+            .first()
+            .is_some_and(|byte| matches!(byte, b'I' | b'W' | b'E' | b'F' | b'D'))
+    {
+        (0, span.clone(), span.end)
+    } else if family == "Apache CLF"
+        && span.start > 0
+        && bytes.get(span.start - 1) == Some(&b'[')
+        && bytes.get(span.end) == Some(&b']')
+        && line[..span.start - 1].split_whitespace().count() >= 2
+    {
+        (0, span.clone(), span.end + 1)
+    } else {
+        return None;
+    };
+    if message_start < bytes.len() && !matches!(bytes[message_start], b' ' | b'\t') {
+        return None;
+    }
+    while bytes
+        .get(message_start)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        message_start += 1;
+    }
+    let time = match parser.extract(line) {
+        Some((value, extracted)) if extracted == span => HeaderTime::Known {
+            value,
+            span: timestamp_span,
+        },
+        _ => HeaderTime::Invalid {
+            span: Some(timestamp_span),
+        },
+    };
+    Some(RecordClassification::Header {
+        time,
+        header_span: header_start..message_start,
+        message_span: message_start..line.len(),
+    })
+}
+
+fn detect_plain_time<'a>(
+    sample: impl IntoIterator<Item = &'a str>,
+    custom: &[CustomTimeFormat],
+) -> (Option<TimeFormatKind>, DetectionDiagnostics) {
+    let lines = sample.into_iter().collect::<Vec<_>>();
+    let mut scores = TIME_FORMATS
+        .iter()
+        .map(|format| TimeFormatKind::BuiltIn(*format))
+        .chain(
+            custom
+                .iter()
+                .cloned()
+                .map(|format| TimeFormatKind::Custom(Arc::new(format))),
+        )
+        .map(|candidate| {
+            let mut hits = 0usize;
+            let mut covered_bytes = 0usize;
+            for line in &lines {
+                if let Some(RecordClassification::Header { time, .. }) =
+                    classify_plain_header(line, Some(&candidate))
+                {
+                    hits += 1;
+                    covered_bytes += match time {
+                        HeaderTime::Known { span, .. } => span.len(),
+                        HeaderTime::Invalid { span } => span.map_or(0, |span| span.len()),
+                        HeaderTime::Missing => 0,
+                    };
+                }
+            }
+            (candidate, hits, covered_bytes)
+        })
+        .filter(|(_, hits, _)| *hits > 0)
+        .collect::<Vec<_>>();
+    scores.sort_by(|left, right| (right.1, right.2).cmp(&(left.1, left.2)));
+    let mut diagnostics = DetectionDiagnostics {
+        profile_id: Some("builtin:plain-leading-time".to_string()),
+        ..DetectionDiagnostics::default()
+    };
+    let Some((winner, hits, covered_bytes)) = scores.first().cloned() else {
+        return (None, diagnostics);
+    };
+    diagnostics.supporting_headers = hits;
+    diagnostics.conflicting_candidates = scores
+        .iter()
+        .skip(1)
+        .filter(|(_, other_hits, other_bytes)| *other_hits == hits && *other_bytes == covered_bytes)
+        .map(|(candidate, _, _)| candidate.name())
+        .collect();
+    if !diagnostics.conflicting_candidates.is_empty() {
+        diagnostics.confidence = DetectionConfidence::Ambiguous;
+        return (None, diagnostics);
+    }
+    diagnostics.time_format = Some(winner.name());
+    diagnostics.confidence = if hits >= 2 {
+        DetectionConfidence::High
+    } else if lines.len() <= 4 {
+        DetectionConfidence::Low
+    } else {
+        DetectionConfidence::Unresolved
+    };
+    if diagnostics.confidence == DetectionConfidence::Unresolved {
+        (None, diagnostics)
+    } else {
+        (Some(winner), diagnostics)
+    }
+}
+
+fn normalize_profile_header<'a>(
+    profile: &CompiledProfile,
+    matched: &crate::core::record::TemplateMatch,
+    line: &'a [u8],
+    context: &mut FormatContext<'_>,
+) -> Cow<'a, str> {
+    let message = String::from_utf8_lossy(&line[matched.message_span.clone()]);
+    let masked = context
+        .masker
+        .mask_with_header(message.as_ref(), &[], context.mask_cache);
+    let level = profile
+        .captured(matched, "log_level")
+        .and_then(|span| std::str::from_utf8(&line[span]).ok());
+    Cow::Owned(match level {
+        Some(level) if !masked.is_empty() => format!("{level} {masked}"),
+        Some(level) => level.to_string(),
+        None => masked.into_owned(),
+    })
 }
 
 fn report(tx: &Sender<LoadProgress>, stage: LoadStage, done: u64, total: u64) {
@@ -1005,7 +2072,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "logotomy_test_{}_{}_{}.log",
+            "haystack_test_{}_{}_{}.log",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed),
             content.len()
@@ -1070,6 +2137,46 @@ mod tests {
     }
 
     #[test]
+    fn profiled_load_uses_the_same_production_result() {
+        let path = write_temp(
+            "2026-09-11T10:00:00.000Z INFO first\n\
+             continuation\n\
+             2026-09-11T10:00:01.000Z ERROR second\n",
+        );
+        let regular = LogDocument::open(&path).unwrap();
+        let (profiled, profile) =
+            LogDocument::open_profiled(&path, ParsingConfig::default(), &[]).unwrap();
+
+        assert_eq!(profile.bytes, regular.file_size);
+        assert_eq!(profile.physical_lines, regular.total_lines_untrimmed());
+        assert_eq!(profile.explicit_timestamps, regular.record_count());
+        assert_eq!(
+            profiled.total_lines_untrimmed(),
+            regular.total_lines_untrimmed()
+        );
+        assert_eq!(profiled.time_range, regular.time_range);
+        assert_eq!(profiled.record_count(), regular.record_count());
+        assert_eq!(
+            profiled.index_payload_bytes(),
+            regular.index_payload_bytes()
+        );
+        assert!(profile.total_wall >= profile.analysis_wall);
+        assert_eq!(
+            profiled
+                .templates
+                .iter()
+                .map(|template| (&template.pattern, template.count))
+                .collect::<Vec<_>>(),
+            regular
+                .templates
+                .iter()
+                .map(|template| (&template.pattern, template.count))
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn forward_fills_timestamps() {
         let path = write_temp(
             "2026-07-19T10:00:00.000Z INFO boom\n    at stack.frame(Foo.rs:1)\n2026-07-19T10:00:01.000Z INFO next\n",
@@ -1095,6 +2202,236 @@ mod tests {
             span.start,
             doc.line(0).rfind("2026-08-15T19:40:01Z").unwrap()
         );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn payload_dates_do_not_split_multiline_records_or_change_time_bounds() {
+        let path = write_temp(
+            "2026-09-11 10:00:00.100 ERROR request failed\n\
+                 payload={\"retry_at\":\"2035-01-01T00:00:00Z\"}\n\
+                 at Handler.run(Handler.java:42)\n\
+             2026-09-11 10:00:00.098 INFO recovery started\n\
+                 upstream last_seen=2020-01-01T00:00:00Z\n\
+             2026-09-11 10:00:01.000 INFO complete\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+
+        assert_eq!(doc.record_count(), 3);
+        assert_eq!(doc.record_range_containing(0), Some(0..3));
+        assert_eq!(doc.record_range_containing(2), Some(0..3));
+        assert_eq!(doc.record_range_containing(3), Some(3..5));
+        assert_eq!(doc.record_range_containing(5), Some(5..6));
+        assert_eq!(doc.time_provenance_at(0), Some(TimeProvenance::Explicit));
+        assert_eq!(doc.time_provenance_at(1), Some(TimeProvenance::Inherited));
+        assert_eq!(doc.time_provenance_at(4), Some(TimeProvenance::Inherited));
+        assert!(
+            doc.ts_at(3) < doc.ts_at(0),
+            "clock reversal must be preserved"
+        );
+        assert_eq!(doc.ts_at(1), doc.ts_at(0));
+        assert_eq!(doc.ts_at(4), doc.ts_at(3));
+        assert_eq!(doc.time_range, Some((doc.ts_at(3), doc.ts_at(5))));
+        assert!(doc.explicit_timestamp_at(1).is_none());
+        assert!(doc.explicit_timestamp_at(4).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn explicit_detailed_profile_controls_boundaries_and_spans() {
+        let path = write_temp(
+            "2026-09-11 10:00:00.100 - [ERROR] - worker-7 Handler.rs:42 request failed\n\
+                 payload.retry_at=2035-01-01T00:00:00Z\n\
+                 at Handler.run()\n\
+             2026-09-11 10:00:00.098 - [INFO] - worker-12 Handler.rs:57 recovering\n",
+        );
+        let compiled = CompiledProfile::compile(RecordProfile::text(
+            "test:detailed",
+            "Detailed",
+            "{time} - [{log_level}] - {thread_id} {file}:{line} {log}",
+        ))
+        .unwrap();
+        let doc = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            compiled,
+            Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+        )
+        .unwrap();
+
+        assert_eq!(doc.record_count(), 2);
+        assert_eq!(doc.record_range_containing(2), Some(0..3));
+        assert_eq!(doc.record_range_containing(3), Some(3..4));
+        let (_, span) = doc.explicit_timestamp_at(0).unwrap();
+        assert_eq!(&doc.line(0)[span], "2026-09-11 10:00:00.100");
+        assert_eq!(doc.time_provenance_at(2), Some(TimeProvenance::Inherited));
+        assert!(doc.ts_at(3) < doc.ts_at(0));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn malformed_profile_time_starts_unknown_record_and_resets_inheritance() {
+        let path = write_temp(
+            "2026-09-11 10:00:00.100 first\n\
+             continuation one\n\
+             2026-02-30 10:00:01.000 impossible\n\
+             continuation two\n\
+             2026-09-11 10:00:02.000 final\n",
+        );
+        let compiled = CompiledProfile::compile(RecordProfile::default_text()).unwrap();
+        let doc = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            compiled,
+            Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+        )
+        .unwrap();
+
+        assert_eq!(doc.record_count(), 3);
+        assert_eq!(doc.time_provenance_at(2), Some(TimeProvenance::Invalid));
+        assert_eq!(doc.time_provenance_at(3), Some(TimeProvenance::Unknown));
+        assert_eq!(doc.ts_at(2), -1);
+        assert_eq!(doc.ts_at(3), -1);
+        assert_eq!(doc.invalid_time_count, 1);
+        assert_eq!(doc.invalid_time_lines, vec![2]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn rfc5424_missing_time_is_a_boundary_and_resets_inheritance() {
+        let path = write_temp(
+            "<34>1 2026-09-11T10:00:00Z host app 1 one - first\n\
+             continuation\n\
+             <34>1 - host app 2 two - no clock\n\
+             continuation after missing\n\
+             <34>1 2026-09-11T10:00:01Z host app 3 three - final\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+
+        assert_eq!(doc.format_name(), "rfc5424");
+        assert_eq!(doc.record_count(), 3);
+        assert_eq!(doc.time_provenance_at(2), Some(TimeProvenance::Missing));
+        assert_eq!(doc.time_provenance_at(3), Some(TimeProvenance::Unknown));
+        assert_eq!(doc.record_range_containing(3), Some(2..4));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn json_locks_one_top_level_time_key_for_the_document() {
+        let path = write_temp(
+            "{\"time\":\"2026-09-11T10:00:00Z\",\"msg\":\"one\"}\n\
+             {\"timestamp\":\"2026-09-11T10:00:01Z\",\"msg\":\"two\"}\n\
+             {\"time\":\"2026-09-11T10:00:02Z\",\"msg\":\"three\"}\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+
+        assert_eq!(doc.format_name(), "json");
+        assert_eq!(doc.record_count(), 3);
+        assert_eq!(doc.time_provenance_at(0), Some(TimeProvenance::Explicit));
+        assert_eq!(doc.time_provenance_at(1), Some(TimeProvenance::Missing));
+        assert_eq!(doc.time_provenance_at(2), Some(TimeProvenance::Explicit));
+        assert_eq!(doc.ts_at(1), -1);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn timestamp_span_overflow_preserves_explicit_provenance() {
+        let padding = "a".repeat(70_000);
+        let content = format!(
+            "{{\"padding\":\"{padding}\",\"time\":\"2026-09-11T10:00:00Z\",\"msg\":\"one\"}}\n\
+             {{\"padding\":\"{padding}\",\"time\":\"2026-09-11T10:00:01Z\",\"msg\":\"two\"}}\n"
+        );
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+
+        let (_, span) = doc.explicit_timestamp_at(0).unwrap();
+        assert!(span.start > u16::MAX as usize);
+        assert_eq!(&doc.line(0)[span], "2026-09-11T10:00:00Z");
+        assert_eq!(doc.time_provenance_at(0), Some(TimeProvenance::Explicit));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn rank_queries_work_across_more_than_one_directory_block() {
+        let mut content = String::new();
+        for line in 0..1_200 {
+            if line % 400 == 0 {
+                content.push_str(&format!(
+                    "2026-09-11 10:00:{:02}.000 header {line}\n",
+                    line / 400
+                ));
+            } else {
+                content.push_str("continuation\n");
+            }
+        }
+        let path = write_temp(&content);
+        let compiled = CompiledProfile::compile(RecordProfile::default_text()).unwrap();
+        let doc = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            compiled,
+            Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+        )
+        .unwrap();
+
+        assert_eq!(doc.record_count(), 3);
+        assert_eq!(doc.count_records(1, 800), 1);
+        assert_eq!(doc.count_records(399, 801), 2);
+        assert_eq!(doc.record_range_containing(799), Some(400..800));
+        assert_eq!(doc.record_range_containing(1_199), Some(800..1_200));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn auto_detection_finds_sparse_headers_in_distributed_windows() {
+        let mut content = String::from("2026-09-11 10:00:00.000 first\n");
+        for line in 1..1_000 {
+            content.push_str(&format!(
+                "    continuation {line} retry_at=2035-01-01T00:00:00Z\n"
+            ));
+        }
+        content.push_str("2026-09-11 10:00:01.000 second\n");
+        let path = write_temp(&content);
+        let doc = LogDocument::open(&path).unwrap();
+
+        assert_eq!(doc.time_format_name(), Some("ISO-8601".to_string()));
+        assert_eq!(doc.record_count(), 2);
+        assert_eq!(doc.record_range_containing(999), Some(0..1_000));
+        assert_eq!(doc.detection.confidence, DetectionConfidence::High);
+        assert_eq!(doc.detection.supporting_headers, 2);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn explicit_profile_auto_resolves_only_its_timestamp_slot() {
+        let path = write_temp(
+            "[worker-7] 2026-09-11 10:00:00.000 first\n\
+             payload date 2035-01-01T00:00:00Z\n\
+             [worker-8] 2026-09-11 10:00:01.000 second\n",
+        );
+        let profile = CompiledProfile::compile(RecordProfile::text(
+            "test:prefixed",
+            "Prefixed",
+            "[{thread_id}] {time} {log}",
+        ))
+        .unwrap();
+        let doc = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            profile,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(doc.time_format_name(), Some("ISO-8601".to_string()));
+        assert_eq!(doc.record_count(), 2);
+        assert_eq!(doc.detection.profile_id.as_deref(), Some("test:prefixed"));
+        assert_eq!(doc.detection.supporting_headers, 2);
+        assert_eq!(doc.time_provenance_at(1), Some(TimeProvenance::Inherited));
         std::fs::remove_file(path).ok();
     }
 
@@ -1993,6 +3330,417 @@ mod tests {
         assert_eq!(doc.file_change().unwrap(), FileChange::Unchanged);
 
         std::fs::remove_file(path).ok();
+    }
+
+    fn assert_append_matches_fresh(appended: &LogDocument, fresh: &LogDocument) {
+        assert_eq!(
+            appended.total_lines_untrimmed(),
+            fresh.total_lines_untrimmed()
+        );
+        assert_eq!(appended.record_count(), fresh.record_count());
+        assert_eq!(appended.time_range, fresh.time_range);
+        assert_eq!(appended.invalid_time_count, fresh.invalid_time_count);
+        assert_eq!(appended.invalid_time_lines, fresh.invalid_time_lines);
+        assert_eq!(appended.max_line_width, fresh.max_line_width);
+        for line in 0..fresh.total_lines() {
+            assert_eq!(
+                appended.line_bytes(line),
+                fresh.line_bytes(line),
+                "line {line}"
+            );
+            assert_eq!(appended.ts_at(line), fresh.ts_at(line), "time at {line}");
+            assert_eq!(
+                appended.time_provenance_at(line),
+                fresh.time_provenance_at(line),
+                "provenance at {line}"
+            );
+            assert_eq!(
+                appended.explicit_timestamp_at(line),
+                fresh.explicit_timestamp_at(line),
+                "timestamp span at {line}"
+            );
+            assert_eq!(
+                appended.record_range_containing(line),
+                fresh.record_range_containing(line),
+                "record ownership at {line}"
+            );
+            for (name, _) in fresh.record_field_schema() {
+                assert_eq!(
+                    appended.record_field_span(line, name),
+                    fresh.record_field_span(line, name),
+                    "capture {name} at {line}"
+                );
+                assert_eq!(
+                    appended.record_field_segments(line, name),
+                    fresh.record_field_segments(line, name),
+                    "segments {name} at {line}"
+                );
+            }
+            assert_eq!(
+                appended.template_at(line),
+                fresh.template_at(line),
+                "mining at {line}"
+            );
+        }
+        let templates = |doc: &LogDocument| {
+            doc.templates
+                .iter()
+                .map(|template| {
+                    (
+                        template.id,
+                        template.pattern.clone(),
+                        template.count,
+                        template.example_line,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(templates(appended), templates(fresh), "Drain clusters");
+    }
+
+    #[test]
+    fn inline_fields_retain_exact_spans_and_multiline_record_ownership() {
+        let path = write_temp("preamble\n2026-07-15 22:26:39.907481+0300 MyApp[12345:9] <FAULT> CameraService.swift:295 crash\n  detail one\n2026-07-15 22:26:40.907481+0300 MyApp[2:10] <INFO> recovered\n");
+        let profile = CompiledProfile::compile(RecordProfile::inline(
+            "test:inline",
+            "Inline",
+            "{time} MyApp[{a}:{b:number}] <{loglevel}> {log}",
+        ))
+        .unwrap();
+        let doc = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            profile,
+            None,
+        )
+        .unwrap();
+        let value = |line, field| {
+            doc.record_field_span(line, field)
+                .and_then(|span| doc.source_bytes(span))
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        };
+        assert_eq!(doc.record_field_schema()[2], ("b", "number"));
+        assert_eq!(value(0, "a"), None);
+        assert_eq!(value(1, "a"), Some("12345".into()));
+        assert_eq!(value(2, "a"), Some("12345".into()));
+        assert_eq!(value(2, "loglevel"), Some("FAULT".into()));
+        assert_eq!(value(3, "b"), Some("10".into()));
+        let segments = doc.record_field_segments(2, "log").unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(
+            doc.source_bytes(segments[0].clone()),
+            Some(&b"CameraService.swift:295 crash"[..])
+        );
+        assert_eq!(
+            doc.source_bytes(segments[1].clone()),
+            Some(&b"  detail one"[..])
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn refined_ignore_fields_match_headers_without_creating_capture_columns() {
+        let path = write_temp(
+            "2026-07-15 22:26:39.907481+0300 MyApp[12345:9] first\n\
+             2026-07-15 22:26:40.907481+0300 MyApp[2:10] second\n",
+        );
+        let profile = CompiledProfile::compile(RecordProfile::refined_inline(
+            "test:refined-ignore",
+            "Refined ignore",
+            "{time} MyApp[{thread:number}:{ignore:number}] {log}",
+        ))
+        .unwrap();
+        let doc = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            profile,
+            None,
+        )
+        .unwrap();
+        let value = |line, field| {
+            doc.record_field_span(line, field)
+                .and_then(|span| doc.source_bytes(span))
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        };
+
+        assert_eq!(
+            doc.record_field_schema(),
+            &[
+                ("time".into(), "timestamp".into()),
+                ("thread".into(), "number".into()),
+                ("log".into(), "message".into())
+            ]
+        );
+        assert_eq!(value(0, "thread"), Some("12345".into()));
+        assert_eq!(value(0, "ignore"), None);
+        assert_eq!(value(1, "thread"), Some("2".into()));
+        assert_eq!(value(1, "log"), Some("second".into()));
+        assert_eq!(doc.record_profile_match_rate(), Some((2, 2)));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn inline_capture_columns_replay_partial_append_like_fresh_load() {
+        let final_content = "2026-07-15 22:26:39.907481+0300 MyApp[12345:9] <FAULT> first\n detail\n2026-07-15 22:26:40.907481+0300 MyApp[2:10] <INFO> recovered";
+        let profile = CompiledProfile::compile(RecordProfile::inline(
+            "test:inline",
+            "Inline",
+            "{time} MyApp[{a}:{b:number}] <{loglevel}> {log}",
+        ))
+        .unwrap();
+        for cut in 1..final_content.len() {
+            if !final_content.is_char_boundary(cut) {
+                continue;
+            }
+            let path = write_temp(&final_content[..cut]);
+            let mut appended = LogDocument::open_with_record_profile(
+                &path,
+                ParsingConfig::default(),
+                &[],
+                Arc::clone(&profile),
+                Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+            )
+            .unwrap();
+            File::options()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(final_content[cut..].as_bytes())
+                .unwrap();
+            appended.append_new_data_detailed().unwrap();
+            let fresh = LogDocument::open_with_record_profile(
+                &path,
+                ParsingConfig::default(),
+                &[],
+                Arc::clone(&profile),
+                Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+            )
+            .unwrap();
+            assert_append_matches_fresh(&appended, &fresh);
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn append_at_every_byte_boundary_matches_fresh_profiled_load() {
+        let final_content = "2026-09-11T10:00:00Z ERROR first\n    payload retry_at=2035-01-01T00:00:00Z\n2026-02-30T10:00:01Z WARN impossible\n continuation\n2026-09-11T09:59:59Z INFO recovered";
+        let compiled = CompiledProfile::compile(RecordProfile::default_text()).unwrap();
+        for cut in 1..final_content.len() {
+            let path = write_temp(&final_content[..cut]);
+            let mut appended = LogDocument::open_with_record_profile(
+                &path,
+                ParsingConfig::default(),
+                &[],
+                Arc::clone(&compiled),
+                Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+            )
+            .unwrap();
+            let old_count = appended.total_lines_untrimmed();
+            let old_partial = final_content.as_bytes()[cut - 1] != b'\n';
+            let mut file = File::options().append(true).open(&path).unwrap();
+            file.write_all(final_content[cut..].as_bytes()).unwrap();
+            let update = appended.append_new_data_detailed().unwrap().unwrap();
+            assert_eq!(
+                update.first_changed_line,
+                old_count - usize::from(old_partial),
+                "cut={cut}"
+            );
+            let fresh = LogDocument::open_with_record_profile(
+                &path,
+                ParsingConfig::default(),
+                &[],
+                Arc::clone(&compiled),
+                Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+            )
+            .unwrap();
+            assert_append_matches_fresh(&appended, &fresh);
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn yearless_profile_keeps_explicit_year_across_append() {
+        let mut profile = RecordProfile::text("test:syslog", "Syslog", "{time} {log}");
+        profile.timestamp = TimestampSelection::BuiltIn("BSD syslog".into());
+        profile.yearless_year = Some(2024);
+        let compiled = CompiledProfile::compile(profile).unwrap();
+        let path = write_temp("Jan  5 03:22:11 first\nJan  5 03:22:12 second\n");
+        let mut appended = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            Arc::clone(&compiled),
+            None,
+        )
+        .unwrap();
+        assert_eq!(appended.detection.yearless_reference_year, Some(2024));
+        assert!(crate::core::time::format_ms(appended.ts_at(0)).starts_with("2024"));
+
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"Jan  5 03:22:13 third\n")
+            .unwrap();
+        appended.append_new_data_detailed().unwrap();
+        let fresh = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            compiled,
+            None,
+        )
+        .unwrap();
+        assert_append_matches_fresh(&appended, &fresh);
+        assert_eq!(appended.detection.yearless_reference_year, Some(2024));
+        assert!(crate::core::time::format_ms(appended.ts_at(2)).starts_with("2024"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn repeated_partial_appends_do_not_drift() {
+        let final_content =
+            "2026-09-11T10:00:00Z ERROR first\n continuation\n2026-09-11T10:00:01Z INFO done";
+        let path = write_temp(&final_content[..1]);
+        let compiled = CompiledProfile::compile(RecordProfile::default_text()).unwrap();
+        let mut appended = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            Arc::clone(&compiled),
+            Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+        )
+        .unwrap();
+        for end in 2..=final_content.len() {
+            let mut file = File::options().append(true).open(&path).unwrap();
+            file.write_all(&final_content.as_bytes()[end - 1..end])
+                .unwrap();
+            appended.append_new_data_detailed().unwrap();
+            let fresh = LogDocument::open_with_record_profile(
+                &path,
+                ParsingConfig::default(),
+                &[],
+                Arc::clone(&compiled),
+                Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+            )
+            .unwrap();
+            assert_append_matches_fresh(&appended, &fresh);
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn empty_file_can_gain_its_first_record_through_append() {
+        let path = write_temp("");
+        let compiled = CompiledProfile::compile(RecordProfile::default_text()).unwrap();
+        let mut appended = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            Arc::clone(&compiled),
+            Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+        )
+        .unwrap();
+        assert_eq!(appended.total_lines(), 1);
+        assert_eq!(appended.line(0).as_ref(), "");
+        assert_eq!(appended.record_count(), 0);
+
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"2026-09-11T10:00:00Z INFO first\n")
+            .unwrap();
+        let update = appended.append_new_data_detailed().unwrap().unwrap();
+        assert_eq!(update.first_changed_line, 0);
+        assert_eq!(update.added_lines, 0);
+        let fresh = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            compiled,
+            Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+        )
+        .unwrap();
+        assert_append_matches_fresh(&appended, &fresh);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn append_updates_record_rank_across_directory_boundary() {
+        let mut content = String::new();
+        for index in 0..512 {
+            content.push_str(&format!("2026-09-11T10:00:00Z INFO record {index}\n"));
+        }
+        content.push_str("2026-09-11T10:00:01Z WARN parti");
+        let path = write_temp(&content);
+        let compiled = CompiledProfile::compile(RecordProfile::default_text()).unwrap();
+        let mut appended = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            Arc::clone(&compiled),
+            Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+        )
+        .unwrap();
+        let mut file = File::options().append(true).open(&path).unwrap();
+        file.write_all(b"al\n2026-09-11T10:00:02Z INFO after\n")
+            .unwrap();
+        let update = appended.append_new_data_detailed().unwrap().unwrap();
+        assert_eq!(update.first_changed_line, 512);
+        assert_eq!(appended.record_count(), 514);
+        assert_eq!(appended.count_records(511, 514), 3);
+        let fresh = LogDocument::open_with_record_profile(
+            &path,
+            ParsingConfig::default(),
+            &[],
+            compiled,
+            Some(TimeFormatKind::BuiltIn(&crate::core::time::Iso)),
+        )
+        .unwrap();
+        assert_append_matches_fresh(&appended, &fresh);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn append_outside_right_trim_does_not_change_visible_time_bounds() {
+        let path =
+            write_temp("2026-09-11T10:00:00Z INFO first\n2026-09-11T10:00:01Z INFO second\n");
+        let mut doc = LogDocument::open(&path).unwrap();
+        doc.trim_range(0, 0);
+        let original_range = doc.time_range;
+        let mut file = File::options().append(true).open(&path).unwrap();
+        file.write_all(b"2026-09-11T10:00:30Z INFO hidden\n")
+            .unwrap();
+        doc.append_new_data_detailed().unwrap();
+        assert_eq!(doc.total_lines(), 1);
+        assert_eq!(doc.time_range, original_range);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn partial_json_object_and_rfc_header_replay_match_fresh_loads() {
+        for (initial, suffix) in [
+            (
+                "{\"time\":\"2026-09-11T10:00:00Z\",\"msg\":\"first\"}\n{\"time\":\"2026-09-11T10:00:01Z\",\"msg\":\"second\"}\n{\"time\":\"2026-09-11T10:00:02Z\",\"msg\":\"thi",
+                "rd\"}\n",
+            ),
+            (
+                "<134>1 2026-09-11T10:00:00Z host app 1 msg - first\n<134>1 - host app 1 msg - second\n<134>1 2026-09-11T10:00:02Z host app 1 msg - thi",
+                "rd\n",
+            ),
+        ] {
+            let path = write_temp(initial);
+            let mut appended = LogDocument::open(&path).unwrap();
+            let mut file = File::options().append(true).open(&path).unwrap();
+            file.write_all(suffix.as_bytes()).unwrap();
+            appended.append_new_data_detailed().unwrap();
+            let fresh = LogDocument::open(&path).unwrap();
+            assert_append_matches_fresh(&appended, &fresh);
+            std::fs::remove_file(path).ok();
+        }
     }
 
     #[test]

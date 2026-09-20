@@ -1,4 +1,4 @@
-**logotomy is complete** — the half-baked project is now a full high-performance Rust log analyzer + visualizer, with every requested feature verified.
+**haystack is complete** — the half-baked project is now a full high-performance Rust log analyzer + visualizer, with every requested feature verified.
 
 **What was built**
 
@@ -9,7 +9,7 @@
 - `search.rs` — Aho-Corasick multi-keyword single-pass scan, time-window counts, first/last occurrence
 - `timeline.rs` — 2048-bucket density histogram + per-keyword lanes; falls back to line-number domain for timeless files
 
-`src/ui/` (eframe/egui GUI, `logotomy`):
+`src/ui/` (eframe/egui GUI, `haystack`):
 - Drag-drop any text file + open dialog; **progress bar** with stage labels and cancel
 - **Multi-tab** — open/switch/close many files
 - Virtualized log view (line # + template ID gutter, keyword highlighting) — smooth on 787k lines
@@ -17,14 +17,14 @@
 - Click timeline → **bottom panel shows selected line ± 5** (radius adjustable), with jump-to-full-view
 - Right-side template browser (mined patterns sorted by frequency, click → example)
 
-`src/bin/mcp_server.rs` (`logotomy-mcp`, stdio JSON-RPC MCP):
+`src/bin/mcp_server.rs` (`haystack-mcp`, stdio JSON-RPC MCP):
 - Tools: `load_log`, `list_logs`, `close_log`, `get_occurrence_count`, `get_occurrence_time_range`, `get_logs_within_time`, `find_occurrences`, `get_templates` — smoke-tested end-to-end (windowed counts, forward-filled stack-trace lines, pagination all correct)
 
 **Verified performance** (release, 64MB / 787k-line synthetic log): load 3.3s with live progress, 3-keyword full scan 0.67s, timeline 13ms (`cargo run --release --example bench`).
 
 **Docs:** UserGuide.md (usage, MCP config, cheat sheet), feature.md (full inventory). The Python sidecar (`src/python/`) is deleted.
 
-Note: the release GUI binary wasn't pre-built (eframe release compile takes several minutes) — debug GUI at `target/debug/logotomy` works now; run `cargo build --release` for the optimized build when ready.
+Note: the release GUI binary wasn't pre-built (eframe release compile takes several minutes) — debug GUI at `target/debug/haystack` works now; run `cargo build --release` for the optimized build when ready.
 
 
 # Retrospection
@@ -48,7 +48,7 @@ Honest assessment — what I'd improve, ranked by impact:
 6. ~~**Timeline has no zoom/pan.** It's a fixed 2048-bucket overview. Brushing a range to zoom (re-bucket into the selection) is the natural next step — the bucketing code already supports arbitrary ranges.~~ ✅ **Done:** scroll-wheel zoom, drag pan, shift+drag brush-select, double-click reset, minimap click-to-jump all implemented.
 7. **No keyboard navigation** — j/k or arrows to move the selection, Enter to jump, `/` to focus the keyword box. Instant-feel improvement, trivial in egui.
 8. **Regex keywords** — currently substring-only. Aho-Corasick doesn't do regex; the pragmatic move is a separate `regex` crate path for patterns wrapped in `/…/`, scanned on the same background thread.
-9. **Keyword sets aren't persisted** — reopening a file loses your bookmarks. A tiny sidecar JSON (`file.log.logotomy.json`) would fix it.
+9. **Keyword sets aren't persisted** — reopening a file loses your bookmarks. A tiny sidecar JSON (`file.log.haystack.json`) would fix it.
 10. **No export** — "save filtered range / template report to file" is easy and useful for sharing findings.
 11. **Time display is UTC-only.** Fine for correlation, but a local-time toggle in the status bar would reduce mental math.
 

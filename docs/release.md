@@ -1,16 +1,16 @@
 # Building & Packaging Releases
 
-logotomy ships **native OS installers** (not raw binaries) via
+Haystack ships **native OS installers** (not raw binaries) via
 [cargo-packager](https://github.com/crabnebula-dev/cargo-packager). Installers
 must be built **on their own host OS** (installer wrappers — NSIS, dpkg,
 hdiutil — don't cross-compile reliably).
 
 | Platform | Formats | Output (default `target/<triple>/release/`) |
 |---|---|---|
-| Windows x86_64 | `nsis` | `logotomy-<version>-setup.exe` |
-| Ubuntu x86_64 | `deb,appimage` | `logotomy_<version>_amd64.deb`, `logotomy-<version>-x86_64.AppImage` |
-| macOS Apple Silicon | `app,dmg` | `logotomy_<version>_aarch64.dmg` (+ `logotomy.app`) |
-| macOS Intel | `app,dmg` | `logotomy_<version>_x64.dmg` (+ `logotomy.app`) |
+| Windows x86_64 | `nsis` | `haystack-<version>-setup.exe` |
+| Ubuntu x86_64 | `deb,appimage` | `haystack_<version>_amd64.deb`, `haystack-<version>-x86_64.AppImage` |
+| macOS Apple Silicon | `app,dmg` | `haystack_<version>_aarch64.dmg` (+ `haystack.app`) |
+| macOS Intel | `app,dmg` | `haystack_<version>_x64.dmg` (+ `haystack.app`) |
 
 ## 1. Install the tool
 
@@ -21,10 +21,10 @@ cargo install cargo-packager --locked
 The packaging config lives in `Cargo.toml` under `[package.metadata.packager]`
 (identifier, product name/version, app icons, file associations, and
 NSIS/macOS/Linux options). The native installers register `.log`, `.txt`,
-`.out`, `.err`, `.csv`, `.json`, `.xml`, and `.md` with logotomy. On Linux, registration follows the MIME types advertised by the
+`.out`, `.err`, `.csv`, `.json`, `.xml`, and `.md` with haystack. On Linux, registration follows the MIME types advertised by the
 desktop entry; Windows and macOS register the extensions directly. Windows
 Event Log binaries (`.evt`/`.evtx`) and `.sys` files are not registered because
-logotomy’s core expects text input.
+haystack’s core expects text input.
 
 ### Platform prerequisites
 
@@ -40,9 +40,9 @@ Exactly two commands per platform — the packager wraps the binary that
 it packages whatever release binary exists for the `--target` you pass.)
 
 > The raw per-platform binary is what you build first:
-> `target/<triple>/release/logotomy` (Windows uses `logotomy.exe`).
+> `target/<triple>/release/haystack` (Windows uses `haystack.exe`).
 
-### Windows (generates `logotomy-<version>-setup.exe`)
+### Windows (generates `haystack-<version>-setup.exe`)
 
 ```bash
 rustup target add x86_64-pc-windows-msvc
@@ -50,7 +50,7 @@ cargo build --release --target x86_64-pc-windows-msvc
 cargo packager --release --formats nsis --target x86_64-pc-windows-msvc
 ```
 
-The runnable binary is `target/x86_64-pc-windows-msvc/release/logotomy.exe`
+The runnable binary is `target/x86_64-pc-windows-msvc/release/haystack.exe`
 (correct `.exe` extension; icon/version info embedded at build time by
 `build.rs` → `winres`).
 
@@ -85,12 +85,12 @@ to put them in a clean `dist/` folder instead):
 
 ```
 target/<triple>/release/
-   logotomy-0.1.0-setup.exe            # Windows
-   logotomy_0.1.0_amd64.deb            # Ubuntu
-   logotomy-0.1.0-x86_64.AppImage      # Linux (arch label may vary)
-   logotomy.app/                       # macOS app bundle
-   logotomy_0.1.0_aarch64.dmg          # macOS Apple Silicon
-   logotomy_0.1.0_x64.dmg              # macOS Intel
+   haystack-0.1.0-setup.exe            # Windows
+   haystack_0.1.0_amd64.deb            # Ubuntu
+   haystack-0.1.0-x86_64.AppImage      # Linux (arch label may vary)
+   haystack.app/                       # macOS app bundle
+   haystack_0.1.0_aarch64.dmg          # macOS Apple Silicon
+   haystack_0.1.0_x64.dmg              # macOS Intel
 ```
 
 > The installer's internal version comes from `Cargo.toml` (`[package].version`);
@@ -101,7 +101,7 @@ target/<triple>/release/
 `.github/workflows/release.yml` does all four automatically when a matching
 `v*` tag is pushed: version validation, tests + bench, then packaging
 (`--out-dir dist`), then staging renamed
-installers (`logotomy-<tag>-<target>.<ext>`) and uploading them plus
+installers (`haystack-<tag>-<target>.<ext>`) and uploading them plus
 the combined `benchmark-results.txt` and `checksums.sha256` to the GitHub
 Release. Raw tarball/zip archives are **not** published anymore.
 
@@ -118,15 +118,15 @@ Windows, Ubuntu/Linux, macOS Apple Silicon, and macOS Intel results.
 
 After building an installer you can verify it right away. The GitHub Release
 also includes these first-run instructions:
-- **Windows**: double-click `logotomy-<version>-setup.exe` → install → launch.
-- **Ubuntu**: `sudo apt install ./logotomy_0.1.0_amd64.deb` → run `logotomy`.
-- **macOS**: open the DMG → drag `logotomy.app` to Applications → right-click
+- **Windows**: double-click `haystack-<version>-setup.exe` → install → launch.
+- **Ubuntu**: `sudo apt install ./haystack_0.1.0_amd64.deb` → run `haystack`.
+- **macOS**: open the DMG → drag `haystack.app` to Applications → right-click
   the app and choose **Open** on first launch. If it remains blocked, remove
   quarantine only after verifying the download: `xattr -d
-  com.apple.quarantine /Applications/logotomy.app`.
+  com.apple.quarantine /Applications/haystack.app`.
 - **Windows**: if SmartScreen shows “Windows protected your PC”, verify the
   download, click **More info**, then **Run anyway**.
-- **Ubuntu/Linux AppImage**: run `chmod +x logotomy-*.AppImage` before launching.
+- **Ubuntu/Linux AppImage**: run `chmod +x haystack-*.AppImage` before launching.
 
 ## Future work
 - Code signing: Windows Authenticode (SmartScreen), macOS Developer-ID +

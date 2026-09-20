@@ -1,6 +1,7 @@
 mod analysis_popup;
 mod annotation_popup;
 pub mod embedded;
+mod occurrence_overlay;
 pub mod view;
 
 pub use view::{

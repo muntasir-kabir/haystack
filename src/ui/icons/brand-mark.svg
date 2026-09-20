@@ -1,0 +1,10 @@
+<!-- Full-colour in-app mark. This is intentionally separate from 24px action icons. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" aria-label="Haystack">
+  <rect width="24" height="24" rx="5.1" fill="#202938"/>
+  <rect x="4.45" y="6.05" width="10.92" height="1.92" rx="0.96" fill="#8EC5FF"/>
+  <rect x="4.45" y="9.71" width="14.63" height="1.92" rx="0.96" fill="#FF9A8B"/>
+  <rect x="4.45" y="13.36" width="9.14" height="1.92" rx="0.96" fill="#B8A7FF"/>
+  <rect x="4.45" y="17.02" width="12.19" height="1.92" rx="0.96" fill="#7ED6B2"/>
+  <circle cx="2.9" cy="2.9" r="1.12" fill="#F4C95D"/>
+  <circle cx="21.1" cy="21.1" r="0.88" fill="#E86A6A"/>
+</svg>

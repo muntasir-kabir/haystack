@@ -1,4 +1,4 @@
-//! Generate iOS-style dummy app logs for testing logotomy.
+//! Generate iOS-style dummy app logs for testing haystack.
 //!
 //! Deterministic: the same `--seed` always produces byte-identical output —
 //! the generator is pure Rust (PCG64) with zero platform-dependent behavior,
@@ -600,7 +600,7 @@ fn parse_size(s: &str) -> u64 {
 
 fn print_usage() {
     eprintln!(
-        "Generate iOS-style dummy app logs for testing logotomy.\n\
+        "Generate iOS-style dummy app logs for testing haystack.\n\
          \n\
          Usage:\n\
          \x20 cargo run --release --example gen_ios_logs -- [SIZES...] [--all] [--seed N]\n\
@@ -683,7 +683,7 @@ mod tests {
     use std::fs;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("logotomy_gen_{}_{}", std::process::id(), name))
+        std::env::temp_dir().join(format!("haystack_gen_{}_{}", std::process::id(), name))
     }
 
     fn cleanup(p: &std::path::Path) {

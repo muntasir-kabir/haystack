@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui;
-use egui::{Color32, RichText};
+use egui::{RichText, Stroke};
 use egui_dock::{DockArea, DockState};
 use log::info;
 
@@ -12,16 +12,21 @@ use crate::ui::pin_viewer;
 use crate::ui::template_view;
 use crate::ui::theme::Theme;
 use crate::ui::timeline;
-use logotomy::core::time::parse_time_param;
+use haystack::core::time::parse_time_param;
+use haystack::core::time_query::nearest_record_time;
 
 use super::model::*;
 use crate::ui::custom_date;
+use crate::ui::record_format;
 use crate::ui::settings;
 
 #[path = "filters_dropdown.rs"]
 mod filters_dropdown;
+#[path = "format_menu.rs"]
+mod format_menu;
 #[path = "key_listener.rs"]
 mod key_listener;
+use super::overlay;
 use key_listener::{AppCommand, ALIASES, COMMANDS};
 
 #[derive(Clone, Copy)]
@@ -44,23 +49,36 @@ fn compact_top_bar(available_width: f32) -> bool {
     available_width < 1100.0
 }
 
-fn popup_should_close(
-    escape_pressed: bool,
-    click_pos: Option<egui::Pos2>,
-    button_rect: egui::Rect,
-    popup_rect: egui::Rect,
+fn open_file_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+O"
+    } else {
+        "Ctrl+O"
+    }
+}
+
+fn document_status_context(format: Option<&str>, status: &str) -> String {
+    match format {
+        Some(format) if !status.is_empty() => format!("{format} · {status}"),
+        Some(format) => format.to_owned(),
+        None => String::new(),
+    }
+}
+
+fn should_request_repaint(
+    any_search: bool,
+    loaders_changed: bool,
+    loaders_in_flight: bool,
+    mcp_enabled: bool,
 ) -> bool {
-    escape_pressed
-        || click_pos.is_some_and(|position| {
-            !button_rect.contains(position) && !popup_rect.contains(position)
-        })
+    any_search || loaders_changed || loaders_in_flight || mcp_enabled
 }
 
 /// Save a renderer-native viewport capture when the tracked-screenshot
 /// environment hook is active. This avoids OS screen-recording permissions and
 /// keeps README captures deterministic across local and CI workflows.
 fn consume_tracked_screenshot(ctx: &egui::Context) {
-    let Ok(target) = std::env::var("LOGOTOMY_SCREENSHOT_PATH") else {
+    let Ok(target) = std::env::var("HAYSTACK_SCREENSHOT_PATH") else {
         return;
     };
     for event in ctx.input(|input| input.events.clone()) {
@@ -99,7 +117,7 @@ fn consume_tracked_screenshot(ctx: &egui::Context) {
 }
 
 fn request_tracked_screenshot(ctx: &egui::Context, content_ready: bool) {
-    let Ok(target) = std::env::var("LOGOTOMY_SCREENSHOT_PATH") else {
+    let Ok(target) = std::env::var("HAYSTACK_SCREENSHOT_PATH") else {
         return;
     };
     let requested_id = egui::Id::new("tracked_screenshot_requested");
@@ -121,14 +139,14 @@ fn request_tracked_screenshot(ctx: &egui::Context, content_ready: bool) {
     )));
 }
 
-impl Drop for LogotomyApp {
+impl Drop for HaystackApp {
     fn drop(&mut self) {
         if self.mcp_enabled {
             self.stop_mcp();
         }
         // Tracked screenshot runs are renderer-only previews. Avoid changing
         // the user's workspace, sidecars, recents, or persisted settings.
-        if std::env::var_os("LOGOTOMY_SCREENSHOT_PATH").is_some() {
+        if std::env::var_os("HAYSTACK_SCREENSHOT_PATH").is_some() {
             return;
         }
         self.flush_sidecars();
@@ -138,13 +156,24 @@ impl Drop for LogotomyApp {
     }
 }
 
-impl LogotomyApp {
+impl HaystackApp {
     fn dismiss_app_overlay_on_escape(&mut self, ctx: &egui::Context) {
         let tab_confirmation_open = self
             .active
             .and_then(|index| self.tabs.get(index))
             .is_some_and(|tab| tab.pending_filter_removal.is_some() || tab.pending_clear_filters);
+        // The occurrence overlay owns Escape unless an inspector is layered
+        // above it; inspectors get first chance to close themselves.
+        let occurrence_overlay_open = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .is_some_and(|tab| {
+                tab.log_views.values().any(|view| {
+                    view.occurrence_overlay.is_some() && view.embedded_inspector.is_none()
+                })
+            });
         let has_overlay = self.show_integrate_popup
+            || self.record_editor.open
             || self.show_custom_date_popup
             || self.show_command_palette
             || self.show_goto_popup
@@ -160,15 +189,31 @@ impl LogotomyApp {
             || self.recent_show_dropdown
             || self.show_filter_dropdown
             || self.views_show_dropdown
-            || tab_confirmation_open;
-        if !has_overlay
-            || !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-        {
+            || self.show_format_dropdown
+            || tab_confirmation_open
+            || occurrence_overlay_open;
+        if !has_overlay {
+            if let Some(tab) = self.active.and_then(|index| self.tabs.get_mut(index)) {
+                if tab.log_focus_mode
+                    && ctx.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                    })
+                {
+                    tab.log_focus_mode = false;
+                }
+            }
+            return;
+        }
+        if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             return;
         }
 
         if self.show_integrate_popup {
             self.show_integrate_popup = false;
+        } else if self.record_editor.open {
+            if !self.record_editor.dismiss_completion() {
+                self.record_editor.open = false;
+            }
         } else if self.show_custom_date_popup {
             self.show_custom_date_popup = false;
         } else if self.show_command_palette {
@@ -201,7 +246,18 @@ impl LogotomyApp {
             self.show_filter_dropdown = false;
         } else if self.views_show_dropdown {
             self.views_show_dropdown = false;
+        } else if self.show_format_dropdown {
+            self.show_format_dropdown = false;
         } else if let Some(tab) = self.active.and_then(|index| self.tabs.get_mut(index)) {
+            if let Some(view) = tab
+                .log_views
+                .values_mut()
+                .find(|view| view.occurrence_overlay.is_some() && view.embedded_inspector.is_none())
+            {
+                view.occurrence_overlay = None;
+                view.annotation_hover = None;
+                return;
+            }
             tab.pending_filter_removal = None;
             tab.pending_clear_filters = false;
         }
@@ -286,6 +342,14 @@ impl LogotomyApp {
                     tab.undo_delete();
                 }
             }
+            AppCommand::ToggleLogFocus => {
+                if let Some(tab) = self.active.and_then(|idx| self.tabs.get_mut(idx)) {
+                    let focused = ViewTab::Log(tab.focused_log_view_id);
+                    if !tab.detached_views.contains(&focused) {
+                        tab.log_focus_mode = !tab.log_focus_mode;
+                    }
+                }
+            }
             AppCommand::ShowHelp => self.show_cheat_sheet = true,
             AppCommand::ShowPalette => {
                 self.show_command_palette = true;
@@ -322,7 +386,7 @@ impl LogotomyApp {
             self.goto_error = Some("Use line 1200, RFC3339 time, or @epoch.".to_string());
             return;
         };
-        let Some(line) = tab.timeline.nearest_line(&tab.doc, timestamp) else {
+        let Some(line) = nearest_record_time(&tab.doc, timestamp) else {
             self.goto_error = Some("This log has no timestamps to navigate.".to_string());
             return;
         };
@@ -334,15 +398,13 @@ impl LogotomyApp {
         if !self.show_command_palette {
             return;
         }
-        let mut open = true;
         let mut execute = None;
-        egui::Window::new("Commands")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
-            .show(ctx, |ui| {
+        overlay::modal(
+            ctx,
+            "commands_modal",
+            "Commands",
+            egui::vec2(420.0, 420.0),
+            |ui| {
                 let input = ui
                     .horizontal(|ui| {
                         ui.add(icons::icon_image(
@@ -409,8 +471,8 @@ impl LogotomyApp {
                         })
                         .map(|spec| spec.command);
                 }
-            });
-        self.show_command_palette = open;
+            },
+        );
         if let Some(command) = execute {
             self.show_command_palette = false;
             self.dispatch_command(command);
@@ -425,66 +487,72 @@ impl LogotomyApp {
             return;
         };
 
-        let area = egui::Area::new(egui::Id::new("views_popup"))
-            .current_pos(button_rect.left_bottom())
-            .order(egui::Order::Foreground)
-            .fixed_pos(button_rect.left_bottom());
-        let area_resp = area.show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(180.0);
-                ui.label(RichText::new("More actions").strong().size(14.0));
-                ui.separator();
-                if icons::action_button(
+        let popup = overlay::popover(ui.ctx(), "views_popup", button_rect.left_bottom(), |ui| {
+            ui.set_min_width(180.0);
+            ui.label(RichText::new("More actions").strong().size(14.0));
+            ui.separator();
+            if icons::action_button(
+                ui,
+                Icon::History,
+                "Recent files",
+                self.theme.text,
+                "Open a recently used file",
+            )
+            .clicked()
+            {
+                self.recent_button_rect = self.views_button_rect;
+                self.recent_show_dropdown = true;
+                self.views_show_dropdown = false;
+            }
+            if icons::action_button(
+                ui,
+                Icon::Filter,
+                "Saved filters",
+                self.theme.text,
+                "Apply or save a filter set",
+            )
+            .clicked()
+            {
+                self.filter_button_rect = self.views_button_rect;
+                self.show_filter_dropdown = true;
+                self.views_show_dropdown = false;
+            }
+            if icons::action_button(
+                ui,
+                Icon::Commands,
+                "Commands",
+                self.theme.text,
+                "Open the command palette (Cmd/Ctrl+Shift+P)",
+            )
+            .clicked()
+            {
+                self.show_command_palette = true;
+                self.command_palette_query.clear();
+                self.views_show_dropdown = false;
+            }
+            if let Some(tab) = self.active.and_then(|idx| self.tabs.get_mut(idx)) {
+                let focused = ViewTab::Log(tab.focused_log_view_id);
+                let label = if tab.log_focus_mode {
+                    "Exit Focus Log"
+                } else {
+                    "Focus Log View"
+                };
+                if icons::action_button_enabled(
                     ui,
-                    Icon::History,
-                    "Recent files",
+                    !tab.detached_views.contains(&focused),
+                    Icon::Expand,
+                    label,
                     self.theme.text,
-                    "Open a recently used file",
+                    "Hide or restore the timeline and other dock panes",
                 )
                 .clicked()
                 {
-                    self.recent_button_rect = self.views_button_rect;
-                    self.recent_show_dropdown = true;
+                    tab.log_focus_mode = !tab.log_focus_mode;
                     self.views_show_dropdown = false;
                 }
-                if icons::action_button(
-                    ui,
-                    Icon::Filter,
-                    "Saved filters",
-                    self.theme.text,
-                    "Apply or save a filter set",
-                )
-                .clicked()
-                {
-                    self.filter_button_rect = self.views_button_rect;
-                    self.show_filter_dropdown = true;
-                    self.views_show_dropdown = false;
-                }
-                if icons::action_button(
-                    ui,
-                    Icon::Commands,
-                    "Commands",
-                    self.theme.text,
-                    "Open the command palette (Cmd/Ctrl+Shift+P)",
-                )
-                .clicked()
-                {
-                    self.show_command_palette = true;
-                    self.command_palette_query.clear();
-                    self.views_show_dropdown = false;
-                }
-            });
+            }
         });
-
-        let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
-        let click = ui.input(|input| {
-            input
-                .pointer
-                .any_click()
-                .then(|| input.pointer.interact_pos())
-                .flatten()
-        });
-        if popup_should_close(escape, click, button_rect, area_resp.response.rect) {
+        if popup.should_close() {
             self.views_show_dropdown = false;
         }
     }
@@ -497,38 +565,43 @@ impl LogotomyApp {
             return;
         };
 
-        let area = egui::Area::new(egui::Id::new("ai_assistant_popup"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(button_rect.right_bottom() - egui::vec2(330.0, 0.0))
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(330.0);
-                    ui.horizontal(|ui| {
-                        ui.add(icons::icon_image(ui.ctx(), Icon::Mcp, 16.0, self.theme.text));
-                        ui.label(RichText::new("AI Assistant").strong().size(14.0));
-                    });
-                    ui.separator();
+        let popup = overlay::popover(
+            ui.ctx(),
+            "ai_assistant_popup",
+            button_rect.right_bottom() - egui::vec2(330.0, 0.0),
+            |ui| {
+                ui.set_width(330.0);
+                ui.horizontal(|ui| {
+                    ui.add(icons::icon_image(
+                        ui.ctx(),
+                        Icon::Mcp,
+                        16.0,
+                        self.theme.text,
+                    ));
+                    ui.label(RichText::new("AI Assistant").strong().size(14.0));
+                });
+                ui.separator();
 
-                    let state = if self.mcp_enabled {
-                        "Ready for a private GUI connection"
-                    } else if self.tabs.is_empty() {
-                        "Open a log before starting the connection"
-                    } else {
-                        "Connection is stopped"
-                    };
-                    ui.label(state);
-                    ui.label(
-                        RichText::new(
-                            "Connect a local coding agent to investigate the active log with you.",
-                        )
-                        .small()
-                        .color(self.theme.text_muted),
-                    );
-                    ui.add_space(6.0);
+                let state = if self.mcp_enabled {
+                    "Ready for a private GUI connection"
+                } else if self.tabs.is_empty() {
+                    "Open a log before starting the connection"
+                } else {
+                    "Connection is stopped"
+                };
+                ui.label(state);
+                ui.label(
+                    RichText::new(
+                        "Connect a local coding agent to investigate the active log with you.",
+                    )
+                    .small()
+                    .color(self.theme.text_muted),
+                );
+                ui.add_space(6.0);
 
-                    if self.mcp_enabled {
-                        if let Some(instruction) = self.mcp_instruction() {
-                            if icons::action_button(
+                if self.mcp_enabled {
+                    if let Some(instruction) = self.mcp_instruction() {
+                        if icons::action_button(
                                 ui,
                                 Icon::Copy,
                                 "Copy session instructions",
@@ -543,68 +616,59 @@ impl LogotomyApp {
                                 );
                                 self.show_ai_assistant_popup = false;
                             }
-                        }
-                        if icons::action_button(
-                            ui,
-                            Icon::Stop,
-                            "Stop connection",
-                            self.theme.text,
-                            "Stop MCP and invalidate the temporary GUI session",
-                        )
-                        .clicked()
-                        {
-                            self.stop_mcp();
-                            self.show_toast("AI Assistant connection stopped".to_string());
-                            self.show_ai_assistant_popup = false;
-                        }
-                    } else if icons::action_button_enabled(
+                    }
+                    if icons::action_button(
                         ui,
-                        !self.tabs.is_empty(),
-                        Icon::Start,
-                        "Start connection",
+                        Icon::Stop,
+                        "Stop connection",
                         self.theme.text,
-                        if self.tabs.is_empty() {
-                            "Open a log file first"
-                        } else {
-                            "Start a private MCP connection for the active log"
-                        },
+                        "Stop MCP and invalidate the temporary GUI session",
                     )
                     .clicked()
                     {
-                        self.start_mcp();
-                        if self.mcp_enabled {
-                            self.show_toast(
+                        self.stop_mcp();
+                        self.show_toast("AI Assistant connection stopped".to_string());
+                        self.show_ai_assistant_popup = false;
+                    }
+                } else if icons::action_button_enabled(
+                    ui,
+                    !self.tabs.is_empty(),
+                    Icon::Start,
+                    "Start connection",
+                    self.theme.text,
+                    if self.tabs.is_empty() {
+                        "Open a log file first"
+                    } else {
+                        "Start a private MCP connection for the active log"
+                    },
+                )
+                .clicked()
+                {
+                    self.start_mcp();
+                    if self.mcp_enabled {
+                        self.show_toast(
                                 "AI Assistant connection started. Copy the session instructions to connect."
                                     .to_string(),
                             );
-                        }
                     }
+                }
 
-                    ui.separator();
-                    if icons::action_button(
-                        ui,
-                        Icon::Integrate,
-                        "Integration guide",
-                        self.theme.text,
-                        "Set up Logotomy in Codex, Claude, or Cline",
-                    )
-                    .clicked()
-                    {
-                        self.show_integrate_popup = true;
-                        self.show_ai_assistant_popup = false;
-                    }
-                });
-            });
-
-        let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
-        let click = ui.input(|input| {
-            input
-                .pointer
-                .any_click()
-                .then(|| input.pointer.interact_pos())
-                .flatten()
-        });
-        if popup_should_close(escape, click, button_rect, area.response.rect) {
+                ui.separator();
+                if icons::action_button(
+                    ui,
+                    Icon::Integrate,
+                    "Integration guide",
+                    self.theme.text,
+                    "Set up Haystack in Codex, Claude, or Cline",
+                )
+                .clicked()
+                {
+                    self.show_integrate_popup = true;
+                    self.show_ai_assistant_popup = false;
+                }
+            },
+        );
+        if popup.should_close() {
             self.show_ai_assistant_popup = false;
         }
     }
@@ -613,14 +677,13 @@ impl LogotomyApp {
         if !self.show_goto_popup {
             return;
         }
-        let mut open = true;
         let mut submit = false;
-        egui::Window::new("Go to line or time")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
+        overlay::modal(
+            ctx,
+            "goto_modal",
+            "Go to line or time",
+            egui::vec2(420.0, 180.0),
+            |ui| {
                 ui.label("Line number, RFC3339 timestamp, or @epoch:");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.goto_input)
@@ -660,8 +723,8 @@ impl LogotomyApp {
                         submit = true;
                     }
                 });
-            });
-        self.show_goto_popup = self.show_goto_popup && open;
+            },
+        );
         if submit {
             self.submit_goto();
         }
@@ -671,14 +734,12 @@ impl LogotomyApp {
         if !self.show_cheat_sheet {
             return;
         }
-        let mut open = true;
-        egui::Window::new("Keyboard & Mouse Shortcuts")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(520.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
+        overlay::modal(
+            ctx,
+            "shortcuts_modal",
+            "Keyboard & Mouse Shortcuts",
+            egui::vec2(520.0, 560.0),
+            |ui| {
                 let mut category = "";
                 for spec in COMMANDS {
                     if spec.category != category {
@@ -690,10 +751,28 @@ impl LogotomyApp {
                         ui.label(spec.name);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let label = match spec.command {
-                                AppCommand::GoTo => format!("{} or {}", spec.shortcut.map(|s| ctx.format_shortcut(&s)).unwrap_or_default(), ALIASES.iter().find(|(command, _)| *command == AppCommand::GoTo).map(|(_, shortcut)| ctx.format_shortcut(shortcut)).unwrap_or_default()),
-                                _ => spec.shortcut.map(|s| ctx.format_shortcut(&s)).unwrap_or_default(),
+                                AppCommand::GoTo => format!(
+                                    "{} or {}",
+                                    spec.shortcut
+                                        .map(|s| ctx.format_shortcut(&s))
+                                        .unwrap_or_default(),
+                                    ALIASES
+                                        .iter()
+                                        .find(|(command, _)| *command == AppCommand::GoTo)
+                                        .map(|(_, shortcut)| ctx.format_shortcut(shortcut))
+                                        .unwrap_or_default()
+                                ),
+                                _ => spec
+                                    .shortcut
+                                    .map(|s| ctx.format_shortcut(&s))
+                                    .unwrap_or_default(),
                             };
-                            ui.label(RichText::new(label).monospace().small().color(self.theme.text_muted));
+                            ui.label(
+                                RichText::new(label)
+                                    .monospace()
+                                    .small()
+                                    .color(self.theme.text_muted),
+                            );
                         });
                     });
                 }
@@ -702,11 +781,11 @@ impl LogotomyApp {
                 for gesture in [
                     "Timeline: scroll to zoom, drag to pan, Shift-drag to brush, double-click to reset.",
                     "Timeline lanes: click a lane or occurrence to select it; click eye to toggle; click trash to remove.",
-                    "Log: click a row to select; right-click to pin; drag across rows to select a range.",
+                    "Log: click a row to select; Shift-click for surrounding filter occurrences; right-click to pin; drag across rows to select a range.",
                     "Pins: click a card title to select it; use Remove or Delete to remove it.",
                 ] { ui.label(RichText::new(gesture).small().color(self.theme.text_muted)); }
-            });
-        self.show_cheat_sheet = open;
+            },
+        );
     }
 
     fn close_save_error_ui(&mut self, ctx: &egui::Context) {
@@ -719,15 +798,16 @@ impl LogotomyApp {
             .is_some_and(|tab| tab.pending_sidecar_restore.is_some());
         let mut retry = false;
         let mut discard = false;
-        egui::Window::new("Could not save investigation state")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
+        overlay::modal(
+            ctx,
+            "save_error_modal",
+            "Could not save investigation state",
+            egui::vec2(520.0, 220.0),
+            |ui| {
                 ui.label(if waiting_for_restore {
                     "This tab is waiting for a restored-investigation decision."
                 } else {
-                    "Logotomy could not save this tab's filters, notes, and view state."
+                    "Haystack could not save this tab's filters, notes, and view state."
                 });
                 ui.label(
                     RichText::new(if waiting_for_restore {
@@ -775,7 +855,8 @@ impl LogotomyApp {
                         discard = true;
                     }
                 });
-            });
+            },
+        );
         if retry {
             self.close_save_error = None;
             self.request_close_tab(idx);
@@ -785,12 +866,84 @@ impl LogotomyApp {
             self.close_tab(idx);
         }
     }
+
+    fn sidecar_recovery_ui(&mut self, ctx: &egui::Context) {
+        let Some(recovery) = self.pending_sidecar_recovery.as_ref() else {
+            return;
+        };
+        let path = recovery.path.clone();
+        let detail = recovery.detail.clone();
+        let repaired_sidecar = recovery.repaired_sidecar.clone();
+        let replace_after_load = recovery.replace_after_load;
+        let is_profile = repaired_sidecar.is_some();
+        let mut continue_load = false;
+        let mut cancel = false;
+        overlay::modal(
+            ctx,
+            "sidecar_recovery_modal",
+            "Saved log settings need attention",
+            egui::vec2(620.0, 260.0),
+            |ui| {
+                ui.label(format!(
+                    "{} has saved settings this version cannot use.",
+                    path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |name| name.to_string_lossy().into_owned()
+                    )
+                ));
+                ui.add_space(4.0);
+                ui.label(if is_profile {
+                    "Continue loading with automatic format detection? The invalid saved format will be removed; filters, notes, and layout remain."
+                } else if replace_after_load {
+                    "Continue loading with a fresh investigation? The invalid saved state will be replaced only after this log opens successfully."
+                } else {
+                    "Continue loading without saved settings? The saved state will not be changed automatically."
+                });
+                ui.collapsing("Details", |ui| {
+                    ui.monospace(format!(
+                        "Sidecar: {}\n{detail}",
+                        haystack::core::sidecar::path_for(&path).display()
+                    ));
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    let label = if replace_after_load {
+                        "Continue & repair"
+                    } else {
+                        "Continue without saved settings"
+                    };
+                    if ui.button(label).clicked() {
+                        continue_load = true;
+                    }
+                });
+            },
+        );
+        if cancel {
+            self.pending_sidecar_recovery = None;
+            self.status = "Opening log cancelled; saved settings were not changed.".into();
+        } else if continue_load {
+            self.pending_sidecar_recovery = None;
+            self.recovery_sidecars
+                .insert(path.clone(), (repaired_sidecar, replace_after_load));
+            self.open_file(path);
+        }
+    }
 }
 
 /// Owns the mutable state for a single file tab and renders the UI for it.
 struct TabViewer<'a> {
     tab: &'a mut LogTab,
     theme: &'a Theme,
+    allow_popout: bool,
+    /// Detached Log Views keep their return action in the tab header so it
+    /// does not consume a second row above the reading surface.
+    return_to_main: Option<&'a mut bool>,
+    /// `None` identifies the main dock. A detached Log window is identified
+    /// by the root tab that created its native viewport.
+    dock_container: Option<ViewTab>,
 }
 
 impl<'a> egui_dock::TabViewer for TabViewer<'a> {
@@ -799,91 +952,313 @@ impl<'a> egui_dock::TabViewer for TabViewer<'a> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
             ViewTab::Timeline => timeline::show(ui, self.tab, self.theme),
-            ViewTab::Log => log_view::show(ui, self.tab, self.theme),
+            ViewTab::Log(id) => {
+                let interacted = log_view_pointer_interaction(ui);
+                show_log_view(ui, self.tab, self.theme, *id, interacted);
+            }
             ViewTab::Pinned => pin_viewer::show(ui, self.tab, self.theme),
             ViewTab::Templates => template_view::show(ui, self.tab, self.theme),
         }
     }
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        let display_number = match tab {
+            ViewTab::Log(id) => self.tab.log_views.get(id).map(|view| view.display_number),
+            _ => None,
+        };
+        dock_tab_title(*tab, self.tab.log_view_count(), display_number).into()
+    }
+
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(("workspace_view", *tab))
+    }
+
+    fn is_closeable(&self, tab: &Self::Tab) -> bool {
+        matches!(tab, ViewTab::Log(_)) && self.tab.log_view_count() > 1
+    }
+
+    fn on_close(&mut self, tab: &mut Self::Tab) -> egui_dock::tab_viewer::OnCloseResponse {
         match tab {
-            ViewTab::Timeline => "Timeline".into(),
-            ViewTab::Log => "Log".into(),
-            ViewTab::Pinned => "Pinned".into(),
-            ViewTab::Templates => "Templates".into(),
+            ViewTab::Log(id) if self.tab.close_log_view(*id) => {
+                egui_dock::tab_viewer::OnCloseResponse::Close
+            }
+            _ => egui_dock::tab_viewer::OnCloseResponse::Ignore,
         }
     }
 
-    fn is_closeable(&self, _tab: &Self::Tab) -> bool {
-        false
-    }
-
-    fn on_tab_button(&mut self, _tab: &mut Self::Tab, response: &egui::Response) {
-        if response.hovered() {
-            response.clone().on_hover_text("Switch workspace view");
-        }
-    }
-}
-
-/// Draw the resize affordance that replaces egui-dock's leaf close-all button.
-///
-/// The native button is disabled on the `DockArea` because its action closes a
-/// dock leaf. For Log and Pinned leaves the same location instead detaches the
-/// active view into a viewport window.
-fn draw_dock_resize_buttons(
-    ui: &mut egui::Ui,
-    dock_state: &DockState<ViewTab>,
-    tab_bar_height: f32,
-    log_tab: &mut LogTab,
-    theme: &Theme,
-) {
-    for (path, leaf) in dock_state.iter_leaves() {
-        let Some(active_view) = leaf.tabs.get(leaf.active.0) else {
-            continue;
-        };
-        if !matches!(
-            active_view,
-            ViewTab::Log | ViewTab::Pinned | ViewTab::Templates
-        ) {
-            continue;
-        }
-
-        let header_rect = egui::Rect::from_min_max(
-            egui::pos2(leaf.rect.right() - icons::ACTION_HEIGHT, leaf.rect.top()),
-            egui::pos2(leaf.rect.right(), leaf.rect.top() + tab_bar_height),
+    fn on_tab_button(&mut self, tab: &mut Self::Tab, response: &egui::Response) {
+        let accessible_label = dock_tab_accessibility_label(
+            *tab,
+            self.tab.log_view_count(),
+            match tab {
+                ViewTab::Log(id) => self.tab.log_views.get(id).map(|view| view.display_number),
+                _ => None,
+            },
         );
-        let response = ui.interact(
-            header_rect,
-            egui::Id::new(("dock_leaf_resize", path)),
-            egui::Sense::click(),
-        );
-        let color = if response.hovered() {
-            theme.text
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                response.enabled(),
+                accessible_label.clone(),
+            )
+        });
+        if let ViewTab::Log(id) = tab {
+            // `egui_dock` replaces the original tab response with a drag
+            // proxy once its internal drag threshold is crossed. Arm our
+            // cross-window bridge while the original tab owns the press,
+            // before that proxy exists.
+            if response.is_pointer_button_down_on() {
+                self.tab.active_log_drag = Some((*id, self.dock_container));
+                // A native child viewport owns the pointer while the tab is
+                // dragged. Repaint the main window so its cross-window drop
+                // marker appears as soon as the pointer enters it.
+                response.ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            if response.clicked() {
+                self.tab.focus_log_view(*id);
+                self.tab.active_log_drag = None;
+            }
+        }
+        let action = if self.allow_popout {
+            dock_tab_action_rects(*tab, response.rect, self.is_closeable(tab))
+                .map(|rect| (rect, Icon::ExternalWindow))
+        } else if self.return_to_main.is_some() && matches!(tab, ViewTab::Log(_)) {
+            dock_tab_action_rects(*tab, response.rect, self.is_closeable(tab))
+                .map(|rect| (rect, Icon::ArrowLeft))
         } else {
-            theme.text_muted
+            None
         };
+        let Some((action_rect, action_icon)) = action else {
+            if response.hovered() {
+                response.clone().on_hover_text("Switch workspace view");
+            }
+            return;
+        };
+        let pointer = response.ctx.pointer_hover_pos();
+        let action_hovered = pointer.is_some_and(|p| action_rect.contains(p));
+        let action_color = if action_hovered {
+            self.theme.text
+        } else {
+            self.theme.text_muted
+        };
+        let painter = response.ctx.layer_painter(response.layer_id);
         icons::paint_icon(
-            ui.ctx(),
-            ui.painter(),
-            Icon::ExternalWindow,
-            header_rect.center(),
-            15.0,
-            color,
+            &response.ctx,
+            &painter,
+            action_icon,
+            action_rect.center(),
+            14.0,
+            action_color,
         );
-        let view_name = match active_view {
-            ViewTab::Timeline => "Timeline",
-            ViewTab::Log => "Log",
-            ViewTab::Pinned => "Pinned",
-            ViewTab::Templates => "Templates",
-        };
-        let response = response.on_hover_text(format!("Open {view_name} in a separate window"));
-        if response.clicked() {
-            log_tab.pending_detach = Some(*active_view);
+        if action_hovered {
+            response.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            let tooltip = if self.allow_popout {
+                format!("Open {} in a separate window", dock_tab_name(*tab))
+            } else {
+                "Return this Log View to the main window".to_owned()
+            };
+            response.clone().on_hover_text(tooltip);
+            if response.clicked()
+                && response
+                    .interact_pointer_pos()
+                    .is_some_and(|pointer| action_rect.contains(pointer))
+            {
+                if self.allow_popout {
+                    self.tab.pending_detach = Some(*tab);
+                } else if let Some(return_to_main) = self.return_to_main.as_deref_mut() {
+                    *return_to_main = true;
+                }
+            }
+        } else if response.hovered() {
+            let tooltip = match tab {
+                ViewTab::Log(_) if self.tab.log_view_count() == 1 => {
+                    "Switch to this Log View. The final Log View stays open; use + to create another."
+                }
+                ViewTab::Log(_) => {
+                    "Switch to this Log View. Timeline and navigation follow the focused Log View."
+                }
+                _ => "Switch workspace view",
+            };
+            response.clone().on_hover_text(tooltip);
         }
+    }
+
+    fn on_add(&mut self, path: egui_dock::NodePath) {
+        self.tab.pending_add_log_view = Some(path);
     }
 }
 
-impl eframe::App for LogotomyApp {
+fn log_view_pointer_interaction(ui: &egui::Ui) -> bool {
+    ui.rect_contains_pointer(ui.max_rect())
+        && ui.input(|input| {
+            input.pointer.any_pressed()
+                || input.pointer.any_down()
+                || input.smooth_scroll_delta != egui::Vec2::ZERO
+        })
+}
+
+/// Draw the explicit, cross-native-window Log View drop marker. `egui_dock`
+/// owns drag feedback inside one dock state; this bridge makes a dragged Log
+/// tab visible and droppable in another native viewport as well.
+fn show_cross_window_log_drop_marker(
+    ui: &egui::Ui,
+    tab: &mut LogTab,
+    theme: &Theme,
+    target: LogDockTarget,
+    target_container: Option<ViewTab>,
+    rect: egui::Rect,
+) -> bool {
+    let Some((id, source_container)) = tab.active_log_drag else {
+        return false;
+    };
+    if source_container == target_container || !tab.log_views.contains_key(&id) {
+        return false;
+    }
+    let pointer = ui
+        .ctx()
+        .pointer_hover_pos()
+        .or_else(|| ui.ctx().pointer_interact_pos());
+    let hovered = pointer.is_some_and(|pointer| rect.contains(pointer));
+    let stroke = if hovered {
+        Stroke::new(2.0, theme.selection_focused)
+    } else {
+        Stroke::new(1.0, theme.selection_focused)
+    };
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new(("cross_window_log_drop", target_container)),
+    ));
+    painter.rect_stroke(rect.shrink(6.0), 6.0, stroke, egui::StrokeKind::Inside);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Drop Log View here",
+        egui::FontId::proportional(14.0),
+        theme.selection_focused,
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Copy);
+    }
+    if hovered && ui.input(|input| input.pointer.primary_released()) {
+        let moved = tab.dock_log_view(id, target);
+        if moved {
+            tab.active_log_drag = None;
+        }
+        return moved;
+    }
+    false
+}
+
+/// Render through the temporary compatibility bridge without allowing paint
+/// order to redefine the most recently focused Log View.
+fn show_log_view(
+    ui: &mut egui::Ui,
+    tab: &mut LogTab,
+    theme: &Theme,
+    id: LogViewId,
+    received_focus: bool,
+) {
+    if !tab.log_views.contains_key(&id) {
+        return;
+    }
+    let previous = tab.focused_log_view_id;
+    tab.focused_log_view_id = id;
+    log_view::show(ui, tab, theme);
+    tab.focused_log_view_id = previous;
+    if received_focus {
+        tab.focus_log_view(id);
+    }
+}
+
+fn detached_viewport_id(path: &std::ffi::OsStr, view_tab: ViewTab) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of((path, view_tab))
+}
+
+fn dock_tab_name(tab: ViewTab) -> &'static str {
+    match tab {
+        ViewTab::Timeline => "Timeline",
+        ViewTab::Log(_) => "Log",
+        ViewTab::Pinned => "Pinned",
+        ViewTab::Templates => "Templates",
+    }
+}
+
+fn detached_view_title(
+    file_name: &str,
+    view_tab: ViewTab,
+    log_view_count: usize,
+    display_number: Option<u64>,
+) -> String {
+    let identity = match view_tab {
+        ViewTab::Timeline => "Timeline".to_owned(),
+        ViewTab::Log(_) if log_view_count > 1 => {
+            format!("Log View {}", display_number.unwrap_or(1))
+        }
+        ViewTab::Log(_) => "Log View".to_owned(),
+        ViewTab::Pinned => "Pinned".to_owned(),
+        ViewTab::Templates => "Templates".to_owned(),
+    };
+    format!("{file_name} · {identity}")
+}
+
+fn dock_tab_title(tab: ViewTab, log_view_count: usize, display_number: Option<u64>) -> String {
+    let name = dock_tab_name(tab);
+    if matches!(tab, ViewTab::Log(_)) {
+        let label = if log_view_count > 1 {
+            format!("{name} {}", display_number.unwrap_or(1))
+        } else {
+            name.to_owned()
+        };
+        format!("{label}             ")
+    } else if matches!(tab, ViewTab::Pinned | ViewTab::Templates) {
+        format!("{name}     ")
+    } else {
+        name.to_owned()
+    }
+}
+
+fn dock_tab_accessibility_label(
+    tab: ViewTab,
+    log_view_count: usize,
+    display_number: Option<u64>,
+) -> String {
+    let title = dock_tab_title(tab, log_view_count, display_number)
+        .trim()
+        .to_owned();
+    match tab {
+        ViewTab::Log(_) if log_view_count == 1 => format!(
+            "{title} tab. Add another Log View or open this view in a separate window. The final Log View cannot be closed."
+        ),
+        ViewTab::Log(_) => format!(
+            "{title} tab. Add another Log View, open this view in a separate window, or close this Log View."
+        ),
+        ViewTab::Pinned | ViewTab::Templates => {
+            format!("{title} tab. Open this view in a separate window.")
+        }
+        ViewTab::Timeline => title,
+    }
+}
+
+fn dock_tab_action_rects(
+    tab: ViewTab,
+    tab_rect: egui::Rect,
+    closeable: bool,
+) -> Option<egui::Rect> {
+    matches!(tab, ViewTab::Log(_) | ViewTab::Pinned | ViewTab::Templates).then(|| {
+        let size = egui::vec2(22.0, tab_rect.height().min(22.0));
+        let close_space = if closeable { size.x } else { 0.0 };
+        let popout = egui::Rect::from_center_size(
+            egui::pos2(
+                tab_rect.right() - close_space - size.x * 0.65,
+                tab_rect.center().y,
+            ),
+            size,
+        );
+        popout
+    })
+}
+
+impl eframe::App for HaystackApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let is_main_viewport = ui.ctx().input(|i| i.viewport().parent.is_none());
         let viewport_id = ui.ctx().viewport_id();
@@ -896,19 +1271,20 @@ impl eframe::App for LogotomyApp {
     }
 }
 
-impl LogotomyApp {
+impl HaystackApp {
     fn apply_tracked_screenshot_view(&mut self, ctx: &egui::Context) {
-        if std::env::var("LOGOTOMY_SCREENSHOT_PATH").is_err() {
+        if std::env::var("HAYSTACK_SCREENSHOT_PATH").is_err() {
             return;
         }
         let applied_id = egui::Id::new("tracked_screenshot_view_applied");
         if ctx.data(|data| data.get_temp::<bool>(applied_id).unwrap_or(false)) {
             return;
         }
-        let desired = match std::env::var("LOGOTOMY_SCREENSHOT_VIEW").as_deref() {
-            Ok("pinned") => Some(ViewTab::Pinned),
-            Ok("templates") => Some(ViewTab::Templates),
-            Ok("log") => Some(ViewTab::Log),
+        let screenshot_view = std::env::var("HAYSTACK_SCREENSHOT_VIEW").ok();
+        let desired = match screenshot_view.as_deref() {
+            Some("pinned") => Some(ViewTab::Pinned),
+            Some("templates") => Some(ViewTab::Templates),
+            Some("log") => Some(ViewTab::Log(LogViewId::INITIAL)),
             _ => None,
         };
         let Some(tab) = self.active.and_then(|index| self.tabs.get_mut(index)) else {
@@ -919,21 +1295,32 @@ impl LogotomyApp {
                 let _ = tab.dock_state.set_active_tab(path);
             }
         }
+        if screenshot_view.as_deref() == Some("multiple-logs") && tab.log_view_count() == 1 {
+            let source = ViewTab::Log(tab.focused_log_view_id);
+            if let Some(source_path) = tab.dock_state.find_tab(&source) {
+                tab.dock_state
+                    .set_focused_node_and_surface(source_path.node_path());
+                let second = tab.add_log_view();
+                tab.dock_state.push_to_focused_leaf(ViewTab::Log(second));
+                if let Some(second_path) = tab.dock_state.find_tab(&ViewTab::Log(second)) {
+                    let _ = tab.dock_state.set_active_tab(second_path);
+                }
+            }
+        }
         tab.bottom_panel_open = true;
         ctx.data_mut(|data| data.insert_temp(applied_id, true));
     }
 
     fn update_main(&mut self, ui: &mut egui::Ui) {
         consume_tracked_screenshot(ui.ctx());
-        if std::env::var("LOGOTOMY_SCREENSHOT_PATH").is_ok() {
+        if std::env::var("HAYSTACK_SCREENSHOT_PATH").is_ok() {
             ui.ctx()
                 .all_styles_mut(|style| style.interaction.tooltip_delay = f32::INFINITY);
         }
-        ui.ctx().set_visuals(if self.dark_mode {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        self.dark_mode = crate::ui::theme::apply_egui_theme(ui.ctx(), self.settings.theme_mode);
+
+        let interactive_surface_open = overlay::interactive_surface_open(self, ui.ctx());
+        overlay::mark_background_input(ui.ctx(), interactive_surface_open);
 
         self.poll_open_requests(ui.ctx());
 
@@ -945,7 +1332,8 @@ impl LogotomyApp {
         }
         let hovering_files = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
 
-        self.poll_loaders();
+        let loaders_changed = self.poll_loaders();
+        self.poll_reparse();
         self.apply_tracked_screenshot_view(ui.ctx());
         self.poll_mcp_dirty();
         self.poll_mcp_filters();
@@ -965,25 +1353,29 @@ impl LogotomyApp {
             if tab.poll_visible_lines() {
                 any_search = true;
             }
-            if tab.poll_find() {
-                any_search = true;
-            }
-            if tab.poll_embedded_data() {
+            if tab.poll_log_view_workers() {
                 any_search = true;
             }
         }
         self.poll_mcp_search();
         self.drain_recent_query_updates();
-        if any_search || !self.loaders.is_empty() || self.mcp_enabled {
+        if should_request_repaint(
+            any_search,
+            loaders_changed,
+            !self.loaders.is_empty(),
+            self.mcp_enabled,
+        ) {
             ui.ctx().request_repaint_after(Duration::from_millis(60));
         }
 
         // All application commands are consumed in one place so detached
         // views, the palette, and the cheat sheet cannot drift apart.
-        let text_edit_active = ui.ctx().memory(|memory| memory.focused().is_some());
-        let commands = key_listener::consume(ui.ctx(), text_edit_active);
-        for command in commands {
-            self.dispatch_command(command);
+        if !interactive_surface_open {
+            let text_edit_active = ui.ctx().memory(|memory| memory.focused().is_some());
+            let commands = key_listener::consume(ui.ctx(), text_edit_active);
+            for command in commands {
+                self.dispatch_command(command);
+            }
         }
         self.dismiss_app_overlay_on_escape(ui.ctx());
 
@@ -995,42 +1387,11 @@ impl LogotomyApp {
                         // so detaching just hides the panel and opens a window.
                         tab.timeline_detached = true;
                     } else {
-                        // If the close button removed the tab before we could
-                        // detach it, re-add it to the dock first.
-                        if tab.dock_state.find_tab(&view_to_detach).is_none() {
-                            tab.dock_state
-                                .main_surface_mut()
-                                .push_to_focused_leaf(view_to_detach);
-                        }
-                        if let Some(tab_location) = tab.dock_state.find_tab(&view_to_detach) {
-                            // Save a full snapshot of the dock layout before mutating it,
-                            // so we can restore the original split arrangement when the
-                            // view returns.
-                            if tab.saved_dock_state.is_none() {
-                                tab.saved_dock_state = Some(tab.dock_state.clone());
-                            }
-                            tab.detached_locations.insert(view_to_detach, tab_location);
-                            tab.detached_views.insert(view_to_detach);
-                            tab.dock_state.remove_tab(tab_location);
-                        }
+                        tab.detach_dock_view(view_to_detach);
                     }
                 }
-                for closed_tab in tab.just_closed_viewports.drain(..) {
-                    if tab.detached_views.is_empty() {
-                        // All views are back — restore the original layout.
-                        if let Some(saved) = tab.saved_dock_state.take() {
-                            tab.dock_state = saved;
-                        } else {
-                            tab.dock_state
-                                .main_surface_mut()
-                                .push_to_focused_leaf(closed_tab);
-                        }
-                    } else {
-                        // Other views still detached; push to focused leaf for now.
-                        tab.dock_state
-                            .main_surface_mut()
-                            .push_to_focused_leaf(closed_tab);
-                    }
+                for closed_tab in std::mem::take(&mut tab.just_closed_viewports) {
+                    tab.redock_view(closed_tab);
                 }
             }
         }
@@ -1041,9 +1402,9 @@ impl LogotomyApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
                 ui.spacing_mut().item_spacing.x = 4.0;
-                ui.add(icons::app_logo(ui.ctx(), 20.0));
+                ui.add(icons::app_mark(ui.ctx(), 16.0, self.theme.text_muted));
                 if !compact {
-                    ui.label(RichText::new("LOGotomy").strong().size(16.0));
+                    ui.label(RichText::new("Haystack").strong().size(16.0));
                 }
                 ui.separator();
                 if icons::action_button(
@@ -1055,6 +1416,7 @@ impl LogotomyApp {
                 )
                 .clicked()
                 {
+                    self.show_format_dropdown = false;
                     self.recent_show_dropdown = false;
                     self.show_filter_dropdown = false;
                     self.views_show_dropdown = false;
@@ -1070,6 +1432,7 @@ impl LogotomyApp {
                         "Recent files, saved filters, and commands",
                     );
                     if more.clicked() {
+                        self.show_format_dropdown = false;
                         (
                             self.recent_show_dropdown,
                             self.show_filter_dropdown,
@@ -1088,6 +1451,7 @@ impl LogotomyApp {
                         "Open a recently used file",
                     );
                     if recent.clicked() {
+                        self.show_format_dropdown = false;
                         (
                             self.recent_show_dropdown,
                             self.show_filter_dropdown,
@@ -1109,6 +1473,7 @@ impl LogotomyApp {
                         "Apply or save a filter set",
                     );
                     if filters.clicked() {
+                        self.show_format_dropdown = false;
                         (
                             self.recent_show_dropdown,
                             self.show_filter_dropdown,
@@ -1131,6 +1496,7 @@ impl LogotomyApp {
                     )
                     .clicked()
                     {
+                        self.show_format_dropdown = false;
                         self.show_command_palette = true;
                         self.command_palette_query.clear();
                         self.recent_show_dropdown = false;
@@ -1141,28 +1507,87 @@ impl LogotomyApp {
                     }
                 }
 
-                let context = match self.selected_log_format_status() {
-                    Some(info) if !self.status.is_empty() => format!("{info} · {}", self.status),
-                    Some(info) => info,
-                    None => self.status.clone(),
-                };
+                // Keep the document controls visually separate from the file
+                // actions. The status itself is rendered as a bounded chip
+                // below so long format/file details cannot push controls out
+                // of the top bar.
+                ui.add_space(4.0);
+                ui.separator();
+
+                let format_tip = self
+                    .active
+                    .and_then(|index| self.tabs.get(index))
+                    .map(|tab| {
+                        tab.doc.record_profile().map_or_else(
+                            || format!("Auto-detect · {}", tab.doc.format_name()),
+                            |profile| profile.name.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| "Choose or create a log format".into());
+                let format_warning = self
+                    .active
+                    .and_then(|index| self.tabs.get(index))
+                    .and_then(|tab| tab.doc.record_profile_match_rate())
+                    .is_some_and(|(matched, total)| total > 0 && matched * 100 < total * 90);
+                let format_label = if format_warning { "⚠ Format" } else { "Format" };
+                let format_color = if format_warning { self.theme.warning } else { self.theme.text };
+                let format_tip = if format_warning {
+                    format!("{format_tip}\nWarning: the applied format matches fewer than 90% of log lines. Check and update Format.")
+                } else { format_tip };
+                let format =
+                    icons::action_button(ui, Icon::Log, format_label, format_color, &format_tip);
+                if format.clicked() {
+                    self.show_format_dropdown = !self.show_format_dropdown;
+                    self.recent_show_dropdown = false;
+                    self.show_filter_dropdown = false;
+                    self.views_show_dropdown = false;
+                    self.show_ai_assistant_popup = false;
+                    self.show_settings_popup = false;
+                }
+                self.format_button_rect = Some(format.rect);
+
+                // Status and format details describe a document. Do not let
+                // them survive into the empty workspace.
+                let format_status = self.selected_log_format_status();
+                let context = document_status_context(format_status.as_deref(), &self.status);
                 let status_width = if compact { 160.0 } else { 300.0 };
-                ui.add_sized(
-                    egui::vec2(status_width, icons::ACTION_HEIGHT),
-                    egui::Label::new(RichText::new(&context).small().color(self.theme.text_muted))
-                        .truncate(),
-                )
-                .on_hover_text(&context);
+                let status_response = egui::Frame::new()
+                    .fill(self.theme.log_surface)
+                    .stroke(Stroke::new(1.0, self.theme.border))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(6, 1))
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            egui::vec2(status_width - 12.0, icons::ACTION_HEIGHT - 2.0),
+                            egui::Label::new(
+                                RichText::new(if context.is_empty() {
+                                    "No file open"
+                                } else {
+                                    context.as_str()
+                                })
+                                .small()
+                                .color(self.theme.text_muted),
+                            )
+                            .truncate(),
+                        )
+                    })
+                    .response;
+                if !context.is_empty() {
+                    status_response.on_hover_text(&context);
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    ui.separator();
                     let settings_resp = icons::action_button(
                         ui,
                         Icon::Settings,
                         if compact { "" } else { "Settings" },
-                        self.theme.text,
+                        self.theme.text_muted,
                         "Open settings",
                     );
                     if settings_resp.clicked() {
+                        self.show_format_dropdown = false;
                         self.show_settings_popup = !self.show_settings_popup;
                         self.recent_show_dropdown = false;
                         self.show_filter_dropdown = false;
@@ -1185,7 +1610,7 @@ impl LogotomyApp {
                         if self.mcp_enabled {
                             self.theme.accent
                         } else {
-                            self.theme.text
+                            self.theme.text_muted
                         },
                         if self.mcp_enabled {
                             "AI Assistant connection is ready"
@@ -1194,6 +1619,7 @@ impl LogotomyApp {
                         },
                     );
                     if ai.clicked() {
+                        self.show_format_dropdown = false;
                         self.show_ai_assistant_popup = !self.show_ai_assistant_popup;
                         self.recent_show_dropdown = false;
                         self.show_filter_dropdown = false;
@@ -1213,12 +1639,20 @@ impl LogotomyApp {
                         let file_name = self.tabs[i].doc.file_name.clone();
                         let mcp_serving = self.tabs[i].mcp_serving;
                         let is_active = self.active == Some(i) && self.active_loader.is_none();
-                        egui::Frame::new()
+                        let tab_frame = egui::Frame::new()
                             .fill(if is_active {
-                                ui.visuals().selection.bg_fill
+                                self.theme.raised_surface
                             } else {
-                                self.theme.surface
+                                self.theme.log_surface
                             })
+                            .stroke(Stroke::new(
+                                1.0,
+                                if is_active {
+                                    self.theme.border
+                                } else {
+                                    self.theme.log_surface
+                                },
+                            ))
                             .corner_radius(4.0)
                             .inner_margin(egui::Margin::symmetric(5, 1))
                             .show(ui, |ui| {
@@ -1231,7 +1665,13 @@ impl LogotomyApp {
                                         self.theme.text_muted,
                                     ));
                                     if ui
-                                        .selectable_label(is_active, &file_name)
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(&file_name).color(self.theme.text),
+                                            )
+                                            .frame_when_inactive(false)
+                                            .min_size(egui::Vec2::ZERO),
+                                        )
                                         .on_hover_text(format!("Switch to {file_name}"))
                                         .clicked()
                                     {
@@ -1260,12 +1700,19 @@ impl LogotomyApp {
                                         self.theme.text,
                                         format!("Close {file_name}"),
                                     )
-                                    .clicked()
-                                    {
-                                        close_request = Some(i);
-                                    }
-                                });
+                                        .clicked()
+                                        {
+                                            close_request = Some(i);
+                                        }
+                                    });
                             });
+                        if is_active {
+                            let rect = tab_frame.response.rect;
+                            ui.painter().line_segment(
+                                [rect.left_bottom(), rect.right_bottom()],
+                                Stroke::new(1.5, self.theme.accent),
+                            );
+                        }
                     }
                     // Loading files appear as their own (new) log tab, appended
                     // after the fully-loaded tabs. They aren't real LogTabs yet,
@@ -1274,16 +1721,27 @@ impl LogotomyApp {
                         let is_active = self.active_loader == Some(li);
                         egui::Frame::new()
                             .fill(if is_active {
-                                ui.visuals().selection.bg_fill
+                                self.theme.raised_surface
                             } else {
-                                self.theme.surface
+                                self.theme.log_surface
                             })
+                            .stroke(Stroke::new(1.0, self.theme.border))
                             .corner_radius(4.0)
                             .inner_margin(egui::Margin::symmetric(5, 1))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
-                                    if ui.selectable_label(is_active, &loader.name).clicked() {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(&loader.name).color(self.theme.text),
+                                            )
+                                            .frame_when_inactive(false)
+                                            .min_size(egui::Vec2::ZERO),
+                                        )
+                                        .on_hover_text(format!("Focus loading {}", loader.name))
+                                        .clicked()
+                                    {
                                         info!("focused loading tab {} ({})", li, loader.name);
                                         self.active_loader = Some(li);
                                         self.active = None;
@@ -1320,7 +1778,7 @@ impl LogotomyApp {
         // with the number of filters. Hidden when popped out.
         if let Some(idx) = self.active {
             let tab = &mut self.tabs[idx];
-            if !tab.stale && !tab.timeline_detached {
+            if !tab.stale && !tab.timeline_detached && !tab.log_focus_mode {
                 let height = timeline::panel_height(tab);
                 egui::Panel::top("timeline_panel")
                     .exact_size(height)
@@ -1371,61 +1829,229 @@ impl LogotomyApp {
             }
 
             if self.loaders.is_empty() && self.tabs.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add(icons::app_logo(ui.ctx(), 52.0));
-                        ui.add_space(12.0);
-                        ui.label(
-                            RichText::new("Open a log to start investigating")
-                                .size(22.0)
-                                .strong()
-                                .color(self.theme.text),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("Drop any log or .zip to start")
-                                .size(14.0)
-                                .color(self.theme.text_muted),
-                        );
-                        ui.add_space(14.0);
-                        // `available_width` shrinks as the centered column's
-                        // minimum rect grows, so use the full scope width for
-                        // the button row and center its main axis explicitly.
-                        let buttons_width = ui.max_rect().width();
+                // Keep the intro's complete drop target in one bounded region.
+                // The width is comfortable on desktop and contracts with a
+                // narrow window instead of relying on unrelated spacer rows.
+                let content_width = ui.available_width().min(520.0);
+                let shortcut = open_file_shortcut();
+                let recent: Vec<PathBuf> = self
+                    .settings
+                    .recent_files()
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect();
+                let open_error = self.open_error.clone();
+                let mut open_recent = None;
+                let mut retry_path = None;
+                let intro = ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
                         ui.allocate_ui_with_layout(
-                            egui::vec2(buttons_width, icons::ACTION_HEIGHT),
-                            egui::Layout::left_to_right(egui::Align::Center)
-                                .with_main_align(egui::Align::Center)
-                                .with_cross_align(egui::Align::Center),
+                            egui::vec2(content_width, ui.available_height()),
+                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
                             |ui| {
-                                if icons::primary_action_button(
-                                    ui,
-                                    Icon::OpenFile,
-                                    "Open file",
-                                    self.theme.accent,
-                                    "Choose a log, text, or ZIP file (Cmd/Ctrl+O)",
-                                )
-                                .clicked()
-                                {
-                                    self.open_file_dialog();
-                                }
-                                if !self.settings.recent_files().is_empty() {
-                                    let recent = icons::action_button(
-                                        ui,
-                                        Icon::History,
-                                        "Recent files",
-                                        self.theme.text,
-                                        "Open a recently used file",
-                                    );
-                                    if recent.clicked() {
-                                        self.recent_button_rect = Some(recent.rect);
-                                        self.recent_show_dropdown = true;
-                                    }
-                                }
+                                egui::Frame::new()
+                                    .fill(if hovering_files {
+                                        self.theme.accent.linear_multiply(0.10)
+                                    } else {
+                                        self.theme.surface
+                                    })
+                                    .corner_radius(10.0)
+                                    .inner_margin(egui::Margin::symmetric(24, 22))
+                                    .show(ui, |ui| {
+                                        ui.set_width(content_width - 48.0);
+                                        ui.vertical_centered(|ui| {
+                                            ui.add(icons::app_mark(
+                                                ui.ctx(),
+                                                44.0,
+                                                self.theme.text_muted,
+                                            ));
+
+                                            ui.add_space(18.0);
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Drop a log or .zip here, or use {shortcut}"
+                                                ))
+                                                .size(14.0)
+                                                .color(self.theme.text_muted),
+                                            );
+                                            ui.add_space(14.0);
+                                            if icons::action_button(
+                                                ui,
+                                                Icon::OpenFile,
+                                                "Open file",
+                                                self.theme.text,
+                                                &format!(
+                                                    "Choose a log, text, or ZIP file ({shortcut})"
+                                                ),
+                                            )
+                                            .clicked()
+                                            {
+                                                self.open_file_dialog();
+                                            }
+
+                                            if let Some((_, error)) = &open_error {
+                                                ui.add_space(10.0);
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "Could not open file: {error}"
+                                                    ))
+                                                    .small()
+                                                    .color(self.theme.warning),
+                                                );
+                                                if icons::action_button(
+                                                    ui,
+                                                    Icon::Reset,
+                                                    "Retry",
+                                                    self.theme.warning,
+                                                    "Try opening the file again",
+                                                )
+                                                .clicked()
+                                                {
+                                                    retry_path = open_error
+                                                        .as_ref()
+                                                        .map(|(path, _)| path.clone());
+                                                }
+                                            }
+
+                                            if !recent.is_empty() {
+                                                ui.add_space(18.0);
+                                                ui.separator();
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new("Recent files")
+                                                        .small()
+                                                        .strong()
+                                                        .color(self.theme.text_muted),
+                                                );
+                                                for (recent_index, path) in
+                                                    recent.iter().enumerate()
+                                                {
+                                                    let exists = path.exists();
+                                                    let file_name = path
+                                                        .file_name()
+                                                        .map(|name| {
+                                                            name.to_string_lossy().to_string()
+                                                        })
+                                                        .unwrap_or_else(|| {
+                                                            path.display().to_string()
+                                                        });
+                                                    let parent = path
+                                                        .parent()
+                                                        .map(|parent| parent.display().to_string())
+                                                        .unwrap_or_default();
+                                                    let text_color = if exists {
+                                                        self.theme.text
+                                                    } else {
+                                                        self.theme.text_muted
+                                                    };
+                                                    let row_rect = egui::Rect::from_min_size(
+                                                        ui.available_rect_before_wrap().min,
+                                                        egui::vec2(ui.available_width(), 38.0),
+                                                    );
+                                                    let row_hovered = ui.input(|input| {
+                                                        input.pointer.hover_pos().is_some_and(
+                                                            |pos| row_rect.contains(pos),
+                                                        )
+                                                    });
+                                                    if row_hovered {
+                                                        ui.painter().rect_filled(
+                                                            row_rect,
+                                                            egui::CornerRadius::same(4),
+                                                            ui.visuals()
+                                                                .widgets
+                                                                .hovered
+                                                                .weak_bg_fill,
+                                                        );
+                                                        ui.output_mut(|output| {
+                                                            output.cursor_icon =
+                                                                egui::CursorIcon::PointingHand;
+                                                        });
+                                                    }
+                                                    ui.scope_builder(
+                                                        egui::UiBuilder::new()
+                                                            .max_rect(row_rect)
+                                                            .layout(egui::Layout::left_to_right(
+                                                                egui::Align::Center,
+                                                            )),
+                                                        |ui| {
+                                                            ui.horizontal(|ui| {
+                                                                ui.add(icons::icon_image(
+                                                                    ui.ctx(),
+                                                                    Icon::Log,
+                                                                    14.0,
+                                                                    text_color,
+                                                                ));
+                                                                ui.vertical(|ui| {
+                                                                    ui.add(
+                                                                        egui::Label::new(
+                                                                        RichText::new(&file_name)
+                                                                            .size(12.0)
+                                                                            .color(text_color),
+                                                                        )
+                                                                        .selectable(false),
+                                                                    );
+                                                                    ui.add(
+                                                                        egui::Label::new(
+                                                                            RichText::new(if exists {
+                                                                                parent.clone()
+                                                                            } else {
+                                                                                format!("Missing · {parent}")
+                                                                            })
+                                                                            .small()
+                                                                            .color(self.theme.text_muted),
+                                                                        )
+                                                                        .selectable(false),
+                                                                    );
+                                                                });
+                                                            });
+                                                        },
+                                                    );
+                                                    ui.advance_cursor_after_rect(row_rect);
+                                                    // Register the row after its visual children so
+                                                    // this single hit target wins over the icon and
+                                                    // text widgets beneath the pointer.
+                                                    let response = ui.interact(
+                                                        row_rect,
+                                                        ui.id()
+                                                            .with(("intro_recent", recent_index)),
+                                                        egui::Sense::click(),
+                                                    );
+                                                    if exists && response.clicked() {
+                                                        open_recent = Some(path.clone());
+                                                    }
+                                                    if !exists {
+                                                        response.on_hover_text("File is missing");
+                                                    }
+                                                }
+                                                ui.add_space(4.0);
+                                                let recent_button = icons::action_button(
+                                                    ui,
+                                                    Icon::History,
+                                                    "View all recent files",
+                                                    self.theme.text,
+                                                    "Open the full recent-file history",
+                                                );
+                                                if recent_button.clicked() {
+                                                    self.recent_button_rect =
+                                                        Some(recent_button.rect);
+                                                    self.recent_show_dropdown = true;
+                                                }
+                                            }
+                                        });
+                                    });
                             },
                         );
-                    });
-                });
+                    },
+                );
+                if let Some(path) = open_recent {
+                    self.open_file(path);
+                } else if let Some(path) = retry_path {
+                    self.open_file(path);
+                }
+                let _ = intro;
                 return;
             }
 
@@ -1447,11 +2073,12 @@ impl LogotomyApp {
                             .unwrap_or_default();
                         let mut confirmed = false;
                         let mut cancelled = false;
-                        egui::Window::new("Remove filter")
-                            .collapsible(false)
-                            .resizable(false)
-                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                            .show(ui.ctx(), |ui| {
+                        overlay::modal(
+                            ui.ctx(),
+                            "remove_filter_modal",
+                            "Remove filter",
+                            egui::vec2(420.0, 220.0),
+                            |ui| {
                                 ui.label(
                                     RichText::new(format!("Remove filter '{}'?", filter_text))
                                         .size(14.0),
@@ -1496,7 +2123,8 @@ impl LogotomyApp {
                                         confirmed = true;
                                     }
                                 });
-                            });
+                            },
+                        );
                         if confirmed {
                             tab.remove_filter_with_undo(ki);
                             tab.pending_filter_removal = None;
@@ -1517,11 +2145,12 @@ impl LogotomyApp {
                     } else {
                         let mut confirmed = false;
                         let mut cancelled = false;
-                        egui::Window::new("Clear filters")
-                            .collapsible(false)
-                            .resizable(false)
-                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                            .show(ui.ctx(), |ui| {
+                        overlay::modal(
+                            ui.ctx(),
+                            "clear_filters_modal",
+                            "Clear filters",
+                            egui::vec2(420.0, 220.0),
+                            |ui| {
                                 ui.label(
                                     RichText::new(format!("Remove all {n} filters?")).size(14.0),
                                 );
@@ -1565,7 +2194,8 @@ impl LogotomyApp {
                                         confirmed = true;
                                     }
                                 });
-                            });
+                            },
+                        );
                         if confirmed {
                             tab.clear_all_filters();
                             tab.pending_clear_filters = false;
@@ -1621,34 +2251,121 @@ impl LogotomyApp {
                     return;
                 }
 
+                if tab.log_focus_mode {
+                    let focused_id = tab.focused_log_view_id;
+                    if tab.detached_views.contains(&ViewTab::Log(focused_id)) {
+                        tab.log_focus_mode = false;
+                    } else {
+                        ui.horizontal(|ui| {
+                            if icons::action_button(
+                                ui,
+                                Icon::Collapse,
+                                "Exit focus",
+                                self.theme.text,
+                                "Restore the timeline and dock layout (Escape)",
+                            )
+                            .clicked()
+                            {
+                                tab.log_focus_mode = false;
+                            }
+                            ui.label(
+                                RichText::new("Focused Log View")
+                                    .small()
+                                    .color(self.theme.text_muted),
+                            );
+                        });
+                        if tab.log_focus_mode {
+                            let interacted = log_view_pointer_interaction(ui);
+                            show_log_view(ui, tab, &self.theme, focused_id, interacted);
+                            return;
+                        }
+                    }
+                }
+
                 let mut dock_state = std::mem::replace(&mut tab.dock_state, DockState::new(vec![]));
                 let dock_path = tab.doc.path.clone();
+                let empty_main_drop_rect = (!dock_state
+                    .iter_all_tabs()
+                    .any(|(_, view)| matches!(view, ViewTab::Log(_))))
+                .then(|| {
+                    let available = ui.available_rect_before_wrap();
+                    let rect = egui::Rect::from_min_max(
+                        available.min,
+                        egui::pos2(
+                            available.max.x,
+                            available.min.y + available.height() * 0.78,
+                        ),
+                    );
+                    ui.allocate_rect(rect, egui::Sense::hover());
+                    ui.painter().rect_stroke(
+                        rect.shrink(6.0),
+                        6.0,
+                        Stroke::new(1.0, self.theme.border),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Drag a Log View here to restore the top panel",
+                        egui::FontId::proportional(14.0),
+                        self.theme.text_muted,
+                    );
+                    rect
+                });
                 let mut tab_viewer = TabViewer {
                     tab,
                     theme: &self.theme,
+                    allow_popout: true,
+                    return_to_main: None,
+                    dock_container: None,
                 };
-                let dock_style = egui_dock::Style::from_egui(
-                    ui.ctx()
-                        .style_of(egui::Theme::from_dark_mode(self.dark_mode))
-                        .as_ref(),
-                );
-                let tab_bar_height = dock_style.tab_bar.height;
+                let dock_style = crate::ui::theme::dock_style(self.dark_mode);
                 DockArea::new(&mut dock_state)
                     .id(dock_area_id(dock_path.as_os_str()))
                     .style(dock_style)
-                    // Log and Pinned are detachable, not closable. Their
-                    // resize affordances are rendered by TabViewer and below.
-                    .show_close_buttons(false)
+                    // Only non-final Log Views are closeable. The dock's
+                    // standalone add button creates Log Views in the clicked leaf.
+                    .show_close_buttons(true)
+                    .show_add_buttons(true)
+                    // The main workspace has two fixed homes. Dragging is
+                    // still supported for tab ordering and drop-on-tab, but
+                    // the dock library must not offer arbitrary split sides.
+                    .allowed_splits(egui_dock::AllowedSplits::None)
                     .show_leaf_close_all_buttons(false)
                     .show_inside(ui, &mut tab_viewer);
-                draw_dock_resize_buttons(
-                    ui,
-                    &dock_state,
-                    tab_bar_height,
-                    tab_viewer.tab,
-                    &self.theme,
-                );
+                drop(tab_viewer);
+                if let Some(add_path) = tab.pending_add_log_view.take() {
+                    if dock_state.leaf(add_path).is_ok() {
+                        dock_state.set_focused_node_and_surface(add_path);
+                        let new_id = tab.add_log_view();
+                        let new_tab = ViewTab::Log(new_id);
+                        dock_state.push_to_focused_leaf(new_tab);
+                        if let Some(new_path) = dock_state.find_tab(&new_tab) {
+                            let _ = dock_state.set_active_tab(new_path);
+                        }
+                    }
+                }
+                let main_drop_rect = empty_main_drop_rect.or_else(|| {
+                    dock_state.iter_all_tabs().find_map(|(path, view)| {
+                        matches!(view, ViewTab::Log(_))
+                            .then(|| dock_state[path.node_path()].rect())
+                            .flatten()
+                    })
+                });
                 tab.dock_state = dock_state;
+                if !tab.main_dock_layout_is_legal() {
+                    tab.normalize_main_dock_layout();
+                }
+                if let Some(main_drop_rect) = main_drop_rect {
+                    show_cross_window_log_drop_marker(
+                        ui,
+                        tab,
+                        &self.theme,
+                        LogDockTarget::Main,
+                        None,
+                        main_drop_rect,
+                    );
+                }
                 // A Timeline pin click first lets Log consume its scroll
                 // request, then switches this dock leaf to the matching card.
                 tab.finish_pin_navigation();
@@ -1672,7 +2389,7 @@ impl LogotomyApp {
             }
 
             for view_tab in detached_views {
-                let viewport_id = egui::ViewportId::from_hash_of((path.as_os_str(), view_tab));
+                let viewport_id = detached_viewport_id(path.as_os_str(), view_tab);
 
                 // Re-resolve tab index by path to avoid stale indices after tab reorder/removal
                 let resolved_idx = self
@@ -1680,31 +2397,40 @@ impl LogotomyApp {
                     .iter()
                     .position(|t| t.doc.path == path)
                     .unwrap_or(active_tab_idx);
+                // A preceding detached viewport in this frame may have
+                // received the last Log View from this source window. The
+                // iteration snapshot still contains it, but recreating its
+                // dock state here would resurrect an empty native window.
+                if view_tab != ViewTab::Timeline
+                    && !self.tabs[resolved_idx].detached_views.contains(&view_tab)
+                {
+                    continue;
+                }
                 self.viewport_map
-                    .entry(viewport_id)
-                    .or_insert((resolved_idx, view_tab));
+                    .insert(viewport_id, (resolved_idx, view_tab));
 
-                let title = match view_tab {
-                    ViewTab::Timeline => "Timeline",
-                    ViewTab::Log => "Log",
-                    ViewTab::Pinned => "Pinned",
-                    ViewTab::Templates => "Templates",
-                };
-
-                let dark_mode = self.dark_mode;
+                let title = detached_view_title(
+                    &file_name,
+                    view_tab,
+                    self.tabs[resolved_idx].log_view_count(),
+                    match view_tab {
+                        ViewTab::Log(id) => self.tabs[resolved_idx]
+                            .log_views
+                            .get(&id)
+                            .map(|view| view.display_number),
+                        _ => None,
+                    },
+                );
 
                 ui.ctx().show_viewport_immediate(
                     viewport_id,
                     egui::ViewportBuilder::default()
-                        .with_title(format!("{} - {}", title, file_name))
+                        .with_title(title)
                         .with_inner_size([600.0, 400.0]),
                     |ctx, _| {
-                        // Apply theme visuals
-                        ctx.set_visuals(if dark_mode {
-                            egui::Visuals::dark()
-                        } else {
-                            egui::Visuals::light()
-                        });
+                        // Apply the same token-driven styling in native child windows.
+                        let resolved_dark_mode =
+                            crate::ui::theme::apply_egui_theme(ctx, self.settings.theme_mode);
 
                         // Re-resolve tab index by path to avoid stale indices
                         let resolved_idx = self
@@ -1713,18 +2439,86 @@ impl LogotomyApp {
                             .position(|t| t.doc.path == path)
                             .unwrap_or(active_tab_idx);
                         self.viewport_map
-                            .entry(viewport_id)
-                            .or_insert((resolved_idx, view_tab));
+                            .insert(viewport_id, (resolved_idx, view_tab));
 
+                        let mut permanently_close = None;
+                        let mut return_to_main = false;
+                        let mut dock_transfer_closed_viewport = false;
                         if let Some(&(tab_idx, view_tab_inner)) =
                             self.viewport_map.get(&viewport_id)
                         {
                             if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                                let viewport_focused =
+                                    ctx.input(|input| input.viewport().focused.unwrap_or(false));
                                 egui::CentralPanel::default().show(
                                     ctx,
                                     |ui| match view_tab_inner {
                                         ViewTab::Timeline => timeline::show(ui, tab, &self.theme),
-                                        ViewTab::Log => log_view::show(ui, tab, &self.theme),
+                                        ViewTab::Log(id) => {
+                                            let mut detached_state = tab
+                                                .detached_dock_states
+                                                .remove(&view_tab_inner)
+                                                .unwrap_or_else(|| {
+                                                    DockState::new(vec![ViewTab::Log(id)])
+                                                });
+                                            let dock_style =
+                                                crate::ui::theme::dock_style(resolved_dark_mode);
+                                            let mut viewer = TabViewer {
+                                                tab,
+                                                theme: &self.theme,
+                                                allow_popout: false,
+                                                return_to_main: Some(&mut return_to_main),
+                                                dock_container: Some(view_tab_inner),
+                                            };
+                                            DockArea::new(&mut detached_state)
+                                                .id(egui::Id::new((
+                                                    "detached_dock_area",
+                                                    viewport_id,
+                                                )))
+                                                .style(dock_style)
+                                                .show_close_buttons(true)
+                                                .show_add_buttons(true)
+                                                .show_leaf_close_all_buttons(false)
+                                                .show_inside(ui, &mut viewer);
+                                            drop(viewer);
+                                            if let Some(add_path) = tab.pending_add_log_view.take()
+                                            {
+                                                if detached_state.leaf(add_path).is_ok() {
+                                                    detached_state
+                                                        .set_focused_node_and_surface(add_path);
+                                                    let new_id = tab.add_log_view();
+                                                    let new_tab = ViewTab::Log(new_id);
+                                                    detached_state.push_to_focused_leaf(new_tab);
+                                                    if let Some(new_path) =
+                                                        detached_state.find_tab(&new_tab)
+                                                    {
+                                                        let _ =
+                                                            detached_state.set_active_tab(new_path);
+                                                    }
+                                                }
+                                            }
+                                            tab.detached_dock_states
+                                                .insert(view_tab_inner, detached_state);
+                                            let moved = show_cross_window_log_drop_marker(
+                                                ui,
+                                                tab,
+                                                &self.theme,
+                                                LogDockTarget::Detached(view_tab_inner),
+                                                Some(view_tab_inner),
+                                                ui.max_rect(),
+                                            );
+                                            if moved
+                                                && !tab.detached_views.contains(&view_tab_inner)
+                                            {
+                                                dock_transfer_closed_viewport = true;
+                                            }
+                                            if !tab.log_views.contains_key(&id) {
+                                                permanently_close = Some(id);
+                                            }
+                                            if viewport_focused {
+                                                tab.focus_log_view(id);
+                                            }
+                                        }
                                         ViewTab::Pinned => pin_viewer::show(ui, tab, &self.theme),
                                         ViewTab::Templates => {
                                             template_view::show(ui, tab, &self.theme)
@@ -1732,6 +2526,30 @@ impl LogotomyApp {
                                     },
                                 );
                             }
+                        }
+
+                        if dock_transfer_closed_viewport {
+                            self.viewport_map.remove(&viewport_id);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            return;
+                        }
+
+                        if return_to_main {
+                            self.viewport_map.remove(&viewport_id);
+                            if let Some(tab) = self.tabs.get_mut(resolved_idx) {
+                                tab.just_closed_viewports.push(view_tab);
+                            }
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            return;
+                        }
+
+                        if let Some(id) = permanently_close {
+                            self.viewport_map.remove(&viewport_id);
+                            if let Some(tab) = self.tabs.get_mut(resolved_idx) {
+                                tab.close_log_view(id);
+                            }
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            return;
                         }
 
                         // Handle close: clean up state so the window isn't recreated
@@ -1743,7 +2561,6 @@ impl LogotomyApp {
                                     if view_tab_inner == ViewTab::Timeline {
                                         tab.timeline_detached = false;
                                     } else {
-                                        tab.detached_views.remove(&view_tab_inner);
                                         tab.just_closed_viewports.push(view_tab_inner);
                                     }
                                 }
@@ -1755,17 +2572,42 @@ impl LogotomyApp {
             }
         }
 
+        // A cross-window move can empty a *different* detached source window
+        // (for example, dropping its final Log View into the main window).
+        // It will not be rendered again, so explicitly close its native
+        // viewport instead of leaving an empty OS window behind.
+        let emptied_detached_viewports: Vec<_> = self
+            .viewport_map
+            .iter()
+            .filter_map(|(viewport_id, (tab_idx, view_tab))| {
+                (matches!(view_tab, ViewTab::Log(_))
+                    && self
+                        .tabs
+                        .get(*tab_idx)
+                        .is_some_and(|tab| !tab.detached_views.contains(view_tab)))
+                .then_some(*viewport_id)
+            })
+            .collect();
+        for viewport_id in emptied_detached_viewports {
+            self.viewport_map.remove(&viewport_id);
+            ui.ctx()
+                .send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+        }
+
+        if self.tabs.iter().any(|tab| tab.active_log_drag.is_some()) {
+            ui.ctx().request_repaint();
+            for viewport_id in self.viewport_map.keys().copied() {
+                ui.ctx().request_repaint_of(viewport_id);
+            }
+        }
+
         self.views_dropdown_ui(ui);
+        format_menu::show(self, ui.ctx());
 
         if self.recent_show_dropdown {
             if let Some(button_rect) = self.recent_button_rect {
-                let popup_id = egui::Id::new("recent_popup");
-                let area = egui::Area::new(popup_id)
-                    .current_pos(button_rect.left_bottom())
-                    .order(egui::Order::Foreground)
-                    .fixed_pos(button_rect.left_bottom());
-                let area_resp = area.show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                let popup =
+                    overlay::popover(ui.ctx(), "recent_popup", button_rect.left_bottom(), |ui| {
                         ui.set_min_width(260.0);
                         ui.set_max_width(360.0);
                         ui.label(RichText::new("Recent Files").strong().size(14.0));
@@ -1807,10 +2649,11 @@ impl LogotomyApp {
                                                 color,
                                             ));
                                             let resp = ui.add(
-                                                egui::Label::new(
+                                                egui::Button::new(
                                                     RichText::new(&label).color(color).size(12.0),
                                                 )
-                                                .sense(egui::Sense::click()),
+                                                .frame_when_inactive(false)
+                                                .min_size(egui::Vec2::ZERO),
                                             );
                                             let path_hint = path.to_string_lossy();
                                             let resp = resp.on_hover_text(if exists {
@@ -1848,48 +2691,21 @@ impl LogotomyApp {
                             }
                         }
                     });
-                });
-                let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
-                let click = ui.input(|input| {
-                    input
-                        .pointer
-                        .any_click()
-                        .then(|| input.pointer.interact_pos())
-                        .flatten()
-                });
-                if popup_should_close(escape, click, button_rect, area_resp.response.rect) {
+                if popup.should_close() {
                     self.recent_show_dropdown = false;
                 }
             }
         }
 
-        if hovering_files {
-            let screen = ui.ctx().globally_used_rect();
-            let painter = ui.ctx().layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("drop_overlay"),
-            ));
-            painter.rect_filled(screen, egui::CornerRadius::same(0), self.theme.overlay_bg);
-            painter.text(
-                screen.center(),
-                egui::Align2::CENTER_CENTER,
-                "Drop to open\n.log, .txt, .zip, or any text file",
-                egui::FontId::proportional(28.0),
-                Color32::WHITE,
-            );
-            ui.ctx().request_repaint();
-        }
-
         self.zip_import_ui(ui.ctx());
 
         if self.show_new_filter_popup {
-            let mut open = self.show_new_filter_popup;
-            egui::Window::new("Save filter set")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
+            overlay::modal(
+                ui.ctx(),
+                "save_filter_modal",
+                "Save filter set",
+                egui::vec2(460.0, 180.0),
+                |ui| {
                     ui.label("Give the active filters a name you can recognize later.");
                     ui.horizontal(|ui| {
                         ui.label("Name:");
@@ -1938,20 +2754,17 @@ impl LogotomyApp {
                             }
                         }
                     });
-                });
-            if !open {
-                self.show_new_filter_popup = false;
-            }
+                },
+            );
         }
 
         if self.show_rename_filter_popup {
-            let mut open = self.show_rename_filter_popup;
-            egui::Window::new(format!("Rename ‘{}’", self.rename_filter_target))
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
+            overlay::modal(
+                ui.ctx(),
+                "rename_filter_modal",
+                format!("Rename ‘{}’", self.rename_filter_target),
+                egui::vec2(460.0, 180.0),
+                |ui| {
                     ui.label("Choose a clear name for this saved filter set.");
                     ui.horizontal(|ui| {
                         ui.label("New name:");
@@ -2003,10 +2816,8 @@ impl LogotomyApp {
                             }
                         }
                     });
-                });
-            if !open {
-                self.show_rename_filter_popup = false;
-            }
+                },
+            );
         }
 
         if self.show_filter_dropdown {
@@ -2019,26 +2830,27 @@ impl LogotomyApp {
         self.goto_ui(ui.ctx());
         self.cheat_sheet_ui(ui.ctx());
         self.close_save_error_ui(ui.ctx());
+        self.sidecar_recovery_ui(ui.ctx());
 
         settings::show_settings_popup(ui, self);
         settings::show_integrate_popup(ui, self);
         custom_date::show_custom_date_popup(self, ui.ctx());
+        record_format::show_record_format_popup(self, ui.ctx());
 
         // MCP error popup — show when MCP server fails to start
         if self.mcp_error_popup.is_some() {
-            let mut open = true;
             let mut dismissed = false;
             let error_msg = self.mcp_error_popup.clone().unwrap_or_default();
-            egui::Window::new("AI Assistant connection error")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
+            overlay::modal(
+                ui.ctx(),
+                "mcp_error_modal",
+                "AI Assistant connection error",
+                egui::vec2(560.0, 220.0),
+                |ui| {
                     ui.label(RichText::new(&error_msg).size(14.0));
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new("Check that another Logotomy connection is not already using the local port, then try again.")
+                        RichText::new("Check that another Haystack connection is not already using the local port, then try again.")
                             .small()
                             .color(self.theme.text_muted),
                     );
@@ -2054,8 +2866,9 @@ impl LogotomyApp {
                     {
                         dismissed = true;
                     }
-                });
-            if !open || dismissed {
+                },
+            );
+            if dismissed {
                 self.mcp_error_popup = None;
             }
         }
@@ -2066,11 +2879,12 @@ impl LogotomyApp {
             } else {
                 let mut restore = false;
                 let mut keep_notes = false;
-                egui::Window::new("Log changed on disk")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ui.ctx(), |ui| {
+                overlay::modal(
+                    ui.ctx(),
+                    "restore_positions_modal",
+                    "Log changed on disk",
+                    egui::vec2(500.0, 200.0),
+                    |ui| {
                         ui.label("This log changed since the investigation was saved.");
                         ui.label("Restore the previous line positions and pins?");
                         ui.add_space(10.0);
@@ -2099,7 +2913,8 @@ impl LogotomyApp {
                                 restore = true;
                             }
                         });
-                    });
+                    },
+                );
                 if restore || keep_notes {
                     if let Some(tab) = self.tabs.get_mut(idx) {
                         tab.confirm_sidecar_restore(restore);
@@ -2112,7 +2927,7 @@ impl LogotomyApp {
 
         // Toast notification (self-dismissing, ~5s). Tracked screenshots
         // deliberately show the steady-state UI rather than transient hints.
-        if std::env::var_os("LOGOTOMY_SCREENSHOT_PATH").is_some() {
+        if std::env::var_os("HAYSTACK_SCREENSHOT_PATH").is_some() {
             for tab in &mut self.tabs {
                 tab.pending_toast = None;
             }
@@ -2151,7 +2966,7 @@ impl LogotomyApp {
                 }
             }
         }
-        if std::env::var_os("LOGOTOMY_SCREENSHOT_PATH").is_none() {
+        if std::env::var_os("HAYSTACK_SCREENSHOT_PATH").is_none() {
             self.poll_sidecar_saves();
         }
         request_tracked_screenshot(
@@ -2168,23 +2983,100 @@ impl LogotomyApp {
 
     fn update_detached(&mut self, viewport_id: egui::ViewportId, ui: &mut egui::Ui) {
         // Apply theme visuals
-        let visuals = if self.dark_mode {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        };
-        ui.ctx().set_visuals(visuals);
+        self.dark_mode = crate::ui::theme::apply_egui_theme(ui.ctx(), self.settings.theme_mode);
+        overlay::mark_background_input(ui.ctx(), overlay::interactive_surface_open(self, ui.ctx()));
 
+        let mut permanently_close = None;
+        let mut return_to_main = false;
+        let mut dock_transfer_closed_viewport = false;
         // Look up which tab + view this viewport belongs to
         if let Some(&(tab_idx, view_tab)) = self.viewport_map.get(&viewport_id) {
             if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                egui::CentralPanel::default().show(ui, |ui| match view_tab {
-                    ViewTab::Timeline => timeline::show(ui, tab, &self.theme),
-                    ViewTab::Log => log_view::show(ui, tab, &self.theme),
-                    ViewTab::Pinned => pin_viewer::show(ui, tab, &self.theme),
-                    ViewTab::Templates => template_view::show(ui, tab, &self.theme),
-                });
+                if permanently_close.is_none() && !return_to_main {
+                    egui::CentralPanel::default().show(ui, |ui| match view_tab {
+                        ViewTab::Timeline => timeline::show(ui, tab, &self.theme),
+                        ViewTab::Log(id) => {
+                            let mut detached_state = tab
+                                .detached_dock_states
+                                .remove(&view_tab)
+                                .unwrap_or_else(|| DockState::new(vec![ViewTab::Log(id)]));
+                            let dock_style = crate::ui::theme::dock_style(self.dark_mode);
+                            let mut viewer = TabViewer {
+                                tab,
+                                theme: &self.theme,
+                                allow_popout: false,
+                                return_to_main: Some(&mut return_to_main),
+                                dock_container: Some(view_tab),
+                            };
+                            DockArea::new(&mut detached_state)
+                                .id(egui::Id::new(("detached_dock_area", viewport_id)))
+                                .style(dock_style)
+                                .show_close_buttons(true)
+                                .show_add_buttons(true)
+                                .show_leaf_close_all_buttons(false)
+                                .show_inside(ui, &mut viewer);
+                            drop(viewer);
+                            if let Some(add_path) = tab.pending_add_log_view.take() {
+                                if detached_state.leaf(add_path).is_ok() {
+                                    detached_state.set_focused_node_and_surface(add_path);
+                                    let new_id = tab.add_log_view();
+                                    let new_tab = ViewTab::Log(new_id);
+                                    detached_state.push_to_focused_leaf(new_tab);
+                                    if let Some(new_path) = detached_state.find_tab(&new_tab) {
+                                        let _ = detached_state.set_active_tab(new_path);
+                                    }
+                                }
+                            }
+                            tab.detached_dock_states.insert(view_tab, detached_state);
+                            let moved = show_cross_window_log_drop_marker(
+                                ui,
+                                tab,
+                                &self.theme,
+                                LogDockTarget::Detached(view_tab),
+                                Some(view_tab),
+                                ui.max_rect(),
+                            );
+                            if moved && !tab.detached_views.contains(&view_tab) {
+                                dock_transfer_closed_viewport = true;
+                            }
+                            if !tab.log_views.contains_key(&id) {
+                                permanently_close = Some(id);
+                            }
+                        }
+                        ViewTab::Pinned => pin_viewer::show(ui, tab, &self.theme),
+                        ViewTab::Templates => template_view::show(ui, tab, &self.theme),
+                    });
+                }
             }
+        }
+
+        if dock_transfer_closed_viewport {
+            self.viewport_map.remove(&viewport_id);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        if return_to_main {
+            let tab_idx = self.viewport_map.get(&viewport_id).map(|(idx, _)| *idx);
+            let view_tab = self.viewport_map.get(&viewport_id).map(|(_, view)| *view);
+            self.viewport_map.remove(&viewport_id);
+            if let (Some(tab_idx), Some(view_tab)) = (tab_idx, view_tab) {
+                if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                    tab.just_closed_viewports.push(view_tab);
+                }
+            }
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        if let Some(id) = permanently_close {
+            if let Some((tab_idx, _)) = self.viewport_map.remove(&viewport_id) {
+                if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                    tab.close_log_view(id);
+                }
+            }
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
         }
 
         // Handle close: clean up state so the window isn't recreated
@@ -2194,7 +3086,6 @@ impl LogotomyApp {
                     if view_tab == ViewTab::Timeline {
                         tab.timeline_detached = false;
                     } else {
-                        tab.detached_views.remove(&view_tab);
                         tab.just_closed_viewports.push(view_tab);
                     }
                 }
@@ -2209,18 +3100,19 @@ fn saved_filter_row_id(filter_name: &str) -> egui::Id {
 }
 
 fn dock_area_id(path: &std::ffi::OsStr) -> egui::Id {
-    egui::Id::new(("logotomy_dock_area", path))
+    egui::Id::new(("haystack_dock_area", path))
 }
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui;
     use std::ffi::OsStr;
 
-    use eframe::egui;
-
     use super::{
-        compact_top_bar, dock_area_id, dropdown_visibility, popup_should_close,
-        saved_filter_row_id, TopPanelDropdown,
+        compact_top_bar, detached_view_title, detached_viewport_id, dock_area_id,
+        dock_tab_accessibility_label, dock_tab_action_rects, dock_tab_title,
+        document_status_context, dropdown_visibility, saved_filter_row_id, should_request_repaint,
+        LogViewId, TopPanelDropdown, ViewTab,
     };
 
     #[test]
@@ -2247,29 +3139,21 @@ mod tests {
     }
 
     #[test]
-    fn popup_dismissal_handles_escape_and_outside_clicks() {
-        let button = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(30.0, 28.0));
-        let popup = egui::Rect::from_min_size(egui::pos2(10.0, 42.0), egui::vec2(200.0, 160.0));
+    fn empty_workspace_hides_stale_document_status() {
+        assert_eq!(
+            document_status_context(None, "Loaded `old.log` — 42 lines"),
+            ""
+        );
+        assert_eq!(
+            document_status_context(Some("format: plain · date: none"), ""),
+            "format: plain · date: none"
+        );
+    }
 
-        assert!(popup_should_close(true, None, button, popup));
-        assert!(!popup_should_close(
-            false,
-            Some(egui::pos2(20.0, 20.0)),
-            button,
-            popup
-        ));
-        assert!(!popup_should_close(
-            false,
-            Some(egui::pos2(30.0, 60.0)),
-            button,
-            popup
-        ));
-        assert!(popup_should_close(
-            false,
-            Some(egui::pos2(400.0, 400.0)),
-            button,
-            popup
-        ));
+    #[test]
+    fn completed_loader_requests_a_follow_up_frame() {
+        assert!(should_request_repaint(false, true, false, false));
+        assert!(!should_request_repaint(false, false, false, false));
     }
 
     #[test]
@@ -2294,5 +3178,76 @@ mod tests {
             dock_area_id(OsStr::new("iOS-1K.log")),
             dock_area_id(OsStr::new("android.log"))
         );
+    }
+
+    #[test]
+    fn detached_log_viewport_ids_are_stable_and_distinct_per_view() {
+        let path = OsStr::new("iOS-1K.log");
+        let first = ViewTab::Log(LogViewId::INITIAL);
+        let second = ViewTab::Log(LogViewId(LogViewId::INITIAL.0 + 1));
+        assert_eq!(
+            detached_viewport_id(path, first),
+            detached_viewport_id(path, first)
+        );
+        assert_ne!(
+            detached_viewport_id(path, first),
+            detached_viewport_id(path, second)
+        );
+    }
+
+    #[test]
+    fn detached_titles_include_filename_and_view_identity() {
+        let first = ViewTab::Log(LogViewId::INITIAL);
+        assert_eq!(
+            detached_view_title("server.log", first, 1, Some(1)),
+            "server.log · Log View"
+        );
+        assert_eq!(
+            detached_view_title("server.log", first, 2, Some(7)),
+            "server.log · Log View 7"
+        );
+        assert_eq!(
+            detached_view_title("server.log", ViewTab::Timeline, 2, None),
+            "server.log · Timeline"
+        );
+    }
+
+    #[test]
+    fn dock_tab_headers_reserve_only_detach_actions() {
+        let tab_rect = egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(100.0, 24.0));
+        let log = ViewTab::Log(LogViewId::INITIAL);
+        for tab in [log, ViewTab::Pinned, ViewTab::Templates] {
+            assert!(dock_tab_title(tab, 1, Some(1)).ends_with("     "));
+            let popout = dock_tab_action_rects(tab, tab_rect, false).unwrap();
+            assert!(tab_rect.contains_rect(popout));
+            assert!(popout.center().x > tab_rect.center().x);
+        }
+        assert_eq!(dock_tab_title(ViewTab::Timeline, 1, None), "Timeline");
+        assert!(dock_tab_action_rects(ViewTab::Timeline, tab_rect, false).is_none());
+    }
+
+    #[test]
+    fn multiple_log_tab_titles_are_numbered_and_actions_avoid_close_button() {
+        let tab = ViewTab::Log(LogViewId::INITIAL);
+        assert_eq!(dock_tab_title(tab, 1, Some(1)).trim(), "Log");
+        assert_eq!(dock_tab_title(tab, 2, Some(7)).trim(), "Log 7");
+
+        let tab_rect = egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(140.0, 24.0));
+        let popout = dock_tab_action_rects(tab, tab_rect, true).unwrap();
+        assert!(popout.right() <= tab_rect.right() - 11.0);
+    }
+
+    #[test]
+    fn log_tab_accessibility_copy_explains_actions_and_final_view_invariant() {
+        let tab = ViewTab::Log(LogViewId::INITIAL);
+        let only = dock_tab_accessibility_label(tab, 1, Some(1));
+        assert!(only.starts_with("Log tab."));
+        assert!(only.contains("Add another Log View"));
+        assert!(only.contains("cannot be closed"));
+
+        let multiple = dock_tab_accessibility_label(tab, 2, Some(7));
+        assert!(multiple.starts_with("Log 7 tab."));
+        assert!(multiple.contains("separate window"));
+        assert!(multiple.contains("close this Log View"));
     }
 }

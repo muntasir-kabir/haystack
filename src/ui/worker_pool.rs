@@ -35,7 +35,7 @@ impl WorkerPool {
             .map(|index| {
                 let shared = std::sync::Arc::clone(&shared);
                 std::thread::Builder::new()
-                    .name(format!("logotomy-worker-{index}"))
+                    .name(format!("haystack-worker-{index}"))
                     .spawn(move || loop {
                         let job = {
                             let mut state = shared.state.lock().unwrap();

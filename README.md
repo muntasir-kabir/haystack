@@ -1,19 +1,19 @@
 <div align="center">
-  <img src="src/ui/icons/logotomy_256.png" alt="logotomy icon" width="112" height="112">
+  <img src="src/ui/icons/haystack_256.png" alt="Haystack icon" width="112" height="112">
 
-  # logotomy
+  # Haystack
 
-  Surgically extracting the chaos from giant, mind-numbing log files—giving developers clear visual cues and enabling AI agents to process data in a highly token-efficient manner.
+  Stop searching for the needle. We sift through giant, mind-numbing log files to give developers clear visual cues, while feeding AI agents the highly compressed, token-efficient data they need to process the chaos.
 
   <p>
-    <a href="https://github.com/muntasir-kabir/logotomy/releases">Download</a> ·
+    <a href="https://github.com/muntasir-kabir/haystack/releases">Download</a> ·
     <a href="UserGuide.md">User guide</a> ·
     <a href="docs/mcp.md">MCP server</a> ·
     <a href="feature.md">Feature inventory</a>
   </p>
 
   <p>
-    <a href="https://github.com/muntasir-kabir/logotomy/actions/workflows/rust.yml"><img src="https://github.com/muntasir-kabir/logotomy/actions/workflows/rust.yml/badge.svg" alt="CI status"></a>
+    <a href="https://github.com/muntasir-kabir/haystack/actions/workflows/rust.yml"><img src="https://github.com/muntasir-kabir/haystack/actions/workflows/rust.yml/badge.svg" alt="CI status"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
     <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-orange.svg" alt="Built with Rust"></a>
   </p>
@@ -22,8 +22,14 @@
 <div align="center">
   <table>
     <tr>
-      <td><img src="screen-dark.png" width="420" alt="logotomy in dark theme showing a log timeline, filter lanes, and virtualized log view"></td>
-      <td><img src="screen-light.png" width="420" alt="logotomy in light theme showing a log timeline, filter lanes, and virtualized log view"></td>
+      <td><img src="screen-dark.png" width="420" alt="Haystack in dark theme showing a log timeline, filter lanes, and virtualized log view"></td>
+      <td><img src="screen-light.png" width="420" alt="Haystack in light theme showing a log timeline, filter lanes, and virtualized log view"></td>
+    </tr>
+  </table>
+  <table>
+    <tr>
+      <td><img src="screen-multiple-logs-dark.png" width="420" alt="Haystack in dark theme showing two numbered Log View tabs for one shared file"></td>
+      <td><img src="screen-multiple-logs.png" width="420" alt="Haystack in light theme showing two numbered Log View tabs for one shared file"></td>
     </tr>
   </table>
 </div>
@@ -37,18 +43,22 @@ Does anyone really read long logs anymore?
 **CHEERS!**
 
 
-_:The rest of this README was written with AI assistance:_
+*:The rest of this README was written with AI assistance:*
 
 
 
-## Why logotomy?
+## Why Haystack?
 
 Large logs are not just long text files. They are timelines, repeated event shapes, bursts,
 gaps, and a handful of lines that explain the whole incident.
 
-logotomy loads a file, detects what it can, mines recurring templates, and puts the structure
+Haystack loads a file, detects what it can, mines recurring templates, and puts the structure
 on screen. Add a few keywords, see where they cluster, jump to an occurrence, inspect its
 context, and keep the useful lines around while you investigate.
+
+The application UI uses the embedded **Inter Regular** typeface. Log content in the Log View and
+pin surfaces uses the embedded **Space Mono** typeface so the source remains easy to scan and
+align.
 
 It is deliberately a desktop tool, not a hosted log platform. There is no ingestion pipeline,
 no account, no dashboard backend, and no claim that a heuristic can replace your judgment.
@@ -77,6 +87,8 @@ is where it went wrong”** quickly.
 ### Explore the incident visually
 
 - Open multiple files in tabs and drag files directly onto the window.
+- Open multiple independent Log Views of one file in dock tabs or native windows while sharing its filters, timeline, pins, parser, and live-tail document.
+- **FIX:** Multi-window Log View tab docking now shows cross-window drop targets, restores an empty main window's top Log panel on drop, and closes a detached window after its final Log View moves away.
 - Browse a virtualized log view with line numbers, template IDs, inline match highlights,
   selection, context, pins, and notes.
 - Add up to 20 keyword filters; matching runs in the background and filters are color-coded.
@@ -88,7 +100,7 @@ is where it went wrong”** quickly.
 ### Give AI assistants a local, structured view of the log
 
 The same binary includes an [MCP (Model Context Protocol) server](docs/mcp.md). Agents configure
-one `logotomy --mcp` stdio command. It can load files independently or attach, with a temporary
+one `haystack --mcp` stdio command. It can load files independently or attach, with a temporary
 session ID, to the file already open in the GUI—so visual and programmatic investigation share
 the same document without adding a temporary server to the agent.
 
@@ -105,7 +117,7 @@ Available tools include:
 
 ## Install
 
-Download the latest native installer from [GitHub Releases](https://github.com/muntasir-kabir/logotomy/releases):
+Download the latest native installer from [GitHub Releases](https://github.com/muntasir-kabir/haystack/releases):
 
 | Platform | Package |
 | --- | --- |
@@ -121,8 +133,8 @@ SHA-256 checksums. If you prefer to build from source, see below.
 You need a current [Rust toolchain](https://rustup.rs/) (Rust 1.85+ is used by the project docs).
 
 ```bash
-git clone https://github.com/muntasir-kabir/logotomy.git
-cd logotomy
+git clone https://github.com/muntasir-kabir/haystack.git
+cd haystack
 
 # Build and run the GUI in release mode
 cargo run --release
@@ -132,7 +144,7 @@ cargo build --release
 ```
 
 The default build includes the GUI and MCP server. The resulting binary is
-`target/release/logotomy` (or `logotomy.exe` on Windows).
+`target/release/haystack` (or `haystack.exe` on Windows).
 
 For a headless MCP-only build:
 
@@ -163,8 +175,8 @@ Configure one stdio server for standalone and GUI-assisted work:
 ```json
 {
   "mcpServers": {
-    "logotomy": {
-      "command": "/absolute/path/to/logotomy",
+    "haystack": {
+      "command": "/absolute/path/to/haystack",
       "args": ["--mcp"]
     }
   }
@@ -177,7 +189,7 @@ calls `attach_gui_session` with the temporary ID; no MCP configuration changes. 
 provides the log, so no `log_id` is needed. A useful approach is to read user findings with
 `get_analysis`, explore log shape with summaries and targeted searches, narrow a hypothesis with
 filters or `trim`, and post evidence-backed root-cause conclusions with `add_analysis`.
-Logotomy exposes MCP only over stdio and uses authenticated private local IPC for GUI routing.
+Haystack exposes MCP only over stdio and uses authenticated private local IPC for GUI routing.
 
 For protocol details, tool arguments, ranges, filtering semantics, and a manual JSON-RPC smoke
 test, see [`docs/mcp.md`](docs/mcp.md).
@@ -206,7 +218,7 @@ length of an individual line at 2,000 characters; the underlying mapped data rem
 
 ## Project status and boundaries
 
-logotomy is an active, opinionated tool—not a finished observability platform. It currently
+Haystack is an active, opinionated tool—not a finished observability platform. It currently
 focuses on local inspection and keyword-driven exploration. Regex filters, export/reporting,
 persistent filter sets, merged multi-file timelines, and MCP prompts are not implemented
 yet. See the [feature inventory](feature.md) for the current implementation and deliberate next
@@ -248,8 +260,15 @@ changes should include a regression test where practical.
 
 ## License
 
-logotomy is released under the [MIT License](LICENSE).
+Haystack is released under the [MIT License](LICENSE).
+
+### Embedded fonts and attribution
 
 The log text view embeds [Space Mono](https://fonts.google.com/specimen/Space+Mono) by The Space
 Mono Project Authors under the [SIL Open Font License 1.1](https://openfontlicense.org/). The font
 license and original files are included in `src/ui/fonts/Space_Mono/`.
+
+The application UI embeds [Inter](https://rsms.me/inter/) Regular by The Inter Project Authors,
+created by Rasmus Andersson / RSMS, under the [SIL Open Font License 1.1](https://openfontlicense.org/).
+The original Inter Regular font file and license are included in `src/ui/fonts/Inter/`. Inter is a
+trademark of Rasmus Andersson.

@@ -4,16 +4,17 @@
 //! optional `ms`, `ampm`), a sample log line to verify against, and a name.
 //! The window live-verifies the regex against the sample and shows the parsed
 //! components. On "Add", the format is saved to
-//! `~/.logotomy/custom_date_format_list.json` and is used (alongside the
+//! `~/.haystack/custom_date_format_list.json` and is used (alongside the
 //! built-in families) when files are opened.
 
 use eframe::egui;
 use egui::{Color32, RichText};
 
-use logotomy::core::settings::Settings;
-use logotomy::core::time::CustomDateFormat;
+use haystack::core::settings::Settings;
+use haystack::core::time::CustomDateFormat;
 
-use crate::ui::app::model::LogotomyApp;
+use crate::ui::app::model::HaystackApp;
+use crate::ui::app::overlay;
 use crate::ui::icons::{self, Icon};
 
 /// Success green, tuned to read well on both light and dark surfaces.
@@ -26,7 +27,7 @@ fn success_color(bg: Color32) -> Color32 {
 }
 
 /// Show the "Custom Date Recognizers" modal (drawn at the app level).
-pub fn show_custom_date_popup(app: &mut LogotomyApp, ctx: &egui::Context) {
+pub fn show_custom_date_popup(app: &mut HaystackApp, ctx: &egui::Context) {
     if !app.show_custom_date_popup {
         return;
     }
@@ -38,14 +39,12 @@ pub fn show_custom_date_popup(app: &mut LogotomyApp, ctx: &egui::Context) {
         app.theme.bg,
     );
 
-    let mut open = true;
-    egui::Window::new("Custom date recognizers")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(true)
-        .default_width(620.0)
-        .default_height(580.0)
-        .show(ctx, |ui| {
+    overlay::modal(
+        ctx,
+        "custom_date_modal",
+        "Custom date recognizers",
+        egui::vec2(620.0, 580.0),
+        |ui| {
             ui.label(
                 RichText::new(
                     "Custom recognizers are tried together with the built-in date formats \
@@ -129,10 +128,18 @@ pub fn show_custom_date_popup(app: &mut LogotomyApp, ctx: &egui::Context) {
             );
             match def.preview(&app.cd_sample) {
                 Ok(Some(comps)) => {
-                    ui.label(RichText::new(comps.describe()).monospace().color(success_color(bg)));
+                    ui.label(
+                        RichText::new(comps.describe())
+                            .monospace()
+                            .color(success_color(bg)),
+                    );
                 }
                 Ok(None) => {
-                    ui.label(RichText::new("Regex did not match the sample line.").monospace().color(warning));
+                    ui.label(
+                        RichText::new("Regex did not match the sample line.")
+                            .monospace()
+                            .color(warning),
+                    );
                 }
                 Err(e) => {
                     ui.label(RichText::new(e).monospace().color(warning));
@@ -160,7 +167,7 @@ pub fn show_custom_date_popup(app: &mut LogotomyApp, ctx: &egui::Context) {
                     "Enter a name and a pattern that matches the sample line"
                 },
             )
-                .clicked()
+            .clicked()
             {
                 app.custom_date_formats.push(def);
                 Settings::save_custom_date_formats(&app.custom_date_formats);
@@ -209,15 +216,13 @@ pub fn show_custom_date_popup(app: &mut LogotomyApp, ctx: &egui::Context) {
             {
                 app.show_custom_date_popup = false;
             }
-        });
-    if !open {
-        app.show_custom_date_popup = false;
-    }
+        },
+    );
 }
 /// Render the saved-formats list; returns the index selected for removal.
 fn saved_formats_ui(
     ui: &mut egui::Ui,
-    app: &mut LogotomyApp,
+    app: &mut HaystackApp,
     text_muted: Color32,
 ) -> Option<usize> {
     if app.custom_date_formats.is_empty() {

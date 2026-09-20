@@ -19,17 +19,17 @@ fn main() {
         let mut res = winres::WindowsResource::new();
         res.set_icon(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/assets/icons/logotomy.ico"
+            "/assets/icons/haystack.ico"
         ));
         res.set(
             "FileDescription",
-            "logotomy — high-performance log analyzer",
+            "Haystack — high-performance log analyzer",
         );
-        res.set("ProductName", "logotomy");
+        res.set("ProductName", "Haystack");
         res.set("ProductVersion", "0.1.0");
         res.set("FileVersion", "0.1.0");
         res.set("LegalCopyright", "Copyright (c) 2026 MK");
-        res.set("OriginalFilename", "logotomy.exe");
+        res.set("OriginalFilename", "haystack.exe");
         if let Err(e) = res.compile() {
             // Non-fatal: the NSIS installer icon and eframe runtime window icon
             // still apply even if the static .exe icon fails to embed.

@@ -25,7 +25,7 @@ mod syslog;
 use std::ops::Range;
 use std::sync::Arc;
 
-use chrono::{DateTime, NaiveDateTime};
+use chrono::{DateTime, Datelike, Local, NaiveDateTime};
 
 pub use apache::Apache;
 pub use custom::{CustomDateFormat, CustomTimeFormat, TimeComponents};
@@ -55,6 +55,14 @@ pub trait TimeFormat: Send + Sync {
 
     /// Extract (epoch millis, byte span) from a line, if this family applies.
     fn extract(&self, line: &str) -> Option<(i64, Range<usize>)>;
+
+    /// Recognize the complete timestamp-shaped token even when conversion
+    /// fails (for example, an impossible calendar date). Most families can
+    /// use successful extraction as their structural recognizer; parsers with
+    /// a separate lexical grammar override this method.
+    fn recognize(&self, line: &str) -> Option<Range<usize>> {
+        self.extract(line).map(|(_, span)| span)
+    }
 }
 
 /// All registered time formats, in detection priority order (most common first).
@@ -91,6 +99,40 @@ pub(crate) fn window(line: &str) -> &str {
 pub enum TimeFormatKind {
     BuiltIn(&'static dyn TimeFormat),
     Custom(Arc<CustomTimeFormat>),
+    PinnedYearless(YearlessFamily, YearlessReference),
+}
+
+/// Clock snapshot used for yearless families. Tailing retains the same value
+/// even if the system clock crosses midnight or New Year.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YearlessReference {
+    pub year: i32,
+    pub epoch_seconds: i64,
+    pub roll_back_future: bool,
+}
+
+impl YearlessReference {
+    pub fn now() -> Self {
+        let now = Local::now();
+        Self {
+            year: now.year(),
+            epoch_seconds: now.timestamp(),
+            roll_back_future: true,
+        }
+    }
+
+    pub fn with_explicit_year(mut self, year: i32) -> Self {
+        self.year = year;
+        self.roll_back_future = false;
+        self
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum YearlessFamily {
+    Syslog,
+    LogcatThreadtime,
+    Glog,
 }
 
 impl TimeFormatKind {
@@ -98,6 +140,12 @@ impl TimeFormatKind {
         match self {
             TimeFormatKind::BuiltIn(f) => f.name().to_string(),
             TimeFormatKind::Custom(c) => c.name.clone(),
+            TimeFormatKind::PinnedYearless(family, _) => match family {
+                YearlessFamily::Syslog => "BSD syslog",
+                YearlessFamily::LogcatThreadtime => "logcat threadtime",
+                YearlessFamily::Glog => "glog",
+            }
+            .to_string(),
         }
     }
 
@@ -105,6 +153,40 @@ impl TimeFormatKind {
         match self {
             TimeFormatKind::BuiltIn(f) => f.extract(line),
             TimeFormatKind::Custom(c) => c.extract(line),
+            TimeFormatKind::PinnedYearless(family, reference) => match family {
+                YearlessFamily::Syslog => syslog::extract_at(line, *reference),
+                YearlessFamily::LogcatThreadtime => logcat_threadtime::extract_at(line, *reference),
+                YearlessFamily::Glog => glog::extract_at(line, *reference),
+            },
+        }
+    }
+
+    pub fn recognize(&self, line: &str) -> Option<Range<usize>> {
+        match self {
+            TimeFormatKind::BuiltIn(format) => format.recognize(line),
+            TimeFormatKind::Custom(custom) => custom.recognize(line),
+            TimeFormatKind::PinnedYearless(_, _) => self.extract(line).map(|(_, span)| span),
+        }
+    }
+
+    pub fn pin_yearless(self, reference: YearlessReference) -> Self {
+        match &self {
+            TimeFormatKind::BuiltIn(format) => match format.name() {
+                "BSD syslog" => Self::PinnedYearless(YearlessFamily::Syslog, reference),
+                "logcat threadtime" => {
+                    Self::PinnedYearless(YearlessFamily::LogcatThreadtime, reference)
+                }
+                "glog" => Self::PinnedYearless(YearlessFamily::Glog, reference),
+                _ => self,
+            },
+            _ => self,
+        }
+    }
+
+    pub fn yearless_reference(&self) -> Option<YearlessReference> {
+        match self {
+            Self::PinnedYearless(_, reference) => Some(*reference),
+            _ => None,
         }
     }
 }
@@ -188,6 +270,47 @@ impl TimeDetector {
         } else {
             None
         }
+    }
+
+    /// Choose from structurally prefiltered candidate-header lines. Unlike
+    /// the legacy physical-line percentage vote, two independent valid
+    /// headers are sufficient. Equal evidence is reported as unresolved.
+    pub fn detect_any_from_headers<S: AsRef<str>>(
+        sample: impl Iterator<Item = S>,
+        builtin: &'static [&'static dyn TimeFormat],
+        custom: &[CustomTimeFormat],
+    ) -> Option<(TimeFormatKind, usize, Vec<String>)> {
+        let lines: Vec<S> = sample.take(8_192).collect();
+        let mut scores = builtin
+            .iter()
+            .map(|format| {
+                let kind = TimeFormatKind::BuiltIn(*format);
+                let hits = lines
+                    .iter()
+                    .filter(|line| kind.extract(line.as_ref()).is_some())
+                    .count();
+                (kind, hits)
+            })
+            .chain(custom.iter().cloned().map(|format| {
+                let kind = TimeFormatKind::Custom(Arc::new(format));
+                let hits = lines
+                    .iter()
+                    .filter(|line| kind.extract(line.as_ref()).is_some())
+                    .count();
+                (kind, hits)
+            }))
+            .filter(|(_, hits)| *hits > 0)
+            .collect::<Vec<_>>();
+        scores.sort_by(|left, right| right.1.cmp(&left.1));
+        let (winner, hits) = scores.first().cloned()?;
+        let conflicts = scores
+            .iter()
+            .skip(1)
+            .filter(|(_, other_hits)| *other_hits == hits)
+            .map(|(candidate, _)| candidate.name())
+            .collect::<Vec<_>>();
+        let enough = hits >= 2 || (lines.len() <= 4 && hits == 1);
+        (enough && conflicts.is_empty()).then_some((winner, hits, conflicts))
     }
 
     /// Detect among all built-in families plus the supplied custom formats.
@@ -349,5 +472,31 @@ mod tests {
         let kind = TimeDetector::detect_with_custom(lines.iter(), &[]).unwrap();
         assert!(matches!(kind, TimeFormatKind::BuiltIn(_)));
         assert_eq!(kind.name(), "ISO-8601");
+    }
+
+    #[test]
+    fn pinned_yearless_families_keep_the_document_reference() {
+        let reference = YearlessReference {
+            year: 2024,
+            epoch_seconds: 0,
+            roll_back_future: false,
+        };
+        for (format, line) in [
+            (TimeFormatKind::BuiltIn(&Syslog), "Jan  5 03:22:11 host"),
+            (
+                TimeFormatKind::BuiltIn(&LogcatThreadtime),
+                "01-05 03:22:11.123  1234 5678 I Tag: hi",
+            ),
+            (
+                TimeFormatKind::BuiltIn(&Glog),
+                "I0105 03:22:11.123456 hello",
+            ),
+        ] {
+            let pinned = format.pin_yearless(reference);
+            assert_eq!(pinned.yearless_reference(), Some(reference));
+            let value = pinned.extract(line).unwrap().0;
+            assert_eq!(format_ms(value).get(..4), Some("2024"));
+            assert_eq!(pinned.clone().extract(line).unwrap().0, value);
+        }
     }
 }

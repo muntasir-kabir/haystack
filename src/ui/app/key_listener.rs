@@ -23,6 +23,7 @@ pub(super) enum AppCommand {
     ToggleLane,
     DeleteSelected,
     UndoDelete,
+    ToggleLogFocus,
     ShowHelp,
     ShowPalette,
 }
@@ -169,6 +170,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         name: "Undo deletion",
         category: "Filters & Pins",
         shortcut: Some(egui::KeyboardShortcut::new(COMMAND, egui::Key::Z)),
+        text_safe: false,
+    },
+    CommandSpec {
+        command: AppCommand::ToggleLogFocus,
+        name: "Focus Log View",
+        category: "View",
+        shortcut: None,
         text_safe: false,
     },
     CommandSpec {

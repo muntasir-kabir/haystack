@@ -3,10 +3,10 @@
 use std::ops::Range;
 use std::sync::LazyLock;
 
-use chrono::{Datelike, Local, NaiveDateTime};
+use chrono::{Datelike, NaiveDateTime};
 use regex::Regex;
 
-use super::{window, TimeFormat};
+use super::{window, TimeFormat, YearlessReference};
 
 static RE_LOGCAT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3}").unwrap());
@@ -24,18 +24,22 @@ impl TimeFormat for LogcatThreadtime {
     }
 
     fn extract(&self, line: &str) -> Option<(i64, Range<usize>)> {
-        let m = RE_LOGCAT.find(window(line))?;
-        Some((parse_logcat(m.as_str())?, m.range()))
+        extract_at(line, YearlessReference::now())
     }
+}
+
+pub(super) fn extract_at(line: &str, reference: YearlessReference) -> Option<(i64, Range<usize>)> {
+    let m = RE_LOGCAT.find(window(line))?;
+    Some((parse_logcat_at(m.as_str(), reference)?, m.range()))
 }
 
 /// Logcat `MM-DD HH:MM:SS.mmm` carries no year; assume the current one
 /// (with the same future-rollback as syslog).
-fn parse_logcat(raw: &str) -> Option<i64> {
-    let year = Local::now().year();
+fn parse_logcat_at(raw: &str, reference: YearlessReference) -> Option<i64> {
+    let year = reference.year;
     let with_year = format!("{year}-{raw}");
     let mut n = NaiveDateTime::parse_from_str(&with_year, "%Y-%m-%d %H:%M:%S%.f").ok()?;
-    if n.and_utc().timestamp() > Local::now().timestamp() + 86_400 {
+    if reference.roll_back_future && n.and_utc().timestamp() > reference.epoch_seconds + 86_400 {
         n = n.with_year(year - 1)?;
     }
     Some(n.and_utc().timestamp_millis())
@@ -45,6 +49,7 @@ fn parse_logcat(raw: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::core::time::format_ms;
+    use chrono::Local;
 
     #[test]
     fn matches_positive() {

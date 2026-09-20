@@ -1,4 +1,4 @@
-# logotomy — Feature Inventory
+# Haystack — Feature Inventory
 
 Everything currently implemented, and what's deliberately not (yet).
 
@@ -11,30 +11,32 @@ Everything currently implemented, and what's deliberately not (yet).
 | SIMD line index | one `memchr` pass builds the line-offset table |
 | Real progress reporting | 2 stages (Indexing / Analyzing), byte-accurate %, cancellable |
 | Log format detection | Pluggable recognizer: JSON, CEF, RFC 5424, Apple Unified Logging (`log show`), logcat brief, iOS OSLog console — one file per format (`src/core/format/`), registry-extensible, `plain` fallback |
-| Timestamp detection | Built-in families (ISO-8601, YYYY/MM/DD, BSD syslog, Apache CLF, epoch, logcat threadtime, glog, ISO-8601 12h AM/PM) + user-defined custom recognizers (regex with named groups, live-verified, saved to `~/.logotomy/custom_date_format_list.json`); exact source spans retained compactly for annotation (`src/core/time/`, `src/ui/custom_date/`) |
+| Timestamp detection | Built-in families (ISO-8601, YYYY/MM/DD, BSD syslog, Apache CLF, epoch, logcat threadtime, glog, ISO-8601 12h AM/PM) + user-defined custom recognizers (regex with named groups, live-verified, saved to `~/.haystack/custom_date_format_list.json`); exact source spans retained compactly for annotation (`src/core/time/`, `src/ui/custom_date/`) |
 | Timestamp auto-detection | Pluggable: ISO-8601 (`Z`, offsets, comma/dot millis, space/`T` separator), `YYYY/MM/DD`, syslog `Jan  5`, Apache `10/Oct/2024:13:55:36 -0700`, epoch s/ms, logcat threadtime, glog — one file per family (`src/core/time/`) |
-| Forward-filled timestamps | stack traces & continuation lines inherit previous timestamp |
-| Compact record boundaries | one bit per physical line records explicit timestamp starts, allowing bounded recovery of large multiline records |
+| Record time provenance | Continuations inherit only their owning record's known time; missing/invalid headers reset it and untimed preambles stay unknown |
+| Compact record boundaries | one bit per physical line marks actual record headers independent of timestamp validity, with rank-assisted lookup of large multiline records |
 | Embedded data detection | Registry-based, viewport-scoped detectors for JSON, logfmt/key-value, colon fields, Swift/Foundation/Python/JVM debug values, XML and labeled OpenStep plists, binary plist magic, HTTP, protobuf text, stack traces, and encoded JWT/Base64/hex/PEM; exact source spans, cancellation, and safety limits |
 | Native Drain template mining | fixed-depth parse tree, `<*>` wildcards, per-line template ID, occurrence counts, example line — zero Python |
 | Robustness | CRLF, missing trailing newline, blank lines, invalid UTF-8 (lossy), multi-MB single lines, timeless files |
 | Filter engine | Aho-Corasick, case-sensitive, all filters in a single pass, background thread + cancellation |
-| Timeline bucketing | Exact screen-width viewport re-resolution over a 2048-bucket minimap overview; time domain or line-sequence fallback; sorted per-filter points, exact 2×7px singleton markers, and edge-to-edge full-bucket-width 7/10/13px collision tiers |
+| Timeline bucketing | Source-line axis for every file; exact record-start overview and physical-line filter counts, screen-width viewport re-resolution, exact 2×7px singleton markers, and edge-to-edge full-bucket-width 7/10/13px collision tiers |
 | Timeline lane toggles | Per-filter eye (visible/invisible) toggles + "Everything Else" lane; log view filters to active lanes only; trash icon per lane removes filter with confirmation |
-| Smart axis labels | Shorthand: same hour → `MM:SS.ms`, same date → `HH:MM:SS.ms`, multi-day → full; duration label between ticks |
+| Axis labels | Physical source line numbers; event times do not control positions |
 | Time-window analytics | count-in-window, first/last occurrence helpers |
 
 ## ✅ Desktop GUI (`src/ui/`, egui/eframe)
 
 | Feature | Detail |
 |---|---|
-| Application shell | `LOGotomy` product mark; grouped Open file/Recent/Saved filters/Commands actions; format/date status; AI Assistant state menu; Settings; responsive More menu below 1100px |
+| Application shell | `Haystack` product mark; grouped Open file/Recent/Saved filters/Commands actions; format/date status; AI Assistant state menu; Settings; responsive More menu below 1100px |
 | SVG action system | exhaustive embedded 24×24 `currentColor` outline catalog, aligned compact 22px controls, quiet icon+label and icon-only helpers, action-oriented tooltips, light/dark rendering tests |
 | Drag & drop | drop any file anywhere; clear file-type overlay while hovering files; actionable empty/loading/error states |
 | Open dialog | native picker via `rfd` |
 | Progress bar | per-loading-file card with stage label + % + cancel |
 | Multi-tab | cohesive log-icon tabs with integrated close action, loading spinner, and compact AI status badge; re-dropping an open file focuses its tab |
+| Multiple Log Views | add stable numbered Log Views for one file; each owns selection, scroll, Find, inspectors, and transient row state while document/filter/timeline/pin/template state stays shared; views can dock or detach independently, and the final view cannot be closed |
 | Virtualized log view | renders only visible rows; line # + template ID gutter; filter highlight; color marker per line |
+| Filter occurrence context | Shift-click a log row to center it in a scrollable overlay with the nearest prior and next occurrence from every configured filter; retains log highlighting and embedded-data cues |
 | Source annotations | quiet exact timestamp underlines with raw/normalized-UTC hover actions; background structured-data analysis with font-scaled zero-layout cues, exact underlines, delayed source actions, Tree/Pretty/Raw inspector, frame-oriented trace view, and explicit encoded preview |
 | Log font | embedded Space Mono monospace (SIL OFL 1.1) — log text only, rest of UI stays on default fonts |
 | Log font size controls | A− / A+ buttons in both log view and context panel (8–24px range) |
@@ -47,21 +49,21 @@ Everything currently implemented, and what's deliberately not (yet).
 | Timeline navigation | click → nearest filter match (or approx. position) |
 | Context panel | selected line ± 5 (radius adjustable 1–50), timestamp + template header, jump-to-full-view, clear |
 | Template browser | right panel, mined patterns sorted by frequency, click → example line |
-| Docked/separate views | one conventional External Window action per active dock leaf; closing the child window restores the previous dock layout |
+| Docked/separate views | the dock panel has a standalone add button for Log Views; every numbered Log View, Pinned, and Templates places an External Window action beside the dock-tab title; detached windows are dock panels that retain added tabs/layout, and closing a child window restores its dock location |
 | Dark/light mode | semantic colour palette, theme control in Settings, all panels and SVGs themed with readable secondary text |
 | UX details | title-height Timeline controls with bulk actions moved into the lower filter-label area, single-row Log/Pinned/Templates chrome, pointer cursors, clear empty states, sentence-case copy, Escape/outside-click dismissal, explicit dialog footers |
 | Status bar format readout | shows the active log's detected format + date format (`format: json · date: field-based`) |
 
-## ✅ MCP server (`src/mcp.rs`, `logotomy --mcp`)
+## ✅ MCP server (`src/mcp.rs`, `haystack --mcp`)
 
-Embedded in the same binary and exposed to agents only through `logotomy --mcp` stdio.
+Embedded in the same binary and exposed to agents only through `haystack --mcp` stdio.
 The same stable tool catalog supports standalone file loading and explicit attachment to a live
 GUI with `attach_gui_session`. Modern `server/discover` and initialization-era clients are
 supported across `2024-11-05` through `2026-07-28`. GUI sessions use a random 12-character
 hexadecimal temporary ID,
 authenticated private loopback IPC, a private atomic manifest, and automatic invalidation.
-The server exposes `logotomy://session` and
-`logotomy://guide`, a `session_info` tool, structured result content plus text fallback, output
+The server exposes `haystack://session` and
+`haystack://guide`, a `session_info` tool, structured result content plus text fallback, output
 schemas, and behavioral annotations.
 
 | Tool | Purpose |
@@ -74,7 +76,7 @@ schemas, and behavioral annotations.
 | `find_occurrences` | paginated `[one_based_line_number, epoch_ms\|null]` keyword-hit tuples; supports `offset`, `max_results`, optional `after`/`before` window, `with_filtered_log`, and ASCII `case_sensitive` mode |
 | `get_analysis` / `add_analysis` (GUI mode) | read the user's Pin-tab findings/hypotheses or add an evidenced root-cause analysis card; empty `lines` creates a text-only top card |
 | `summarize_log` | one-call orientation over an optional line/time range: stats, error-ish templates, time gaps, densest minute, plus byte-size budget estimates (`template_size_bytes`, `sequence_estimate_bytes`) |
-| `get_timeline_histogram` | tiny distribution histogram (whole log / keyword / template), optional range |
+| `get_timeline_histogram` | histogram over an optional range; explicit line/time domain and record/physical-line units, with omitted/auto retaining legacy clock behavior |
 | `get_template_anomalies` | rare / first-seen-late / bursty templates, optional range |
 | `get_template` | resolve template ids to `{pattern, count, example_line}`; omit `ids` for all |
 | `get_template_samples` | a few concrete lines per template |
@@ -99,9 +101,9 @@ Match results are cached per (log, keyword, case mode); time params accept RFC33
 
 | Feature | Detail |
 |---|---|
-| Application-wide logging | `log` + `env_logger` crate: GUI logs to stderr, MCP server logs to both stderr and `logotomy.log` |
+| Application-wide logging | `log` + `env_logger` crate: GUI logs to stderr, MCP server logs to both stderr and `haystack.log` |
 | Configurable via `RUST_LOG` | standard env-var filtering: `RUST_LOG=debug`, `RUST_LOG=warn`, etc. |
-| Panic hook | MCP server captures panics with location info to `logotomy.log` |
+| Panic hook | MCP server captures panics with location info to `haystack.log` |
 | Key events logged | file open/close, tab switch, MCP start/stop, filter scan, load errors |
 
 ## ✅ Quality & verification

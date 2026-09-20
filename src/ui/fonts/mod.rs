@@ -1,4 +1,4 @@
-//! Embedded **Space Mono** monospace font — used exclusively for log text.
+//! Embedded UI and log fonts.
 //!
 //! Space Mono (<https://fonts.google.com/specimen/Space+Mono>) is distributed
 //! under the **SIL Open Font License 1.1** — the full license text ships next
@@ -8,11 +8,13 @@
 //! embed the four faces **unmodified**, so the "Space Mono" name restriction
 //! (Reserved Font Name) doesn't apply either.
 //!
-//! The faces are registered under a dedicated named egui family
-//! (`space_mono`) and only the **log text** uses it — the log view, the pin
-//! modal preview, and the pinned-lines panel. The rest of the UI (timeline
-//! axis labels, settings URLs, template panel, …) keeps egui's default fonts.
-//! The embedded bytes live in the binary via `include_bytes!`.
+//! Inter Regular is used for all normal application UI text. It is registered as
+//! the first face in egui's proportional and monospace families, so labels,
+//! buttons, text edits, and explicit non-log monospace UI all use Inter.
+//! Space Mono is registered under a dedicated named egui family (`space_mono`)
+//! and only log content opts into it — the log view, log previews, the pin
+//! modal preview, and the pinned-lines panel. The embedded bytes live in the
+//! binary via `include_bytes!`.
 
 use std::sync::Arc;
 
@@ -24,6 +26,7 @@ const FONT_REGULAR: &str = "space_mono_regular";
 const FONT_BOLD: &str = "space_mono_bold";
 const FONT_ITALIC: &str = "space_mono_italic";
 const FONT_BOLD_ITALIC: &str = "space_mono_bold_italic";
+const FONT_INTER_REGULAR: &str = "inter_regular";
 
 /// Name of the egui family under which the Space Mono faces are registered.
 const LOG_FAMILY_NAME: &str = "space_mono";
@@ -39,11 +42,19 @@ pub fn log_font(size: f32) -> FontId {
     FontId::new(size, log_font_family())
 }
 
-/// Build the [`FontDefinitions`] to install at startup: the four Space Mono
-/// faces registered under the log family, with egui's built-in fonts kept as
-/// glyph fallbacks (Space Mono doesn't cover emoji, box-drawing, …).
+/// Build the [`FontDefinitions`] to install at startup: Inter Regular is the
+/// application-wide UI face, while the four Space Mono faces are registered
+/// under a separate log family. Both families retain egui's built-in glyph
+/// fallbacks for emoji, box-drawing, and other characters they do not cover.
 pub fn font_definitions() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
+
+    fonts.font_data.insert(
+        FONT_INTER_REGULAR.to_owned(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "Inter/Inter-Regular.ttf"
+        ))),
+    );
 
     let faces: [(&str, &'static [u8]); 4] = [
         (
@@ -78,6 +89,21 @@ pub fn font_definitions() -> FontDefinitions {
     log_family.push("NotoEmoji-Regular".to_owned());
     log_family.push("emoji-icon-font".to_owned());
 
+    // Inter Regular is the application-wide UI face. Keep it at the front of both
+    // built-in families so default labels/buttons and explicit `.monospace()`
+    // UI controls do not fall back to egui's Hack or Ubuntu fonts. Log text
+    // uses the named `space_mono` family above and is unaffected by this.
+    let ui_family = vec![
+        FONT_INTER_REGULAR.to_owned(),
+        "Ubuntu-Light".to_owned(),
+        "NotoEmoji-Regular".to_owned(),
+        "emoji-icon-font".to_owned(),
+    ];
+    fonts
+        .families
+        .insert(FontFamily::Proportional, ui_family.clone());
+    fonts.families.insert(FontFamily::Monospace, ui_family);
+
     fonts
 }
 
@@ -90,6 +116,21 @@ pub fn install(ctx: &Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embeds_inter_regular_with_valid_ttf_magic() {
+        let fonts = font_definitions();
+        let data = fonts
+            .font_data
+            .get(FONT_INTER_REGULAR)
+            .expect("Inter Regular is registered");
+        let bytes = data.font.as_ref();
+        assert!(bytes.len() > 1_000, "Inter Regular is unexpectedly small");
+        assert_eq!(&bytes[..4], &[0x00, 0x01, 0x00, 0x00]);
+        // Inter 4.1's static Regular face is distinct from the old 414,676-byte
+        // ExtraLight asset and is 411,640 bytes in the bundled release.
+        assert_eq!(bytes.len(), 411_640, "embedded face is not Inter Regular");
+    }
 
     #[test]
     fn embeds_all_four_space_mono_faces_with_valid_ttf_magic() {
@@ -121,8 +162,19 @@ mod tests {
         // egui's built-in faces are appended as glyph fallbacks.
         assert!(family.iter().any(|n| n == "Hack"));
         assert!(family.iter().any(|n| n == "NotoEmoji-Regular"));
-        // Only the log family references Space Mono; the built-in egui
-        // families must be untouched so the rest of the UI doesn't change.
+        // UI families use Inter Regular and must not reference Space Mono.
+        assert_eq!(
+            fonts.families[&FontFamily::Monospace]
+                .first()
+                .map(String::as_str),
+            Some(FONT_INTER_REGULAR)
+        );
+        assert_eq!(
+            fonts.families[&FontFamily::Proportional]
+                .first()
+                .map(String::as_str),
+            Some(FONT_INTER_REGULAR)
+        );
         assert!(!fonts.families[&FontFamily::Monospace]
             .iter()
             .any(|n| n.starts_with("space_mono")));

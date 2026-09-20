@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use logotomy::core::document::LogDocument;
+use haystack::core::document::LogDocument;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TemplateSort {
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn visible_order_reuses_the_cached_allocation_until_query_changes() {
         let path = std::env::temp_dir().join(format!(
-            "logotomy-template-cache-{}-{}.log",
+            "haystack-template-cache-{}-{}.log",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

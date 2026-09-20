@@ -179,7 +179,10 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 }
 
 fn handle_template_keys(ui: &mut egui::Ui, tab: &mut LogTab, order: &[usize]) {
-    if tab.template_browser.selected_id.is_none() || ui.ctx().egui_wants_keyboard_input() {
+    if tab.template_browser.selected_id.is_none()
+        || ui.ctx().egui_wants_keyboard_input()
+        || crate::ui::app::overlay::background_input_blocked(ui.ctx())
+    {
         return;
     }
     let mut previous_occurrence = false;
