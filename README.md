@@ -3,7 +3,7 @@
 
   # Haystack
 
-  Stop searching for the needle. We sift through giant, mind-numbing log files to give developers clear visual cues, while feeding AI agents the highly compressed, token-efficient data they need to process the chaos.
+  Searching needle in haystack? Haystack can sift through giant, mind-numbing log files to give developers clear visual cues, while feeding AI agents the highly compressed, token-efficient data they need to process the chaos.
 
   <p>
     <a href="https://github.com/muntasir-kabir/haystack/releases">Download</a> ·
@@ -35,8 +35,9 @@
 </div>
 
 Does anyone really read long logs anymore?
+**For us (developers),** friendly visual cues make long log files easier to understand and analyze.
 **For AI agents,** built-in MCP tools keep token usage low and improve understanding.
-**For humans,** developer-friendly visual cues make long log files easier to understand and analyze.
+
 
 **If you are a developer** and this tool is helpful, **star** it, feel free to **contribute**, and share **suggestions** in **issues/comments**. More than 90% of the code is AI-generated anyway, so extending it isn't hard.
 

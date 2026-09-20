@@ -1421,7 +1421,6 @@ fn show_toolbar(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme, _max_visible
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
         ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
         ui.horizontal(|ui| {
-            
             if ui
                 .add_sized(
                     egui::vec2(28.0, TOOLBAR_HEIGHT),
@@ -1432,7 +1431,7 @@ fn show_toolbar(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme, _max_visible
             {
                 tab.log_font_size = (tab.log_font_size - 1.0).max(8.0);
             }
-            
+
             if ui
                 .add_sized(
                     egui::vec2(28.0, TOOLBAR_HEIGHT),

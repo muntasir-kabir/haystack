@@ -1,6 +1,37 @@
 use super::*;
 
 impl LogTab {
+    /// Switch Timeline presentation while keeping Log View in source order.
+    /// Line and Time share one zoom because only their captions differ.
+    pub(crate) fn set_timeline_display_mode(&mut self, mode: TimelineDisplayMode) {
+        if mode == self.timeline_display_mode {
+            return;
+        }
+        if mode != TimelineDisplayMode::Line && self.doc.time_range.is_none() {
+            return;
+        }
+
+        if self.timeline_display_mode.uses_real_time_coordinates() {
+            self.timeline_real_time_zoom = self.timeline_zoom;
+        } else {
+            self.timeline_line_zoom = self.timeline_zoom;
+        }
+
+        self.timeline = if mode.uses_real_time_coordinates() {
+            Timeline::build_real_time_shared_u32(&self.doc, &self.matches, DEFAULT_BUCKETS)
+        } else {
+            Timeline::build_shared_u32(&self.doc, &self.matches, DEFAULT_BUCKETS)
+        };
+        self.timeline_display_mode = mode;
+        self.timeline_zoom = if mode.uses_real_time_coordinates() {
+            self.timeline_real_time_zoom
+        } else {
+            self.timeline_line_zoom
+        };
+        self.timeline_brush_start = None;
+        self.ensure_visible();
+    }
+
     /// Open the transient Shift-click context using the completed filter
     /// indexes. This is deliberately independent of lane visibility: the
     /// popup answers "where are the surrounding occurrences of each filter?"
@@ -350,8 +381,11 @@ impl LogTab {
             matched_filter_doc: Arc::downgrade(&doc),
             matched_filter_doc_key: FilterDocumentKey::of(&doc),
             timeline,
+            timeline_display_mode: TimelineDisplayMode::Line,
             template_browser: TemplateBrowserState::default(),
             timeline_zoom: None,
+            timeline_line_zoom: None,
+            timeline_real_time_zoom: None,
             timeline_brush_start: None,
             selected_lane: None,
             selected_pin: None,
@@ -1446,6 +1480,13 @@ impl LogTab {
 
     /// Re-scan the document for the current filter set in the background.
     pub fn rescan_filters(&mut self) {
+        if self.timeline_display_mode != TimelineDisplayMode::Line && self.doc.time_range.is_none()
+        {
+            self.timeline_display_mode = TimelineDisplayMode::Line;
+            self.timeline_real_time_zoom = None;
+            self.timeline_zoom = self.timeline_line_zoom;
+            self.timeline_brush_start = None;
+        }
         if let Some((_, cancel)) = &self.search_rx {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -1470,6 +1511,7 @@ impl LogTab {
             .then_some(self.timeline_zoom)
             .flatten();
         let current_doc_key = FilterDocumentKey::of(&self.doc);
+        let real_time = self.timeline_display_mode.uses_real_time_coordinates();
         let same_document = self
             .matched_filter_doc
             .upgrade()
@@ -1484,6 +1526,8 @@ impl LogTab {
             self.matched_filter_doc_key = current_doc_key;
             self.timeline = if same_document {
                 self.timeline.base_without_filters()
+            } else if real_time {
+                Timeline::build_real_time_shared_u32(&self.doc, &[], DEFAULT_BUCKETS)
             } else {
                 Timeline::build_u32(&self.doc, &[], DEFAULT_BUCKETS)
             };
@@ -1580,6 +1624,9 @@ impl LogTab {
             );
             let timeline = match timeline_base {
                 Some(base) => base.with_shared_filter_matches(&doc, &matches),
+                None if real_time => {
+                    Timeline::build_real_time_shared_u32(&doc, &matches, DEFAULT_BUCKETS)
+                }
                 None => Timeline::build_shared_u32(&doc, &matches, DEFAULT_BUCKETS),
             };
             if !cancel_worker.load(Ordering::Relaxed) {
@@ -1659,6 +1706,7 @@ impl LogTab {
             .ok()
             .map(Arc::new);
         let old_matches = Arc::clone(&self.matches);
+        let real_time = self.timeline_display_mode.uses_real_time_coordinates();
         let timeline_base = self.timeline.base_without_filters();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1710,7 +1758,13 @@ impl LogTab {
             );
             let timeline = timeline_base
                 .extend_append(&doc, old_line_count, &matches)
-                .unwrap_or_else(|| Timeline::build_shared_u32(&doc, &matches, DEFAULT_BUCKETS));
+                .unwrap_or_else(|| {
+                    if real_time {
+                        Timeline::build_real_time_shared_u32(&doc, &matches, DEFAULT_BUCKETS)
+                    } else {
+                        Timeline::build_shared_u32(&doc, &matches, DEFAULT_BUCKETS)
+                    }
+                });
             if !cancel_worker.load(Ordering::Relaxed) {
                 let _ = tx.send(Ok(FilterScanResult {
                     matches,
@@ -1872,25 +1926,24 @@ impl LogTab {
         if first_line >= self.doc.total_lines() || last_line >= self.doc.total_lines() {
             return;
         }
-        let v0 = match self.timeline.domain {
+        let (v0, v1) = match self.timeline.domain {
             haystack::core::timeline::TimelineDomain::Time { .. } => {
-                // viewport_range can hold a stale index after an MCP doc swap and
-                // exceed the current window — never let ts_at index out of bounds.
-                match self.doc.ts_at_opt(first_line) {
-                    Some(t) if t >= 0 => t,
-                    _ => return,
+                let mut min = i64::MAX;
+                let mut max = i64::MIN;
+                for line in first_line..=last_line {
+                    if let Some(timestamp) = self.doc.ts_at_opt(line).filter(|value| *value >= 0) {
+                        min = min.min(timestamp);
+                        max = max.max(timestamp);
+                    }
                 }
-            }
-            haystack::core::timeline::TimelineDomain::Sequence => first_line as i64,
-        };
-        let v1 = match self.timeline.domain {
-            haystack::core::timeline::TimelineDomain::Time { .. } => {
-                match self.doc.ts_at_opt(last_line) {
-                    Some(t) if t >= 0 => t,
-                    _ => return,
+                if min > max {
+                    return;
                 }
+                (min, max)
             }
-            haystack::core::timeline::TimelineDomain::Sequence => last_line as i64,
+            haystack::core::timeline::TimelineDomain::Sequence => {
+                (first_line as i64, last_line as i64)
+            }
         };
         // Match the shadow renderer: only act when the mapped values are valid.
         if v0 < 0 || v1 < 0 {
@@ -1959,6 +2012,8 @@ impl LogTab {
         // are hidden by the Pin panel rather than discarded.
         self.visible_lines = None;
         self.timeline_zoom = None;
+        self.timeline_line_zoom = None;
+        self.timeline_real_time_zoom = None;
         self.pending_filter_removal = None;
         self.pending_clear_filters = false;
         self.invalidate_all_log_view_embedded_data();
@@ -1999,6 +2054,8 @@ impl LogTab {
         // Reset state.
         self.visible_lines = None;
         self.timeline_zoom = None;
+        self.timeline_line_zoom = None;
+        self.timeline_real_time_zoom = None;
         self.pending_filter_removal = None;
         self.pending_clear_filters = false;
         self.invalidate_all_log_view_embedded_data();
@@ -2024,6 +2081,8 @@ impl LogTab {
         self.rebase_all_log_view_lines(previous_start, self.doc.trim_start);
         self.visible_lines = None;
         self.timeline_zoom = None;
+        self.timeline_line_zoom = None;
+        self.timeline_real_time_zoom = None;
         self.invalidate_all_log_view_embedded_data();
         self.clamp_view_state();
         self.rescan_filters();

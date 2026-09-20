@@ -10,11 +10,17 @@
 //!   --layout NAME          default | detailed | prefixed | json (default: default)
 //!   --date-family NAME     iso | slash | epoch (default: iso)
 //!   --reverse-every N      Move the clock backwards every N records (0 disables)
+//!   --long-delay-every N   Add a 10m..7d gap every N records (default: 50, 0 disables)
 //!   --payload-bytes N      Minimum payload bytes per line (default: 48)
 //!   --seed N               Deterministic seed (default: 20260911)
 
+use chrono::{DateTime, Utc};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+
+const MIN_LONG_DELAY_MS: i64 = 10 * 60 * 1_000;
+const MAX_LONG_DELAY_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+const DEFAULT_LONG_DELAY_EVERY: usize = 50;
 
 #[derive(Clone, Copy)]
 enum Layout {
@@ -38,6 +44,7 @@ struct Config {
     layout: Layout,
     date_family: DateFamily,
     reverse_every: usize,
+    long_delay_every: usize,
     payload_bytes: usize,
     seed: u64,
 }
@@ -51,6 +58,7 @@ impl Default for Config {
             layout: Layout::Default,
             date_family: DateFamily::Iso,
             reverse_every: 0,
+            long_delay_every: DEFAULT_LONG_DELAY_EVERY,
             payload_bytes: 48,
             seed: 20_260_911,
         }
@@ -68,6 +76,7 @@ fn main() {
     let mut rng = Lcg(config.seed);
     let mut records = 0usize;
     let mut bytes = 0usize;
+    let mut accumulated_delay_ms = 0i64;
 
     for physical_line in 0..config.lines {
         let stride = config.continuations + 1;
@@ -75,7 +84,7 @@ fn main() {
         let record = physical_line / stride;
         let text = if is_header {
             records += 1;
-            header_line(&config, record, &mut rng)
+            header_line(&config, record, &mut rng, &mut accumulated_delay_ms)
         } else {
             continuation_line(&config, physical_line, &mut rng)
         };
@@ -105,6 +114,12 @@ fn parse_args() -> Result<Config, String> {
             "--lines" => config.lines = parse_usize(&arg, value(&mut args)?)?,
             "--continuations" => config.continuations = parse_usize(&arg, value(&mut args)?)?,
             "--reverse-every" => config.reverse_every = parse_usize(&arg, value(&mut args)?)?,
+            "--long-delay-every" => {
+                config.long_delay_every = parse_usize(&arg, value(&mut args)?)?;
+                if config.long_delay_every != 0 && config.long_delay_every < 50 {
+                    return Err("--long-delay-every must be 0 or at least 50 (max 20 gaps per 1,000 records)".to_string());
+                }
+            }
             "--payload-bytes" => config.payload_bytes = parse_usize(&arg, value(&mut args)?)?,
             "--seed" => {
                 config.seed = value(&mut args)?
@@ -151,8 +166,16 @@ fn parse_usize(option: &str, value: String) -> Result<usize, String> {
         .map_err(|_| format!("{option} must be an unsigned integer"))
 }
 
-fn header_line(config: &Config, record: usize, rng: &mut Lcg) -> String {
-    let mut millis = 1_789_120_000_000i64 + record as i64 * 37;
+fn header_line(
+    config: &Config,
+    record: usize,
+    rng: &mut Lcg,
+    accumulated_delay_ms: &mut i64,
+) -> String {
+    if let Some(delay_ms) = long_delay(config.long_delay_every, record, rng) {
+        *accumulated_delay_ms += delay_ms;
+    }
+    let mut millis = 1_789_120_000_000i64 + record as i64 * 37 + *accumulated_delay_ms;
     if config.reverse_every > 0 && record > 0 && record % config.reverse_every == 0 {
         millis -= 5_000;
     }
@@ -199,17 +222,25 @@ fn pad_payload(mut value: String, minimum: usize) -> String {
 }
 
 fn timestamp(family: DateFamily, millis: i64) -> String {
-    let seconds = millis.div_euclid(1_000);
-    let sub_ms = millis.rem_euclid(1_000);
-    let second_of_day = seconds.rem_euclid(86_400);
-    let hour = second_of_day / 3_600;
-    let minute = second_of_day / 60 % 60;
-    let second = second_of_day % 60;
     match family {
-        DateFamily::Iso => format!("2026-09-11T{hour:02}:{minute:02}:{second:02}.{sub_ms:03}Z"),
-        DateFamily::Slash => format!("2026/09/11 {hour:02}:{minute:02}:{second:02}.{sub_ms:03}"),
+        DateFamily::Iso => DateTime::<Utc>::from_timestamp_millis(millis)
+            .expect("generated timestamp in range")
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string(),
+        DateFamily::Slash => DateTime::<Utc>::from_timestamp_millis(millis)
+            .expect("generated timestamp in range")
+            .format("%Y/%m/%d %H:%M:%S%.3f")
+            .to_string(),
         DateFamily::Epoch => millis.to_string(),
     }
+}
+
+fn long_delay(every: usize, record: usize, rng: &mut Lcg) -> Option<i64> {
+    if every == 0 || record == 0 || record % every != 0 {
+        return None;
+    }
+    let range = (MAX_LONG_DELAY_MS - MIN_LONG_DELAY_MS + 1) as u64;
+    Some(MIN_LONG_DELAY_MS + (rng.next() % range) as i64)
 }
 
 struct Lcg(u64);
@@ -233,9 +264,11 @@ mod tests {
         let config = Config::default();
         let mut left = Lcg(config.seed);
         let mut right = Lcg(config.seed);
+        let mut left_delay = 0;
+        let mut right_delay = 0;
         assert_eq!(
-            header_line(&config, 0, &mut left),
-            header_line(&config, 0, &mut right)
+            header_line(&config, 0, &mut left, &mut left_delay),
+            header_line(&config, 0, &mut right, &mut right_delay)
         );
         assert!(continuation_line(&config, 1, &mut left).starts_with("    "));
     }
@@ -246,8 +279,28 @@ mod tests {
             layout: Layout::Detailed,
             ..Config::default()
         };
-        let line = header_line(&config, 0, &mut Lcg(config.seed));
+        let mut delay = 0;
+        let line = header_line(&config, 0, &mut Lcg(config.seed), &mut delay);
         assert!(line.contains("C:\\src\\Handler.rs:1"));
         assert!(line.contains(" - [TRACE] - worker-0 "));
+    }
+
+    #[test]
+    fn long_delays_are_bounded_and_sparse() {
+        let mut rng = Lcg(Config::default().seed);
+        let delays: Vec<_> = (0..1_000)
+            .filter_map(|record| long_delay(DEFAULT_LONG_DELAY_EVERY, record, &mut rng))
+            .collect();
+        assert_eq!(delays.len(), 19);
+        assert!(delays
+            .iter()
+            .all(|delay| (MIN_LONG_DELAY_MS..=MAX_LONG_DELAY_MS).contains(delay)));
+    }
+
+    #[test]
+    fn long_delay_timestamp_rolls_over_the_calendar() {
+        let millis = 1_789_120_000_000i64 + 7 * 24 * 60 * 60 * 1_000;
+        assert!(timestamp(DateFamily::Iso, millis).starts_with("2026-09-18T"));
+        assert!(timestamp(DateFamily::Slash, millis).starts_with("2026/09/18 "));
     }
 }

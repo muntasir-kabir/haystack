@@ -267,6 +267,36 @@ pub enum ViewTab {
     Templates,
 }
 
+/// How the Timeline presents and spaces log activity. `Line` and `Time` share
+/// source-line coordinates; `Time` only changes axis and interval captions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimelineDisplayMode {
+    #[default]
+    Line,
+    Time,
+    RealTime,
+}
+
+impl TimelineDisplayMode {
+    pub const ALL: [Self; 3] = [Self::Line, Self::Time, Self::RealTime];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Line => "Line",
+            Self::Time => "Time",
+            Self::RealTime => "Real Time",
+        }
+    }
+
+    pub const fn uses_real_time_coordinates(self) -> bool {
+        matches!(self, Self::RealTime)
+    }
+
+    pub const fn shows_time_labels(self) -> bool {
+        !matches!(self, Self::Line)
+    }
+}
+
 /// A destination for moving one Log View between the main dock and native
 /// detached Log View windows. Pinned and Templates deliberately do not use
 /// this: their main-window homes are fixed lower-dock tabs.
@@ -718,11 +748,17 @@ pub struct LogTab {
     matched_filter_doc: Weak<LogDocument>,
     matched_filter_doc_key: FilterDocumentKey,
     pub timeline: Timeline,
+    /// User-facing Timeline display mode. Log View always remains in source order.
+    pub timeline_display_mode: TimelineDisplayMode,
     /// Cached, per-tab state for the docked Templates browser.
     pub template_browser: TemplateBrowserState,
     /// Zoom window on the timeline: (start_x, end_x) in epoch ms or line index.
     /// None = auto (full range).
     pub timeline_zoom: Option<(i64, i64)>,
+    /// Last zoom for the inactive source-line coordinate system.
+    pub timeline_line_zoom: Option<(i64, i64)>,
+    /// Last zoom for the inactive elapsed-time coordinate system.
+    pub timeline_real_time_zoom: Option<(i64, i64)>,
     /// Pointer x-coordinate where the active Shift-drag timeline brush began.
     /// Stored explicitly because egui's current interact position is not the
     /// drag origin once the pointer moves.
@@ -1361,11 +1397,20 @@ impl LogTab {
                 field_query: self.filter_field_queries.get(idx).cloned().flatten(),
             })
             .collect();
-        let timeline_zoom = self.timeline_zoom.map(|(start, end)| TimelineZoomState {
-            domain: "line".to_string(),
-            start: start.saturating_add(self.doc.trim_start as i64),
-            end: end.saturating_add(self.doc.trim_start as i64),
-        });
+        let timeline_zoom = self
+            .timeline_zoom
+            .map(|(start, end)| match self.timeline.domain {
+                haystack::core::timeline::TimelineDomain::Sequence => TimelineZoomState {
+                    domain: "line".to_string(),
+                    start: start.saturating_add(self.doc.trim_start as i64),
+                    end: end.saturating_add(self.doc.trim_start as i64),
+                },
+                haystack::core::timeline::TimelineDomain::Time { .. } => TimelineZoomState {
+                    domain: "time".to_string(),
+                    start,
+                    end,
+                },
+            });
         let log_views = self
             .log_views
             .values()
@@ -1788,6 +1833,8 @@ impl LogTab {
             };
             (start < end).then_some((start, end))
         });
+        self.timeline_line_zoom = self.timeline_zoom;
+        self.timeline_real_time_zoom = None;
         let restored_views: Vec<_> = state
             .log_views
             .iter()
@@ -4742,6 +4789,98 @@ mod tests {
         assert_eq!(e - s, 1);
         assert_eq!((s, e), (3, 4));
 
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn timeline_modes_preserve_source_order_and_independent_zoom() {
+        let path = write_temp(
+            "2026-07-19T10:00:02.000Z late\n\
+             2026-07-19T10:00:00.000Z early\n\
+             2026-07-19T11:00:00.000Z last\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.context_line = Some(1);
+        tab.timeline_zoom = Some((0, 1));
+
+        tab.set_timeline_display_mode(TimelineDisplayMode::Time);
+        assert_eq!(
+            tab.timeline.domain,
+            haystack::core::timeline::TimelineDomain::Sequence
+        );
+        assert_eq!(tab.timeline_zoom, Some((0, 1)));
+        assert_eq!(tab.context_line, Some(1));
+
+        tab.set_timeline_display_mode(TimelineDisplayMode::RealTime);
+        assert!(matches!(
+            tab.timeline.domain,
+            haystack::core::timeline::TimelineDomain::Time { .. }
+        ));
+        assert_eq!(&*tab.timeline.timestamp_lines, &[1, 0, 2]);
+        assert_eq!(tab.context_line, Some(1));
+        tab.timeline_zoom = Some((tab.doc.ts_at(0), tab.doc.ts_at(2)));
+        let saved = tab.investigation_state();
+        assert_eq!(saved.timeline_zoom.as_ref().unwrap().domain, "time");
+        assert_eq!(
+            saved.timeline_zoom.as_ref().unwrap().start,
+            tab.doc.ts_at(0)
+        );
+        assert_eq!(saved.timeline_zoom.as_ref().unwrap().end, tab.doc.ts_at(2));
+
+        tab.set_timeline_display_mode(TimelineDisplayMode::Line);
+        assert_eq!(
+            tab.timeline.domain,
+            haystack::core::timeline::TimelineDomain::Sequence
+        );
+        assert_eq!(tab.timeline_zoom, Some((0, 1)));
+        assert_eq!(tab.context_line, Some(1));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn timeless_log_rejects_time_display_modes() {
+        let path = write_temp("alpha\nbeta\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        tab.set_timeline_display_mode(TimelineDisplayMode::Time);
+        assert_eq!(tab.timeline_display_mode, TimelineDisplayMode::Line);
+        tab.set_timeline_display_mode(TimelineDisplayMode::RealTime);
+        assert_eq!(tab.timeline_display_mode, TimelineDisplayMode::Line);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn real_time_trim_rebuilds_from_only_remaining_source_lines() {
+        let path = write_temp(
+            "2026-07-19T10:00:00.000Z first\n\
+             2026-07-19T11:00:00.000Z second\n\
+             2026-07-19T12:00:00.000Z third\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let removed_timestamp = tab.doc.ts_at(0);
+        tab.set_timeline_display_mode(TimelineDisplayMode::RealTime);
+        tab.timeline_zoom = Some((removed_timestamp, tab.doc.ts_at(1)));
+
+        tab.handle_trim(TrimAction::TrimLeft(1));
+
+        assert_eq!(tab.doc.total_lines(), 2);
+        assert_eq!(tab.timeline_zoom, None);
+        assert_eq!(tab.timeline_line_zoom, None);
+        assert_eq!(tab.timeline_real_time_zoom, None);
+        assert_eq!(
+            tab.timeline.domain,
+            haystack::core::timeline::TimelineDomain::Time {
+                start_ms: tab.doc.ts_at(0),
+                end_ms: tab.doc.ts_at(1),
+            }
+        );
+        assert!(!tab
+            .timeline
+            .timestamp_lines
+            .iter()
+            .any(|&line| tab.doc.ts_at(line as usize) == removed_timestamp));
         std::fs::remove_file(path).ok();
     }
 

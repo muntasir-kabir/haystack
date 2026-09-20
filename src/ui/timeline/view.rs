@@ -16,7 +16,7 @@ use haystack::core::document::LogDocument;
 use haystack::core::time::format_ms;
 use haystack::core::timeline::TimelineDomain;
 
-use crate::ui::app::model::LogTab;
+use crate::ui::app::model::{LogTab, TimelineDisplayMode};
 use crate::ui::filters as filter_strip;
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::Theme;
@@ -90,19 +90,31 @@ pub fn panel_height(tab: &LogTab) -> f32 {
         + minimap_height()
 }
 
-pub fn show(
-    ui: &mut egui::Ui,
-    tab: &mut LogTab,
-    theme: &Theme,
-) {
-    let (full_start, full_end) = domain_span(&tab.timeline.domain, tab.doc.total_lines());
-    let full_span = (full_end - full_start).max(1);
-    let (view_start, view_end) = effective_zoom(&tab.timeline_zoom, full_start, full_end);
+pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let zoomed = tab.timeline_zoom.is_some();
 
+    let mut requested_mode = tab.timeline_display_mode;
     ui.horizontal(|ui| {
         ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
         filter_strip::add_filter_ui(ui, tab, theme);
+
+        ui.separator();
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for mode in TimelineDisplayMode::ALL {
+            let enabled = mode == TimelineDisplayMode::Line || tab.doc.time_range.is_some();
+            let response = ui.add_enabled(
+                enabled,
+                egui::Button::new(RichText::new(mode.label()).small())
+                    .selected(requested_mode == mode),
+            );
+            if response.clicked() {
+                requested_mode = mode;
+            }
+            if !enabled {
+                response.on_disabled_hover_text("No valid log timestamps were detected");
+            }
+        }
+        ui.spacing_mut().item_spacing.x = 8.0;
 
         if zoomed
             && ui
@@ -181,6 +193,12 @@ pub fn show(
             }
         }
     });
+    if requested_mode != tab.timeline_display_mode {
+        tab.set_timeline_display_mode(requested_mode);
+    }
+    let (full_start, full_end) = domain_span(&tab.timeline.domain, tab.doc.total_lines());
+    let full_span = (full_end - full_start).max(1);
+    let (view_start, view_end) = effective_zoom(&tab.timeline_zoom, full_start, full_end);
     // Everything Else lane only shown when filters exist.
     let n_filter_lanes = tab
         .timeline
@@ -955,8 +973,8 @@ pub fn show(
         }
 
         if let Some((first_line, last_line)) = shadow_first.zip(shadow_last) {
-            let v0 = x_of_line(&tab.doc, &tab.timeline.domain, first_line);
-            let v1 = x_of_line(&tab.doc, &tab.timeline.domain, last_line);
+            let (v0, v1) =
+                axis_bounds_for_line_range(tab, first_line, last_line).unwrap_or((-1, -1));
             if v0 >= 0 && v1 >= 0 {
                 let x0 = x_to_px(v0).max(hist.left());
                 let x1 = x_to_px(v1).min(hist.right());
@@ -1027,39 +1045,54 @@ pub fn show(
         tick_vs.push(v);
     }
 
-    // Compute shorthand labels for Time domain.
-    let labels: Vec<String> = match tab.timeline.domain {
-        TimelineDomain::Time { .. } => {
-            // Determine common prefix depth.
-            let dt0 = chrono::DateTime::from_timestamp_millis(tick_vs[0]);
-            let dt1 = chrono::DateTime::from_timestamp_millis(tick_vs[n_ticks - 1]);
-            match (dt0, dt1) {
-                (Some(d0), Some(d1)) => {
-                    let same_date =
-                        d0.format("%Y-%m-%d").to_string() == d1.format("%Y-%m-%d").to_string();
-                    let same_hour =
-                        same_date && d0.format("%H").to_string() == d1.format("%H").to_string();
-                    tick_vs
-                        .iter()
-                        .map(|&v| {
-                            if let Some(dt) = chrono::DateTime::from_timestamp_millis(v) {
-                                if same_hour {
-                                    dt.format("%M:%S%.3f").to_string()
-                                } else if same_date {
-                                    dt.format("%H:%M:%S%.3f").to_string()
+    let tick_times: Vec<Option<i64>> = tick_vs
+        .iter()
+        .map(|&value| axis_timestamp(tab, value))
+        .collect();
+    // Time labels retain source-line spacing in Time mode and use elapsed
+    // clock spacing in Real Time mode.
+    let labels: Vec<String> = if tab.timeline_display_mode.shows_time_labels() {
+        let first = tick_times.iter().flatten().next().copied();
+        let last = tick_times.iter().flatten().next_back().copied();
+        match first.zip(last) {
+            Some((first, last)) => {
+                let dt0 = chrono::DateTime::from_timestamp_millis(first);
+                let dt1 = chrono::DateTime::from_timestamp_millis(last);
+                match (dt0, dt1) {
+                    (Some(d0), Some(d1)) => {
+                        let same_date =
+                            d0.format("%Y-%m-%d").to_string() == d1.format("%Y-%m-%d").to_string();
+                        let same_hour =
+                            same_date && d0.format("%H").to_string() == d1.format("%H").to_string();
+                        tick_times
+                            .iter()
+                            .map(|value| {
+                                if let Some(dt) =
+                                    value.and_then(chrono::DateTime::from_timestamp_millis)
+                                {
+                                    if same_hour {
+                                        dt.format("%M:%S%.3f").to_string()
+                                    } else if same_date {
+                                        dt.format("%H:%M:%S%.3f").to_string()
+                                    } else {
+                                        dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                                    }
                                 } else {
-                                    dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                                    value.map_or_else(|| "Unknown".to_string(), format_ms)
                                 }
-                            } else {
-                                format_ms(v)
-                            }
-                        })
-                        .collect()
+                            })
+                            .collect()
+                    }
+                    _ => tick_times
+                        .iter()
+                        .map(|value| value.map_or_else(|| "Unknown".to_string(), format_ms))
+                        .collect(),
                 }
-                _ => tick_vs.iter().map(|&v| format_ms(v)).collect(),
             }
+            None => vec!["Unknown".to_string(); tick_vs.len()],
         }
-        TimelineDomain::Sequence => tick_vs.iter().map(|&v| format!("L{}", v + 1)).collect(),
+    } else {
+        tick_vs.iter().map(|&v| format!("L{}", v + 1)).collect()
     };
 
     // Draw tick marks and labels.
@@ -1088,10 +1121,16 @@ pub fn show(
                     .color(theme.axis),
             ),
         );
-        if matches!(tab.timeline.domain, TimelineDomain::Sequence) {
+        if tab.timeline_display_mode == TimelineDisplayMode::Line {
             tick_response.on_hover_text(
                 "L = physical source line; positions follow file order, not elapsed time",
             );
+        } else if let Some(timestamp) = tick_times[i] {
+            tick_response.on_hover_text(format!(
+                "{} · source line L{}",
+                format_ms(timestamp),
+                tab.timeline.nearest_line(&tab.doc, tick_vs[i]).unwrap_or(0) + 1
+            ));
         }
     }
 
@@ -1104,11 +1143,18 @@ pub fn show(
             continue;
         }
         let mid_x = (tick_xs[i - 1] + tick_xs[i]) / 2.0;
-        let delta = tick_vs[i] - tick_vs[i - 1];
-        if delta > 0 {
-            let dur_str = match tab.timeline.domain {
-                TimelineDomain::Time { .. } => format_duration_ms(delta),
-                TimelineDomain::Sequence => format!("Δ {} lines", delta),
+        let delta = if tab.timeline_display_mode.shows_time_labels() {
+            tick_times[i]
+                .zip(tick_times[i - 1])
+                .map(|(next, previous)| next - previous)
+        } else {
+            Some(tick_vs[i] - tick_vs[i - 1])
+        };
+        if let Some(delta) = delta {
+            let dur_str = if tab.timeline_display_mode.shows_time_labels() {
+                format_duration_ms(delta)
+            } else {
+                format!("Δ {} lines", delta)
             };
             // Draw between the label rows
             let dur_y = label_y + 2.0;
@@ -1151,8 +1197,7 @@ pub fn show(
         );
     }
     // Draw zoom window highlight on minimap.
-    let frac_left =
-        ((view_start - full_start) as f64 / full_span as f64).clamp(0.0, 1.0) as f32;
+    let frac_left = ((view_start - full_start) as f64 / full_span as f64).clamp(0.0, 1.0) as f32;
     let frac_right = ((view_end - full_start) as f64 / full_span as f64).clamp(0.0, 1.0) as f32;
     let win_left = minimap.left() + frac_left * minimap.width();
     let win_right = minimap.left() + frac_right * minimap.width();
@@ -1366,7 +1411,7 @@ pub fn show(
         response.on_hover_ui(|ui| {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                 let v = px_to_x(pos.x);
-                ui.label(RichText::new(v_caption(tab.timeline.domain, v)).strong());
+                ui.label(RichText::new(v_caption(tab, v)).strong());
                 let density_column = (((pos.x - hist.left()) / hist.width())
                     * density_bins.len() as f32)
                     .floor()
@@ -1437,14 +1482,55 @@ fn fit_text_to_width(ui: &egui::Ui, text: &str, font: egui::FontId, max_width: f
 
 /// Format a duration delta in ms to a human-readable string.
 fn format_duration_ms(ms: i64) -> String {
-    if ms >= 3600000 {
-        format!("Δ {}h {}m", ms / 3600000, (ms % 3600000) / 60000)
-    } else if ms >= 60000 {
-        format!("Δ {}m {}s", ms / 60000, (ms % 60000) / 1000)
+    format!("Δ {}", format_human_duration_ms(ms))
+}
+
+fn axis_timestamp(tab: &LogTab, value: i64) -> Option<i64> {
+    match tab.timeline_display_mode {
+        TimelineDisplayMode::Line => None,
+        TimelineDisplayMode::Time => usize::try_from(value)
+            .ok()
+            .and_then(|line| tab.doc.ts_at_opt(line))
+            .filter(|timestamp| *timestamp >= 0),
+        TimelineDisplayMode::RealTime => Some(value),
+    }
+}
+
+fn unsigned_human_duration_ms(ms: u64) -> String {
+    if ms >= 86_400_000 {
+        let days = ms / 86_400_000;
+        let hours = (ms % 86_400_000) / 3_600_000;
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d {hours}h")
+        }
+    } else if ms >= 3_600_000 {
+        let hours = ms / 3_600_000;
+        let minutes = (ms % 3_600_000) / 60_000;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else if ms >= 60_000 {
+        let minutes = ms / 60_000;
+        let seconds = (ms % 60_000) / 1000;
+        if seconds == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {seconds}s")
+        }
     } else if ms >= 1000 {
-        format!("Δ {:.1}s", ms as f64 / 1000.0)
+        let seconds = ms / 1000;
+        let remainder = ms % 1000;
+        if remainder == 0 {
+            format!("{seconds}s")
+        } else {
+            format!("{:.1}s", ms as f64 / 1000.0)
+        }
     } else {
-        format!("Δ {}ms", ms)
+        format!("{ms}ms")
     }
 }
 
@@ -1469,27 +1555,11 @@ fn minimap_rect(hist: Rect, axis_top: f32) -> Rect {
 }
 
 fn format_human_duration_ms(ms: i64) -> String {
-    let ms = ms.max(0);
-    if ms >= 3600000 {
-        let hours = ms / 3600000;
-        let minutes = (ms % 3600000) / 60000;
-        if minutes == 0 {
-            format!("{hours}h")
-        } else {
-            format!("{hours}h {minutes}m")
-        }
-    } else if ms >= 60000 {
-        let minutes = ms / 60000;
-        let seconds = (ms % 60000) / 1000;
-        if seconds == 0 {
-            format!("{minutes}m")
-        } else {
-            format!("{minutes}m {seconds}sec")
-        }
-    } else if ms >= 1000 {
-        format!("{:.1}sec", ms as f64 / 1000.0)
+    let value = unsigned_human_duration_ms(ms.unsigned_abs());
+    if ms < 0 {
+        format!("−{value}")
     } else {
-        format!("{ms}ms")
+        value
     }
 }
 
@@ -1501,14 +1571,15 @@ fn occurrence_navigation_text(tab: &LogTab) -> Option<String> {
         .position(|&match_line| match_line as usize == line)?;
     let previous = if position > 0 {
         let previous = matches[position - 1] as usize;
-        let delta = match tab.timeline.domain {
-            TimelineDomain::Time { .. } => tab
-                .doc
+        let delta = if tab.timeline_display_mode.shows_time_labels() {
+            tab.doc
                 .ts_at_opt(line)
                 .zip(tab.doc.ts_at_opt(previous))
+                .filter(|(current, previous)| *current >= 0 && *previous >= 0)
                 .map(|(current, previous)| format_human_duration_ms(current - previous))
-                .unwrap_or_else(|| format!("{} lines", line - previous)),
-            TimelineDomain::Sequence => format!("{} lines", line - previous),
+                .unwrap_or_else(|| format!("{} lines", line - previous))
+        } else {
+            format!("{} lines", line - previous)
         };
         Some(delta)
     } else {
@@ -1516,14 +1587,15 @@ fn occurrence_navigation_text(tab: &LogTab) -> Option<String> {
     };
     let next = if position + 1 < matches.len() {
         let next = matches[position + 1] as usize;
-        let delta = match tab.timeline.domain {
-            TimelineDomain::Time { .. } => tab
-                .doc
+        let delta = if tab.timeline_display_mode.shows_time_labels() {
+            tab.doc
                 .ts_at_opt(next)
                 .zip(tab.doc.ts_at_opt(line))
+                .filter(|(next, current)| *next >= 0 && *current >= 0)
                 .map(|(next, current)| format_human_duration_ms(next - current))
-                .unwrap_or_else(|| format!("{} lines", next - line)),
-            TimelineDomain::Sequence => format!("{} lines", next - line),
+                .unwrap_or_else(|| format!("{} lines", next - line))
+        } else {
+            format!("{} lines", next - line)
         };
         Some(delta)
     } else {
@@ -1611,6 +1683,27 @@ fn x_of_line(doc: &LogDocument, domain: &TimelineDomain, line: usize) -> i64 {
     }
 }
 
+fn axis_bounds_for_line_range(
+    tab: &LogTab,
+    first_line: usize,
+    last_line: usize,
+) -> Option<(i64, i64)> {
+    if !tab.timeline_display_mode.uses_real_time_coordinates() {
+        return Some((first_line as i64, last_line as i64));
+    }
+    let end = last_line.min(tab.doc.total_lines().saturating_sub(1));
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for line in first_line.min(end)..=end {
+        let timestamp = tab.doc.ts_at(line);
+        if timestamp >= 0 {
+            min = min.min(timestamp);
+            max = max.max(timestamp);
+        }
+    }
+    (min <= max).then_some((min, max))
+}
+
 /// Text shown by a Timeline pin marker. The user analysis stays first so the
 /// tooltip answers the investigation question before showing navigation detail.
 fn pin_marker_tooltip(
@@ -1634,10 +1727,13 @@ fn pin_marker_tooltip(
     }
 }
 
-fn v_caption(domain: TimelineDomain, v: i64) -> String {
-    match domain {
-        TimelineDomain::Time { .. } => format_ms(v),
-        TimelineDomain::Sequence => format!("source line L{}", v + 1),
+fn v_caption(tab: &LogTab, v: i64) -> String {
+    match tab.timeline_display_mode {
+        TimelineDisplayMode::Line => format!("source line L{}", v + 1),
+        TimelineDisplayMode::Time => axis_timestamp(tab, v)
+            .map(format_ms)
+            .unwrap_or_else(|| "Unknown log time".to_string()),
+        TimelineDisplayMode::RealTime => format_ms(v),
     }
 }
 
@@ -1648,8 +1744,10 @@ mod tests {
     #[test]
     fn human_duration_formats_occurrence_deltas() {
         assert_eq!(format_human_duration_ms(3_900_000), "1h 5m");
-        assert_eq!(format_human_duration_ms(1_500), "1.5sec");
+        assert_eq!(format_human_duration_ms(1_500), "1.5s");
         assert_eq!(format_human_duration_ms(200), "200ms");
+        assert_eq!(format_human_duration_ms(165_600_000), "1d 22h");
+        assert_eq!(format_human_duration_ms(-5_000), "−5s");
     }
 
     #[test]

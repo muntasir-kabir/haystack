@@ -1,3 +1,7 @@
+# 2026-09-21
+- Updated the record-log generator with deterministic 10-minute-to-7-day timestamp gaps, capped at 20 gaps per 1,000 records by default, and fixed date formatting across multi-day gaps for Real Time timeline testing.
+- Added selectable Line, Time, and Real Time Timeline domains. Time keeps source-line spacing with log-time labels and human-readable timestamp deltas; Real Time proportionally spans the oldest-to-latest log timestamps, exposes inactive gaps in the histogram/minimap, and maps gap clicks to the nearest timestamped source line without changing Log View order.
+
 # 2026-09-20
 - Increased the application version to 0.1.5.
 - Restricted the main dock to upper Log Views and a shared lower Pinned/Templates panel, while keeping detached Log View windows free-form. Individual Log Views now drag between the main panel and detached Log View windows, with an empty source window closing automatically.

@@ -1,6 +1,4 @@
-//! Source-order timeline bucketing. Physical line positions are always the x
-//! axis; event timestamps remain metadata for labels, queries, and anomaly
-//! annotations rather than coordinates that can reorder the file.
+//! Timeline bucketing for both source-line and elapsed wall-clock axes.
 
 use crate::core::document::LogDocument;
 use std::sync::Arc;
@@ -50,6 +48,10 @@ pub struct Timeline {
     /// Compatibility storage for explicit legacy time-domain timelines. The
     /// source-line builder leaves it empty and never allocates a sorted copy.
     pub out_of_order_density_lines: Arc<Vec<u32>>,
+    /// Every timestamped physical line, sorted by `(timestamp, source line)`.
+    /// Real-time background clicks use this index so quiet regions resolve to
+    /// the nearest actual log line without changing Log View source order.
+    pub timestamp_lines: Arc<Vec<u32>>,
     pub max_density: u32,
     sequence_end: i64,
 }
@@ -69,12 +71,12 @@ pub struct ResolvedFilterBin {
 
 impl Timeline {
     pub fn build(doc: &LogDocument, filter_matches: &[Vec<usize>], n_buckets: usize) -> Self {
-        Self::build_from_matches(doc, filter_matches, n_buckets)
+        Self::build_from_matches(doc, filter_matches, n_buckets, false)
     }
 
     /// Build from the GUI's compact 32-bit match indexes.
     pub fn build_u32(doc: &LogDocument, filter_matches: &[Vec<u32>], n_buckets: usize) -> Self {
-        Self::build_from_matches(doc, filter_matches, n_buckets)
+        Self::build_from_matches(doc, filter_matches, n_buckets, false)
     }
 
     /// Build from independently shared GUI match lanes. Retained filters can
@@ -84,16 +86,58 @@ impl Timeline {
         filter_matches: &[Arc<Vec<u32>>],
         n_buckets: usize,
     ) -> Self {
-        Self::build_from_matches(doc, filter_matches, n_buckets)
+        Self::build_from_matches(doc, filter_matches, n_buckets, false)
     }
 
-    fn build_from_matches<T, M>(doc: &LogDocument, filter_matches: &[M], n_buckets: usize) -> Self
+    /// Build an elapsed wall-clock timeline. Returns a source-line timeline
+    /// when the current document range has no valid timestamps.
+    pub fn build_real_time_shared_u32(
+        doc: &LogDocument,
+        filter_matches: &[Arc<Vec<u32>>],
+        n_buckets: usize,
+    ) -> Self {
+        Self::build_from_matches(doc, filter_matches, n_buckets, true)
+    }
+
+    fn build_from_matches<T, M>(
+        doc: &LogDocument,
+        filter_matches: &[M],
+        n_buckets: usize,
+        real_time: bool,
+    ) -> Self
     where
         T: Copy + TryInto<usize>,
         M: MatchLane<T>,
     {
         let n_lines = doc.total_lines();
-        let domain = TimelineDomain::Sequence;
+        let mut timestamp_lines = Vec::new();
+        let mut density_lines = Vec::new();
+        if real_time {
+            for line in 0..n_lines {
+                if doc.ts_at_opt(line).is_some_and(|timestamp| timestamp >= 0) {
+                    timestamp_lines.push(line as u32);
+                    if doc.is_record_start_at(line) {
+                        density_lines.push(line as u32);
+                    }
+                }
+            }
+            let by_time_then_line = |a: &u32, b: &u32| {
+                doc.ts_at(*a as usize)
+                    .cmp(&doc.ts_at(*b as usize))
+                    .then_with(|| a.cmp(b))
+            };
+            timestamp_lines.sort_unstable_by(by_time_then_line);
+            density_lines.sort_unstable_by(by_time_then_line);
+        }
+        let domain = timestamp_lines
+            .first()
+            .zip(timestamp_lines.last())
+            .map(|(&first, &last)| TimelineDomain::Time {
+                start_ms: doc.ts_at(first as usize),
+                end_ms: doc.ts_at(last as usize),
+            })
+            .filter(|_| real_time)
+            .unwrap_or(TimelineDomain::Sequence);
         let nb = n_buckets.clamp(16, 8192);
 
         let bucket_of = |v: i64| -> usize {
@@ -116,10 +160,9 @@ impl Timeline {
             }
         };
 
-        // The overview's unit is records, not physical lines. Rank queries
-        // make this exact in O(bucket count), regardless of record length.
+        // The overview's unit is records, not physical lines.
         let mut density = vec![0u32; nb];
-        if n_lines > 0 {
+        if matches!(domain, TimelineDomain::Sequence) && n_lines > 0 {
             for (bucket, count) in density.iter_mut().enumerate() {
                 let (start, end) = discrete_bin_bounds(0, n_lines as i64 - 1, bucket, nb);
                 *count = doc
@@ -130,7 +173,12 @@ impl Timeline {
                     .min(u32::MAX as usize) as u32;
             }
         }
-        let timestamps_monotonic = true;
+        if matches!(domain, TimelineDomain::Time { .. }) {
+            for &line in &density_lines {
+                density[bucket_of(doc.ts_at(line as usize))] += 1;
+            }
+        }
+        let timestamps_monotonic = false;
         let max_density = density.iter().copied().max().unwrap_or(0);
 
         let mut filter_buckets = Vec::with_capacity(filter_matches.len());
@@ -150,6 +198,13 @@ impl Timeline {
                 kb[bucket_of(v)] += 1;
                 lines.push(ln as u32);
             }
+            if matches!(domain, TimelineDomain::Time { .. }) {
+                lines.sort_unstable_by(|a, b| {
+                    doc.ts_at(*a as usize)
+                        .cmp(&doc.ts_at(*b as usize))
+                        .then_with(|| a.cmp(b))
+                });
+            }
             filter_buckets.push(kb);
             filter_lines.push(lines);
         }
@@ -161,7 +216,8 @@ impl Timeline {
             filter_buckets,
             filter_lines,
             timestamps_monotonic,
-            out_of_order_density_lines: Arc::new(Vec::new()),
+            out_of_order_density_lines: Arc::new(density_lines),
+            timestamp_lines: Arc::new(timestamp_lines),
             max_density,
             sequence_end: n_lines.saturating_sub(1) as i64,
         }
@@ -178,6 +234,7 @@ impl Timeline {
             filter_lines: Vec::new(),
             timestamps_monotonic: self.timestamps_monotonic,
             out_of_order_density_lines: Arc::clone(&self.out_of_order_density_lines),
+            timestamp_lines: Arc::clone(&self.timestamp_lines),
             max_density: self.max_density,
             sequence_end: self.sequence_end,
         }
@@ -209,6 +266,13 @@ impl Timeline {
                 }
                 buckets[self.bucket_for(x, total_lines)] += 1;
                 lines.push(line);
+            }
+            if matches!(self.domain, TimelineDomain::Time { .. }) {
+                lines.sort_unstable_by(|a, b| {
+                    doc.ts_at(*a as usize)
+                        .cmp(&doc.ts_at(*b as usize))
+                        .then_with(|| a.cmp(b))
+                });
             }
             self.filter_buckets.push(buckets);
             self.filter_lines.push(lines);
@@ -468,27 +532,8 @@ impl Timeline {
         }
         match self.domain {
             TimelineDomain::Sequence => Some(v.clamp(0, total.saturating_sub(1) as i64) as usize),
-            TimelineDomain::Time { .. } if self.timestamps_monotonic => {
-                let next = lower_bound_document_timestamp(doc, v);
-                match (next.checked_sub(1), (next < total).then_some(next)) {
-                    (Some(previous), Some(next)) => {
-                        let previous_x = doc.ts_at(previous);
-                        let next_x = doc.ts_at(next);
-                        if previous_x >= 0 && (v - previous_x).abs() < (next_x - v).abs() {
-                            Some(previous)
-                        } else {
-                            Some(next)
-                        }
-                    }
-                    (Some(previous), None) => Some(previous),
-                    (None, Some(next)) => Some(next),
-                    (None, None) => None,
-                }
-            }
-            TimelineDomain::Time { .. } => {
-                nearest_line_by_x(self, doc, &self.out_of_order_density_lines, v)
-                    .map(|(line, _)| line as usize)
-            }
+            TimelineDomain::Time { .. } => nearest_line_by_x(self, doc, &self.timestamp_lines, v)
+                .map(|(line, _)| line as usize),
         }
     }
 
@@ -502,11 +547,6 @@ impl Timeline {
                 let lo = start.clamp(0, total);
                 let hi = end.clamp(0, total);
                 doc.count_records(doc.trim_start + lo as usize, doc.trim_start + hi as usize)
-            }
-            TimelineDomain::Time { .. } if self.timestamps_monotonic => {
-                let lo = lower_bound_document_timestamp(doc, start);
-                let hi = lower_bound_document_timestamp(doc, end);
-                hi.saturating_sub(lo)
             }
             TimelineDomain::Time { .. } => {
                 let lines = &self.out_of_order_density_lines;
@@ -546,20 +586,6 @@ fn nearest_line_by_x(
         (None, Some(line)) => Some((line, timeline.x_of_line(doc, line))),
         (None, None) => None,
     }
-}
-
-fn lower_bound_document_timestamp(doc: &LogDocument, target: i64) -> usize {
-    let mut lo = 0usize;
-    let mut hi = doc.total_lines();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if doc.ts_at(mid) < target {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
 }
 
 /// Return `[start, end)` integer-domain bounds for one screen cell. Empty
@@ -814,6 +840,76 @@ mod tests {
         );
         assert_eq!(tl.point_count_in_range(&doc, 0, 0, 2), 3);
         assert_eq!(tl.nearest_match_line_in_filter(&doc, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn real_time_uses_clock_bounds_and_sorts_points_without_reordering_source() {
+        let doc = doc_with(
+            "2026-07-19T10:00:02.000Z late\n\
+             2026-07-19T10:00:00.000Z early\n\
+             2026-07-19T10:00:01.000Z middle\n",
+        );
+        let matches = vec![Arc::new(vec![0, 1, 2])];
+        let tl = Timeline::build_real_time_shared_u32(&doc, &matches, 16);
+        assert_eq!(
+            tl.domain,
+            TimelineDomain::Time {
+                start_ms: doc.ts_at(1),
+                end_ms: doc.ts_at(0),
+            }
+        );
+        assert_eq!(&*tl.timestamp_lines, &[1, 2, 0]);
+        assert_eq!(tl.filter_lines[0], vec![1, 2, 0]);
+        assert_eq!(tl.nearest_line(&doc, doc.ts_at(2)), Some(2));
+        assert_eq!(
+            tl.nearest_match_line_in_filter(&doc, 0, doc.ts_at(1)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn real_time_preserves_quiet_gaps_and_clicks_nearest_timestamped_line() {
+        let doc = doc_with(
+            "2026-07-19T10:00:00.000Z first\n\
+             2026-07-19T10:00:01.000Z second\n\
+             2026-07-19T11:00:00.000Z last\n",
+        );
+        let tl = Timeline::build_real_time_shared_u32(&doc, &[], 16);
+        let start = doc.ts_at(0);
+        let end = doc.ts_at(2);
+        let bins = tl.resolve_density_bins(&doc, start, end, 60);
+        assert_eq!(bins.iter().sum::<u32>(), 3);
+        assert!(bins[2..58].iter().all(|&count| count == 0));
+        assert_eq!(tl.nearest_line(&doc, start + 10_000), Some(1));
+        assert_eq!(tl.nearest_line(&doc, end - 10_000), Some(2));
+    }
+
+    #[test]
+    fn real_time_tracks_multiline_continuations_at_their_record_timestamp() {
+        let doc = doc_with(
+            "2026-07-19T10:00:00.000Z ERROR failed\n\
+             at service::run(source.rs:42)\n\
+             2026-07-19T10:01:00.000Z INFO recovered\n",
+        );
+        assert_eq!(doc.ts_at(1), doc.ts_at(0));
+        let matches = vec![Arc::new(vec![1])];
+        let tl = Timeline::build_real_time_shared_u32(&doc, &matches, 16);
+
+        assert_eq!(&*tl.timestamp_lines, &[0, 1, 2]);
+        assert_eq!(tl.filter_lines[0], vec![1]);
+        assert_eq!(tl.density.iter().sum::<u32>(), 2);
+        assert_eq!(
+            tl.nearest_match_line_in_filter(&doc, 0, doc.ts_at(0)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn real_time_falls_back_to_sequence_without_valid_timestamps() {
+        let doc = doc_with("alpha\nbeta\ngamma\n");
+        let tl = Timeline::build_real_time_shared_u32(&doc, &[], 16);
+        assert_eq!(tl.domain, TimelineDomain::Sequence);
+        assert!(tl.timestamp_lines.is_empty());
     }
 
     #[test]

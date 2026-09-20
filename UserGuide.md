@@ -303,8 +303,9 @@ prefix-dependent ones need an explicit header prefix and a checked preview.
   can be cancelled without blocking the log view.
 
 ### The timeline
-- The timeline is a **fixed-height panel** at the top — it always shows the full histogram, all filter lanes and axis labels, plus the zoom/minimap strip when enabled, and can never be shrunk to hide lanes. Its height grows/shrinks with the number of filters and reclaims the minimap space when it is hidden.
-- Shows record-start counts across the file's physical-line axis, with one **colored lane per filter** counting matching physical lines. Each lane has a quiet orientation baseline; full-strength lane colour is reserved for occurrence markers and density buckets. A bucket containing one visible match shows a **2px × 7px marker at that source-line position**. Multi-occurrence buckets are edge-to-edge rectangles spanning the bucket's full timeline width: small is **7px** high, medium **10px**, and dense **13px**. Adjacent non-empty buckets therefore read as a continuous density strip. Exact counts remain available on hover, and zooming re-resolves the buckets until distinguishable occurrences become exact markers.
+- The timeline is a **fixed-height panel** at the top — it always shows the full histogram, all filter lanes, axis labels, and overview minimap, and can never be shrunk to hide lanes. Its height grows/shrinks with the number of filters.
+- Use the **Line | Time | Real Time** control to change the Timeline domain. **Line** is the default and spaces activity by physical source line. **Time** keeps that same source-line spacing but labels positions with their log timestamps and labels intervals with human-readable timestamp differences such as `5s`, `1m 44s`, or `1d 22h`. **Real Time** spans the oldest through latest valid log timestamp proportionally, so quiet periods appear as empty space. Logs without valid timestamps keep Line selected and disable the two time choices.
+- The histogram shows record-start counts, with one **colored lane per filter** counting matching physical lines. Each lane has a quiet orientation baseline; full-strength lane colour is reserved for occurrence markers and density buckets. A bucket containing one visible match shows a **2px × 7px marker at that domain position**. Multi-occurrence buckets are edge-to-edge rectangles spanning the bucket's full timeline width: small is **7px** high, medium **10px**, and dense **13px**. Adjacent non-empty buckets therefore read as a continuous density strip. Exact counts remain available on hover, and zooming re-resolves the buckets until distinguishable occurrences become exact markers.
 - **Left column** shows left-aligned filter names with monochrome visible/hidden SVG controls and small identity swatches; long values remain available in the hover tooltip. Click to toggle. The first lane is "Everything Else" — it has a neutral swatch and visibility control but **cannot be removed**.
 - The otherwise-empty **Everything Else** lane also shows pinned evidence with pin markers at the first and last selected log rows (one marker for a single-row pin). Markers remain available without filters, use line positions for timestamp-less logs, and follow the active zoom window.
 - Hover a pin marker to read its saved analysis and pinned line range. Click it to jump the Log view to the pin's first selected row, then select and reveal the corresponding card in the **Pinned** tab.
@@ -314,16 +315,16 @@ prefix-dependent ones need an explicit header prefix and a checked preview.
 - **Lower-left filter actions** (shown beneath the filter labels while filters exist) keep bulk visibility and destructive actions out of the compact Timeline header:
   - **Disable all / Enable all** toggles every filter lane at once; the **Everything Else** lane is never touched.
   - **Clear filters** removes every filter (behind a confirmation popup when confirmation is enabled).
-- **Zoom** — scroll anywhere over the timeline. Zoom is continuous, pointer-anchored, works on both trackpads and mouse wheels, and can reach individual-line detail.
+- **Zoom** — scroll anywhere over the timeline. Zoom is continuous, pointer-anchored, works on both trackpads and mouse wheels, and can reach individual-line or millisecond detail according to the selected domain. Line/Time and Real Time retain independent zoom windows while switching during the session.
 - **Pan** — drag left/right (without shift). The visible span is preserved and snaps at the file boundaries.
 - **Brush select** — shift+drag to draw a rectangle; on release, zooms to that range.
 - **Reset zoom** — double-click anywhere on the timeline, or click the labeled **Reset zoom** action.
-- `L` means physical source line, and positions remain in file order rather than elapsed-time spacing.
+- In Line mode, `L` means physical source line. Time labels show the timestamp owned by the line at that position. Real Time labels divide the elapsed timestamp range proportionally.
 - **Minimap** — click anywhere on the minimap to jump to that position.
 - **Hover** the timeline for re-resolved visible-column details (time/line position, line count, and per-filter counts). Density buckets also show their exact occurrence count and boundary lines.
-- **Click** the timeline background → jumps to the nearest real log line; clicking a filter marker/bucket jumps to the nearest occurrence in that lane.
+- **Click** the timeline background → jumps to the nearest real log line. In Real Time, clicking an inactive gap selects the timestamped source line nearest in time. Clicking a filter marker/bucket selects the nearest occurrence in that lane.
   A white marker shows your current position.
-- **Axis labels** show source line numbers. Event times are available in log rows and Go to Time, but never change timeline positions.
+- **Axis labels** show line numbers in Line, log timestamps in Time, and proportionally spaced log timestamps in Real Time. Log View itself always remains in physical source order, including when timestamps repeat or move backward.
 
 ### Bottom panel (pinned lines + analyses)
 - **Right-click** any log line → context menu:
@@ -379,10 +380,13 @@ field-aware templates instead of raw token fragmentation:
 | iOS OSLog console | `[Subsystem:Category] LEVEL: message` | none |
 | Plain (fallback) | anything else | auto-detected |
 
-The primary timeline always uses **physical source lines**, with one-based labels that
-match the Log View. Its overview counts record starts per line interval, while filter
-lanes count matching physical lines. Timestamps are annotations and query metadata:
-equal, missing, or backward-moving times never reorder or stretch the source axis.
+Line and Time Timeline domains use **physical source lines** and therefore never reorder
+or stretch the source axis. Real Time uses a separate timestamp-sorted visual index to
+show elapsed activity and gaps, while selections still resolve to physical source lines
+and Log View stays in file order. The overview counts record starts per domain interval,
+while filter lanes count matching physical lines. Equal timestamps aggregate at one
+position; missing timestamps remain in Log View but are not assigned an invented Real
+Time position; backward-moving timestamps affect only their visual Real Time position.
 For multiline text, only an anchored, recognized header begins a record. Stack traces,
 payload JSON, and other continuation lines inherit that record's timestamp even when
 their payload contains a date. A recognized header with a missing or malformed time
@@ -488,8 +492,11 @@ printf '%s\n' \
   format/date discovery, header learning, line decoding, timestamp extraction,
   normalization/masking, Drain mining, and logical retained index bytes.
 - Generate reproducible multiline, custom-layout, sparse-header, payload-date,
-  and backward-clock workloads with `cargo run --release --example
-  gen_record_logs -- --help`. Generation is outside the profiler's timed load.
+  backward-clock, and long-gap workloads with `cargo run --release --example
+  gen_record_logs -- --help`. Long gaps default to one every 50 records, with
+  each gap randomly selected from 10 minutes through 7 days; use
+  `--long-delay-every 0` to disable them. Generation is outside the profiler's
+  timed load.
 - Per-line render length is capped at 2000 chars in the GUI (data stays intact in the mmap).
 - Line indexes are stored as 32-bit values; a single source is limited to 4,294,967,295 lines.
 - Embedded JSON analysis is debounced while scrolling, cancellable, and worker-only. GUI record scans are bounded to 8 MiB / 20,000 lines, 128 nesting levels, 20,000 normalized nodes, and 64 results per physical interval; values exceeding a bound are not presented as valid detections.

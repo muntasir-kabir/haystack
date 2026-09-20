@@ -119,7 +119,9 @@ fn settings_nav_item(
     child.add_space(8.0);
     // The row owns the click target. Keep the child text non-selectable so it
     // cannot take over the pointer interaction from the row response.
-    child.add(egui::Label::new(RichText::new(section.label()).color(app.theme.text)).selectable(false));
+    child.add(
+        egui::Label::new(RichText::new(section.label()).color(app.theme.text)).selectable(false),
+    );
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, section.label()));
     response
