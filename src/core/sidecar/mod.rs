@@ -52,6 +52,8 @@ pub struct InvestigationState {
     pub bottom_panel_open: bool,
     #[serde(default = "default_log_font_size")]
     pub log_font_size: f32,
+    #[serde(default = "default_timeline_display_mode")]
+    pub timeline_display_mode: String,
     /// Serialized `egui_dock::DockState<ViewTab>`.  Keeping this as JSON in
     /// the core schema avoids coupling the core crate to GUI types.
     #[serde(default)]
@@ -61,6 +63,10 @@ pub struct InvestigationState {
     /// Serialized `Vec<(ViewTab, TabPath)>`; opaque here to keep core GUI-free.
     #[serde(default)]
     pub detached_locations: Option<serde_json::Value>,
+    /// Serialized detached dock window ids, layouts, and native geometry;
+    /// opaque here to keep the core schema independent of GUI types.
+    #[serde(default)]
+    pub detached_dock_layouts: Option<serde_json::Value>,
     #[serde(default)]
     pub timeline_detached: bool,
 }
@@ -76,6 +82,9 @@ fn default_templates_width() -> f32 {
 }
 fn default_log_font_size() -> f32 {
     12.0
+}
+fn default_timeline_display_mode() -> String {
+    "line".to_string()
 }
 fn default_log_view_id() -> u64 {
     1
@@ -103,9 +112,11 @@ impl Default for InvestigationState {
             templates_panel_width: default_templates_width(),
             bottom_panel_open: false,
             log_font_size: default_log_font_size(),
+            timeline_display_mode: default_timeline_display_mode(),
             dock_layout: None,
             detached_views: Vec::new(),
             detached_locations: None,
+            detached_dock_layouts: None,
             timeline_detached: false,
         }
     }

@@ -124,6 +124,7 @@ pub struct Theme {
     /// Tick / axis label colour.
     pub axis: Color32,
     /// Hint text colour (e.g. "scroll to zoom").
+    #[allow(dead_code)]
     pub hint: Color32,
     /// Brush selection fill colour.
     pub brush_fill: Color32,

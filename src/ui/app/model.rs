@@ -267,6 +267,12 @@ pub enum ViewTab {
     Templates,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetachedViewport {
+    Timeline,
+    Dock(DockWindowId),
+}
+
 /// How the Timeline presents and spaces log activity. `Line` and `Time` share
 /// source-line coordinates; `Time` only changes axis and interval captions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -295,15 +301,141 @@ impl TimelineDisplayMode {
     pub const fn shows_time_labels(self) -> bool {
         !matches!(self, Self::Line)
     }
+
+    pub const fn persisted_key(self) -> &'static str {
+        match self {
+            Self::Line => "line",
+            Self::Time => "time",
+            Self::RealTime => "real_time",
+        }
+    }
+
+    pub fn from_persisted_key(key: &str) -> Self {
+        match key {
+            "time" => Self::Time,
+            "real_time" => Self::RealTime,
+            _ => Self::Line,
+        }
+    }
 }
 
-/// A destination for moving one Log View between the main dock and native
-/// detached Log View windows. Pinned and Templates deliberately do not use
-/// this: their main-window homes are fixed lower-dock tabs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogDockTarget {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DockWindowId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetachedWindowGeometry {
+    pub position: Option<egui::Pos2>,
+    pub inner_size: egui::Vec2,
+}
+
+impl Default for DetachedWindowGeometry {
+    fn default() -> Self {
+        Self {
+            position: None,
+            inner_size: egui::vec2(600.0, 400.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedDetachedDock {
+    id: u64,
+    layout: serde_json::Value,
+    position: Option<[f32; 2]>,
+    inner_size: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DockContainer {
     Main,
-    Detached(ViewTab),
+    Detached(DockWindowId),
+}
+
+/// A legal destination for a dockable workspace tab. The main window exposes
+/// two fixed homes; detached windows accept every dockable tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockDropTarget {
+    MainLog,
+    MainUtility,
+    JoinDetached {
+        window: DockWindowId,
+        sibling: ViewTab,
+    },
+    SplitDetached {
+        window: DockWindowId,
+        sibling: ViewTab,
+        split: egui_dock::Split,
+    },
+    TabInsert {
+        container: DockContainer,
+        sibling: ViewTab,
+        after: bool,
+    },
+}
+
+/// Runtime state for one Log-tab drag that may cross native viewport bounds.
+///
+/// Native window backends normally keep pointer capture in the source window,
+/// so destination viewports cannot be expected to receive hover or release
+/// events. The source pointer and every legal destination are therefore kept
+/// in shared monitor coordinates.
+#[derive(Clone, Debug)]
+pub struct DockDragSession {
+    pub tab: ViewTab,
+    pub source: DockContainer,
+    pub press_screen: Option<egui::Pos2>,
+    pub pointer_screen: Option<egui::Pos2>,
+    pub active: bool,
+    pub targets: Vec<(DockDropTarget, egui::Rect)>,
+}
+
+impl DockDragSession {
+    pub fn new(tab: ViewTab, source: DockContainer) -> Self {
+        Self {
+            tab,
+            source,
+            press_screen: None,
+            pointer_screen: None,
+            active: false,
+            targets: Vec::new(),
+        }
+    }
+
+    pub fn register_target(&mut self, target: DockDropTarget, rect: egui::Rect) {
+        if let Some((_, existing)) = self
+            .targets
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == target)
+        {
+            *existing = rect;
+        } else {
+            self.targets.push((target, rect));
+        }
+    }
+
+    pub fn update_pointer(&mut self, pointer: egui::Pos2) {
+        let press = *self.press_screen.get_or_insert(pointer);
+        self.pointer_screen = Some(pointer);
+        self.active |= press.distance(pointer) >= 4.0;
+    }
+
+    pub fn hovered_target(&self) -> Option<DockDropTarget> {
+        if !self.active {
+            return None;
+        }
+        let pointer = self.pointer_screen?;
+        self.targets
+            .iter()
+            .filter(|(_, rect)| rect.contains(pointer))
+            .max_by_key(|(target, _)| match target {
+                DockDropTarget::TabInsert { .. } => 3,
+                DockDropTarget::SplitDetached { .. } => 2,
+                DockDropTarget::MainLog
+                | DockDropTarget::MainUtility
+                | DockDropTarget::JoinDetached { .. } => 1,
+            })
+            .map(|(target, _)| *target)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -842,22 +974,28 @@ pub struct LogTab {
     pub pending_recent_field_search: Option<FieldQuery>,
     /// A filter that the app should persist to Settings after this frame.
     pub pending_recent_filter: Option<RecentFilter>,
+    /// A timeline display mode that the app should persist to Settings after this frame.
+    pub pending_timeline_display_mode: Option<TimelineDisplayMode>,
     pub filter_suggestions_open: bool,
     /// Index of the most recently added filter + when it was added, driving the
     /// short "new filter" highlight animation on the timeline lane label.
     pub filter_highlight: Option<(usize, Instant)>,
     pub dock_state: DockState<ViewTab>,
-    pub detached_views: HashSet<ViewTab>,
+    pub detached_views: HashSet<DockWindowId>,
     pub detached_locations: HashMap<ViewTab, egui_dock::TabPath>,
-    /// Per-native-window dock layouts, initially containing one detached tab.
-    pub detached_dock_states: HashMap<ViewTab, DockState<ViewTab>>,
-    pub just_closed_viewports: Vec<ViewTab>,
+    /// Per-native-window dock layouts, keyed independently from their tabs so
+    /// a window survives when the tab that originally created it moves away.
+    pub detached_dock_states: HashMap<DockWindowId, DockState<ViewTab>>,
+    /// One-shot native positions for windows created by a drop outside every
+    /// legal dock target. Removed after the first viewport build.
+    pub detached_window_geometry: HashMap<DockWindowId, DetachedWindowGeometry>,
+    pub pending_detached_window_geometry: HashSet<DockWindowId>,
+    pub next_dock_window_id: u64,
+    pub just_closed_viewports: Vec<DockWindowId>,
     pub pending_detach: Option<ViewTab>,
     pub pending_add_log_view: Option<egui_dock::NodePath>,
-    /// The Log tab currently being dragged between native dock windows. The
-    /// source is `None` for the main window and the root tab of a detached
-    /// native window otherwise.
-    pub active_log_drag: Option<(LogViewId, Option<ViewTab>)>,
+    /// The Log tab currently being dragged between native dock windows.
+    pub active_dock_drag: Option<DockDragSession>,
 
     /// Whether this tab is currently being served by the MCP server.
     pub mcp_serving: bool,
@@ -1100,7 +1238,7 @@ pub struct HaystackApp {
     pub rename_filter_new_name: String,
 
     // Window management
-    pub viewport_map: HashMap<egui::ViewportId, (usize, ViewTab)>,
+    pub viewport_map: HashMap<egui::ViewportId, (usize, DetachedViewport)>,
 
     pub show_settings_popup: bool,
     pub settings_button_rect: Option<egui::Rect>,
@@ -1283,6 +1421,10 @@ impl HaystackApp {
                 self.settings.add_recent_filter(filter);
                 changed = true;
             }
+            if let Some(mode) = tab.pending_timeline_display_mode.take() {
+                self.settings.timeline_display_mode = mode.persisted_key().to_string();
+                changed = true;
+            }
         }
         if changed {
             self.settings.save();
@@ -1447,8 +1589,14 @@ impl LogTab {
             })
             .collect();
         let mut detached_views: Vec<_> = self
-            .detached_views
-            .iter()
+            .detached_dock_states
+            .values()
+            .flat_map(|state| {
+                state
+                    .iter_all_tabs()
+                    .map(|(_, tab)| *tab)
+                    .collect::<Vec<_>>()
+            })
             .filter_map(|view| match view {
                 ViewTab::Log(id) => Some(DetachedViewState::Log { id: id.0 }),
                 ViewTab::Pinned => Some(DetachedViewState::Pinned),
@@ -1463,6 +1611,24 @@ impl LogTab {
             .map(|(view, path)| (*view, *path))
             .collect();
         detached_locations.sort_by_key(|(view, _)| *view);
+        let mut detached_docks: Vec<_> = self
+            .detached_dock_states
+            .iter()
+            .filter_map(|(window, dock)| {
+                let geometry = self
+                    .detached_window_geometry
+                    .get(window)
+                    .copied()
+                    .unwrap_or_default();
+                Some(PersistedDetachedDock {
+                    id: window.0,
+                    layout: encode_dock_layout(dock)?,
+                    position: geometry.position.map(|pos| [pos.x, pos.y]),
+                    inner_size: [geometry.inner_size.x, geometry.inner_size.y],
+                })
+            })
+            .collect();
+        detached_docks.sort_by_key(|dock| dock.id);
 
         InvestigationState {
             schema_version: sidecar::CURRENT_SCHEMA_VERSION,
@@ -1491,9 +1657,11 @@ impl LogTab {
             templates_panel_width: 320.0,
             bottom_panel_open: self.bottom_panel_open,
             log_font_size: self.log_font_size,
+            timeline_display_mode: self.timeline_display_mode.persisted_key().to_string(),
             dock_layout: encode_dock_layout(&self.dock_state),
             detached_views,
             detached_locations: serde_json::to_value(detached_locations).ok(),
+            detached_dock_layouts: serde_json::to_value(detached_docks).ok(),
             timeline_detached: self.timeline_detached,
         }
     }
@@ -1535,6 +1703,9 @@ impl LogTab {
         self.dock_state = dock_state;
         self.detached_views.clear();
         self.detached_locations.clear();
+        self.detached_dock_states.clear();
+        self.detached_window_geometry.clear();
+        self.pending_detached_window_geometry.clear();
     }
 
     fn restore_log_view_collection(&mut self, state: &InvestigationState) -> bool {
@@ -1630,16 +1801,62 @@ impl LogTab {
             self.rebuild_default_log_layout(self.focused_log_view_id);
             return false;
         };
-        let mut detached_views = HashSet::new();
-        for saved in &state.detached_views {
-            let view = match saved {
-                DetachedViewState::Log { id } => ViewTab::Log(LogViewId(*id)),
-                DetachedViewState::Pinned => ViewTab::Pinned,
-                DetachedViewState::Templates => ViewTab::Templates,
-            };
-            if !detached_views.insert(view) {
-                self.rebuild_default_log_layout(self.focused_log_view_id);
-                return false;
+        let persisted_docks = state.detached_dock_layouts.as_ref().and_then(|value| {
+            let saved: Vec<PersistedDetachedDock> = serde_json::from_value(value.clone()).ok()?;
+            let mut ids = HashSet::new();
+            saved
+                .into_iter()
+                .map(|saved| {
+                    let dock = decode_dock_layout(&saved.layout)?;
+                    let size = egui::vec2(saved.inner_size[0], saved.inner_size[1]);
+                    if saved.id == 0
+                        || !ids.insert(saved.id)
+                        || !size.is_finite()
+                        || size.x < 100.0
+                        || size.y < 100.0
+                    {
+                        return None;
+                    }
+                    let position = saved.position.map(|pos| egui::pos2(pos[0], pos[1]));
+                    if position.is_some_and(|pos| !pos.is_finite()) {
+                        return None;
+                    }
+                    Some((
+                        DockWindowId(saved.id),
+                        dock,
+                        DetachedWindowGeometry {
+                            position,
+                            inner_size: size,
+                        },
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        if state.detached_dock_layouts.is_some() && persisted_docks.is_none() {
+            self.rebuild_default_log_layout(self.focused_log_view_id);
+            return false;
+        }
+        let mut detached_tabs = HashSet::new();
+        if let Some(docks) = &persisted_docks {
+            for (_, dock, _) in docks {
+                for (_, view) in dock.iter_all_tabs() {
+                    if !detached_tabs.insert(*view) {
+                        self.rebuild_default_log_layout(self.focused_log_view_id);
+                        return false;
+                    }
+                }
+            }
+        } else {
+            for saved in &state.detached_views {
+                let view = match saved {
+                    DetachedViewState::Log { id } => ViewTab::Log(LogViewId(*id)),
+                    DetachedViewState::Pinned => ViewTab::Pinned,
+                    DetachedViewState::Templates => ViewTab::Templates,
+                };
+                if !detached_tabs.insert(view) {
+                    self.rebuild_default_log_layout(self.focused_log_view_id);
+                    return false;
+                }
             }
         }
 
@@ -1658,7 +1875,7 @@ impl LogTab {
                 ViewTab::Timeline => valid = false,
             }
         }
-        for view in &detached_views {
+        for view in &detached_tabs {
             match view {
                 ViewTab::Log(id) => match log_counts.get_mut(id) {
                     Some(count) => *count += 1,
@@ -1685,10 +1902,33 @@ impl LogTab {
             })
             .unwrap_or_default()
             .into_iter()
-            .filter(|(view, _)| detached_views.contains(view))
+            .filter(|(view, _)| detached_tabs.contains(view))
             .collect();
         self.dock_state = dock_state;
-        self.detached_views = detached_views;
+        self.detached_views.clear();
+        self.detached_dock_states.clear();
+        self.detached_window_geometry.clear();
+        self.pending_detached_window_geometry.clear();
+        if let Some(docks) = persisted_docks {
+            for (window, dock, geometry) in docks {
+                self.next_dock_window_id = self.next_dock_window_id.max(window.0.saturating_add(1));
+                self.detached_views.insert(window);
+                self.detached_dock_states.insert(window, dock);
+                self.detached_window_geometry.insert(window, geometry);
+                self.pending_detached_window_geometry.insert(window);
+            }
+        } else {
+            for view in detached_tabs {
+                let window = DockWindowId(self.next_dock_window_id);
+                self.next_dock_window_id = self.next_dock_window_id.saturating_add(1);
+                self.detached_views.insert(window);
+                self.detached_dock_states
+                    .insert(window, DockState::new(vec![view]));
+                self.detached_window_geometry
+                    .insert(window, DetachedWindowGeometry::default());
+                self.pending_detached_window_geometry.insert(window);
+            }
+        }
         self.detached_locations = detached_locations;
         // Layouts saved before the fixed main-window regions were introduced
         // may contain valid tabs in now-disallowed leaves. Keep detached
@@ -1765,6 +2005,9 @@ impl LogTab {
         let views_valid = self.restore_log_view_collection(state);
         self.bottom_panel_open = state.bottom_panel_open;
         self.log_font_size = state.log_font_size.clamp(8.0, 24.0);
+        self.set_timeline_display_mode(TimelineDisplayMode::from_persisted_key(
+            &state.timeline_display_mode,
+        ));
         if views_valid {
             self.restore_log_view_layout(state);
         }
@@ -2561,6 +2804,9 @@ impl HaystackApp {
                         ),
                     );
                     new_tab.log_line_display_mode = self.settings.log_line_display_mode;
+                    new_tab.set_timeline_display_mode(TimelineDisplayMode::from_persisted_key(
+                        &self.settings.timeline_display_mode,
+                    ));
                     new_tab.search_history = self.settings.recent_searches.clone();
                     new_tab.field_search_history = self.settings.recent_field_searches.clone();
                     new_tab.filter_history = self.settings.recent_filters.clone();
@@ -4851,6 +5097,39 @@ mod tests {
     }
 
     #[test]
+    fn timeline_display_mode_persists_in_sidecar_and_settings() {
+        let path = write_temp(
+            "2026-07-19T10:00:02.000Z late\n\
+             2026-07-19T10:00:00.000Z early\n",
+        );
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+
+        // Set the mode to Time and serialize to sidecar.
+        tab.set_timeline_display_mode(TimelineDisplayMode::Time);
+        let saved_state = tab.investigation_state();
+        assert_eq!(saved_state.timeline_display_mode, "time");
+
+        // Restore from sidecar to a fresh tab.
+        let doc2 = LogDocument::open(&path).unwrap();
+        let mut tab2 = LogTab::new(doc2);
+        assert_eq!(tab2.timeline_display_mode, TimelineDisplayMode::Line);
+        let theme = crate::ui::theme::Theme::dark();
+        tab2.apply_sidecar_safe(&saved_state, &theme);
+        assert_eq!(tab2.timeline_display_mode, TimelineDisplayMode::Time);
+
+        // Test timeless-doc-rejects-sidecar case.
+        let path_timeless = write_temp("alpha\nbeta\n");
+        let doc_timeless = LogDocument::open(&path_timeless).unwrap();
+        let mut tab_timeless = LogTab::new(doc_timeless);
+        tab_timeless.apply_sidecar_safe(&saved_state, &theme);
+        assert_eq!(tab_timeless.timeline_display_mode, TimelineDisplayMode::Line);
+
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(path_timeless).ok();
+    }
+
+    #[test]
     fn real_time_trim_rebuilds_from_only_remaining_source_lines() {
         let path = write_temp(
             "2026-07-19T10:00:00.000Z first\n\
@@ -5695,16 +5974,16 @@ mod tests {
                 .push_to_focused_leaf(ViewTab::Log(id));
         }
 
-        assert!(tab.detach_dock_view(ViewTab::Log(first)));
-        assert!(tab.detach_dock_view(ViewTab::Log(second)));
+        let first_window = tab.detach_dock_view(ViewTab::Log(first)).unwrap();
+        let second_window = tab.detach_dock_view(ViewTab::Log(second)).unwrap();
         assert_eq!(tab.detached_views.len(), 2);
-        assert!(tab.redock_view(ViewTab::Log(second)));
-        assert!(!tab.detached_views.contains(&ViewTab::Log(second)));
+        assert!(tab.redock_view(second_window));
+        assert!(!tab.is_view_detached(ViewTab::Log(second)));
         assert!(tab.dock_state.find_tab(&ViewTab::Log(second)).is_some());
 
         assert!(tab.close_log_view(first));
-        assert!(!tab.detached_views.contains(&ViewTab::Log(first)));
-        assert!(!tab.redock_view(ViewTab::Log(first)));
+        assert!(!tab.detached_views.contains(&first_window));
+        assert!(!tab.redock_view(first_window));
         assert!(tab.dock_state.find_tab(&ViewTab::Log(first)).is_none());
         let second_count = tab
             .dock_state
@@ -5726,20 +6005,15 @@ mod tests {
             .main_surface_mut()
             .push_to_focused_leaf(ViewTab::Log(second));
 
-        assert!(tab.detach_dock_view(ViewTab::Log(first)));
+        let window = tab.detach_dock_view(ViewTab::Log(first)).unwrap();
         let second_path = tab.dock_state.find_tab(&ViewTab::Log(second)).unwrap();
         tab.dock_state.remove_tab(second_path);
         tab.detached_dock_states
-            .get_mut(&ViewTab::Log(first))
+            .get_mut(&window)
             .unwrap()
             .push_to_focused_leaf(ViewTab::Log(second));
-        assert_eq!(
-            tab.detached_dock_states[&ViewTab::Log(first)]
-                .iter_all_tabs()
-                .count(),
-            2
-        );
-        assert!(tab.redock_view(ViewTab::Log(first)));
+        assert_eq!(tab.detached_dock_states[&window].iter_all_tabs().count(), 2);
+        assert!(tab.redock_view(window));
         assert!(tab.dock_state.find_tab(&ViewTab::Log(first)).is_some());
         assert!(tab.dock_state.find_tab(&ViewTab::Log(second)).is_some());
         std::fs::remove_file(path).ok();
@@ -5760,15 +6034,20 @@ mod tests {
             .main_surface_mut()
             .push_to_focused_leaf(ViewTab::Log(third));
 
-        assert!(tab.detach_dock_view(ViewTab::Log(first)));
-        let detached = ViewTab::Log(first);
-        assert!(tab.dock_log_view(second, LogDockTarget::Detached(detached)));
+        let detached = tab.detach_dock_view(ViewTab::Log(first)).unwrap();
+        assert!(tab.dock_view(
+            ViewTab::Log(second),
+            DockDropTarget::JoinDetached {
+                window: detached,
+                sibling: ViewTab::Log(first),
+            }
+        ));
         assert!(tab.dock_state.find_tab(&ViewTab::Log(second)).is_none());
         assert!(tab.detached_dock_states[&detached]
             .find_tab(&ViewTab::Log(second))
             .is_some());
 
-        assert!(tab.dock_log_view(first, LogDockTarget::Main));
+        assert!(tab.dock_view(ViewTab::Log(first), DockDropTarget::MainLog));
         let first_path = tab.dock_state.find_tab(&ViewTab::Log(first)).unwrap();
         let third_path = tab.dock_state.find_tab(&ViewTab::Log(third)).unwrap();
         let pinned_path = tab.dock_state.find_tab(&ViewTab::Pinned).unwrap();
@@ -5777,7 +6056,7 @@ mod tests {
         assert_eq!(pinned_path.node_path(), templates_path.node_path());
         assert_ne!(first_path.node_path(), pinned_path.node_path());
 
-        assert!(tab.dock_log_view(second, LogDockTarget::Main));
+        assert!(tab.dock_view(ViewTab::Log(second), DockDropTarget::MainLog));
         assert!(!tab.detached_views.contains(&detached));
         assert!(tab.detached_dock_states.get(&detached).is_none());
         assert!(tab.main_dock_layout_is_legal());
@@ -5792,16 +6071,305 @@ mod tests {
         let only = tab.focused_log_view_id;
         let detached = ViewTab::Log(only);
 
-        assert!(tab.detach_dock_view(detached));
+        let window = tab.detach_dock_view(detached).unwrap();
         assert!(tab.dock_state.find_tab(&detached).is_none());
         assert!(tab.main_dock_layout_is_legal());
 
-        assert!(tab.dock_log_view(only, LogDockTarget::Main));
+        assert!(tab.dock_view(detached, DockDropTarget::MainLog));
         assert!(tab.dock_state.find_tab(&detached).is_some());
         assert!(tab.main_dock_layout_is_legal());
-        assert!(!tab.detached_views.contains(&detached));
-        assert!(tab.detached_dock_states.get(&detached).is_none());
+        assert!(!tab.detached_views.contains(&window));
+        assert!(tab.detached_dock_states.get(&window).is_none());
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn detached_window_survives_its_founder_and_accepts_utility_tabs() {
+        let path = write_temp("zero\none\ntwo\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let first = tab.focused_log_view_id;
+        let window = tab.detach_dock_view(ViewTab::Log(first)).unwrap();
+
+        assert!(tab.dock_view(
+            ViewTab::Pinned,
+            DockDropTarget::JoinDetached {
+                window,
+                sibling: ViewTab::Log(first),
+            }
+        ));
+        assert!(tab.dock_view(ViewTab::Log(first), DockDropTarget::MainLog));
+        assert!(tab.detached_views.contains(&window));
+        assert!(tab.detached_dock_states[&window]
+            .find_tab(&ViewTab::Pinned)
+            .is_some());
+        assert!(tab.dock_view(
+            ViewTab::Templates,
+            DockDropTarget::JoinDetached {
+                window,
+                sibling: ViewTab::Pinned,
+            }
+        ));
+        assert!(!tab.dock_view(ViewTab::Pinned, DockDropTarget::MainLog));
+        assert!(!tab.dock_view(ViewTab::Log(first), DockDropTarget::MainUtility));
+
+        assert!(tab.redock_view(window));
+        let pinned = tab.dock_state.find_tab(&ViewTab::Pinned).unwrap();
+        let templates = tab.dock_state.find_tab(&ViewTab::Templates).unwrap();
+        let log = tab.dock_state.find_tab(&ViewTab::Log(first)).unwrap();
+        assert_eq!(pinned.node_path(), templates.node_path());
+        assert_ne!(pinned.node_path(), log.node_path());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn detached_cross_window_drop_can_split_or_insert_at_a_tab() {
+        let path = write_temp("zero\none\ntwo\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let first = tab.focused_log_view_id;
+        let second = tab.add_log_view();
+        tab.dock_state
+            .main_surface_mut()
+            .push_to_focused_leaf(ViewTab::Log(second));
+        let window = tab.detach_dock_view(ViewTab::Log(first)).unwrap();
+
+        assert!(tab.dock_view(
+            ViewTab::Log(second),
+            DockDropTarget::SplitDetached {
+                window,
+                sibling: ViewTab::Log(first),
+                split: egui_dock::Split::Right,
+            }
+        ));
+        assert_eq!(tab.detached_dock_states[&window].iter_leaves().count(), 2);
+
+        assert!(tab.dock_view(
+            ViewTab::Pinned,
+            DockDropTarget::TabInsert {
+                container: DockContainer::Detached(window),
+                sibling: ViewTab::Log(first),
+                after: true,
+            }
+        ));
+        let state = &tab.detached_dock_states[&window];
+        let first_path = state.find_tab(&ViewTab::Log(first)).unwrap();
+        let pinned_path = state.find_tab(&ViewTab::Pinned).unwrap();
+        assert_eq!(first_path.node_path(), pinned_path.node_path());
+        assert_eq!(pinned_path.tab.0, first_path.tab.0 + 1);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn same_window_drop_reorders_main_tabs_and_splits_detached_tabs() {
+        let path = write_temp("zero\none\ntwo\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let first = tab.focused_log_view_id;
+        let second = tab.add_log_view();
+        tab.dock_state
+            .main_surface_mut()
+            .push_to_focused_leaf(ViewTab::Log(second));
+
+        assert!(tab.dock_view(
+            ViewTab::Log(second),
+            DockDropTarget::TabInsert {
+                container: DockContainer::Main,
+                sibling: ViewTab::Log(first),
+                after: false,
+            }
+        ));
+        assert_eq!(
+            tab.dock_state
+                .leaf(
+                    tab.dock_state
+                        .find_tab(&ViewTab::Log(first))
+                        .unwrap()
+                        .node_path()
+                )
+                .unwrap()
+                .tabs(),
+            &[ViewTab::Log(second), ViewTab::Log(first)]
+        );
+
+        let window = tab.detach_dock_view(ViewTab::Log(first)).unwrap();
+        assert!(tab.dock_view(
+            ViewTab::Log(second),
+            DockDropTarget::JoinDetached {
+                window,
+                sibling: ViewTab::Log(first),
+            }
+        ));
+        assert!(tab.dock_view(
+            ViewTab::Log(second),
+            DockDropTarget::SplitDetached {
+                window,
+                sibling: ViewTab::Log(first),
+                split: egui_dock::Split::Below,
+            }
+        ));
+        assert_eq!(tab.detached_dock_states[&window].iter_leaves().count(), 2);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn dropping_outside_targets_creates_a_positioned_detached_window() {
+        let path = write_temp("zero\none\ntwo\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let first = tab.focused_log_view_id;
+        let second = tab.add_log_view();
+        tab.dock_state
+            .main_surface_mut()
+            .push_to_focused_leaf(ViewTab::Log(second));
+        let first_position = egui::pos2(-320.0, 140.0);
+
+        let first_window = tab
+            .detach_view_to_window(ViewTab::Log(first), Some(first_position))
+            .unwrap();
+        assert_eq!(
+            tab.detached_window_geometry[&first_window].position,
+            Some(first_position)
+        );
+        assert!(tab.pending_detached_window_geometry.contains(&first_window));
+        assert!(tab.detached_dock_states[&first_window]
+            .find_tab(&ViewTab::Log(first))
+            .is_some());
+
+        assert!(tab.dock_view(
+            ViewTab::Log(second),
+            DockDropTarget::JoinDetached {
+                window: first_window,
+                sibling: ViewTab::Log(first),
+            }
+        ));
+        let second_window = tab
+            .detach_view_to_window(ViewTab::Log(first), Some(egui::pos2(700.0, 80.0)))
+            .unwrap();
+        assert_ne!(first_window, second_window);
+        assert!(tab.detached_views.contains(&first_window));
+        assert!(tab.detached_views.contains(&second_window));
+        assert!(tab.detached_dock_states[&first_window]
+            .find_tab(&ViewTab::Log(second))
+            .is_some());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn sidecar_restores_free_form_detached_layout_and_geometry() {
+        let path = write_temp("zero\none\ntwo\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let first = tab.focused_log_view_id;
+        let second = tab.add_log_view();
+        tab.dock_state
+            .main_surface_mut()
+            .push_to_focused_leaf(ViewTab::Log(second));
+        let window = tab
+            .detach_view_to_window(ViewTab::Log(first), Some(egui::pos2(-240.0, 90.0)))
+            .unwrap();
+        assert!(tab.dock_view(
+            ViewTab::Log(second),
+            DockDropTarget::SplitDetached {
+                window,
+                sibling: ViewTab::Log(first),
+                split: egui_dock::Split::Right,
+            }
+        ));
+        tab.detached_window_geometry
+            .get_mut(&window)
+            .unwrap()
+            .inner_size = egui::vec2(840.0, 520.0);
+
+        let state = tab.investigation_state();
+        let doc = LogDocument::open(&path).unwrap();
+        let mut restored = LogTab::new(doc);
+        restored.restore_sidecar(
+            LoadedState {
+                state,
+                status: MatchStatus::Exact,
+            },
+            &Theme::dark(),
+        );
+
+        assert_eq!(
+            restored.detached_dock_states[&window].iter_leaves().count(),
+            2
+        );
+        assert_eq!(
+            restored.detached_window_geometry[&window],
+            DetachedWindowGeometry {
+                position: Some(egui::pos2(-240.0, 90.0)),
+                inner_size: egui::vec2(840.0, 520.0),
+            }
+        );
+        assert!(restored.pending_detached_window_geometry.contains(&window));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn log_dock_drag_uses_the_last_overlapping_screen_target() {
+        let mut drag = DockDragSession::new(ViewTab::Log(LogViewId(7)), DockContainer::Main);
+        drag.register_target(
+            DockDropTarget::JoinDetached {
+                window: DockWindowId(1),
+                sibling: ViewTab::Log(LogViewId(1)),
+            },
+            egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 300.0)),
+        );
+        drag.register_target(
+            DockDropTarget::JoinDetached {
+                window: DockWindowId(2),
+                sibling: ViewTab::Log(LogViewId(2)),
+            },
+            egui::Rect::from_min_max(egui::pos2(200.0, 200.0), egui::pos2(400.0, 400.0)),
+        );
+
+        drag.pointer_screen = Some(egui::pos2(250.0, 250.0));
+        drag.active = true;
+        assert_eq!(
+            drag.hovered_target(),
+            Some(DockDropTarget::JoinDetached {
+                window: DockWindowId(2),
+                sibling: ViewTab::Log(LogViewId(2)),
+            })
+        );
+        drag.pointer_screen = Some(egui::pos2(50.0, 50.0));
+        assert_eq!(drag.hovered_target(), None);
+    }
+
+    #[test]
+    fn tab_insertion_target_wins_over_an_overlapping_pane_target() {
+        let window = DockWindowId(3);
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(200.0, 200.0));
+        let mut drag = DockDragSession::new(ViewTab::Pinned, DockContainer::Main);
+        drag.active = true;
+        drag.pointer_screen = Some(egui::pos2(50.0, 50.0));
+        drag.register_target(
+            DockDropTarget::SplitDetached {
+                window,
+                sibling: ViewTab::Templates,
+                split: egui_dock::Split::Left,
+            },
+            rect,
+        );
+        let insertion = DockDropTarget::TabInsert {
+            container: DockContainer::Detached(window),
+            sibling: ViewTab::Templates,
+            after: false,
+        };
+        drag.register_target(insertion, rect);
+        assert_eq!(drag.hovered_target(), Some(insertion));
+    }
+
+    #[test]
+    fn dock_drag_activates_after_a_small_pointer_move() {
+        let mut drag = DockDragSession::new(ViewTab::Pinned, DockContainer::Main);
+        drag.update_pointer(egui::pos2(10.0, 10.0));
+        drag.update_pointer(egui::pos2(12.0, 12.0));
+        assert!(!drag.active);
+        drag.update_pointer(egui::pos2(15.0, 10.0));
+        assert!(drag.active);
     }
 
     #[test]
@@ -5823,7 +6391,7 @@ mod tests {
         tab.dock_state
             .main_surface_mut()
             .push_to_focused_leaf(ViewTab::Log(second));
-        assert!(tab.detach_dock_view(ViewTab::Log(second)));
+        assert!(tab.detach_dock_view(ViewTab::Log(second)).is_some());
 
         let state = tab.investigation_state();
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -5850,7 +6418,7 @@ mod tests {
             restored.pending_toast
         );
         assert_eq!(restored.focused_log_view_id, second);
-        assert!(restored.detached_views.contains(&ViewTab::Log(second)));
+        assert!(restored.is_view_detached(ViewTab::Log(second)));
         assert_eq!(restored.log_views[&first].context_line, Some(1));
         assert_eq!(restored.log_views[&first].find_input, "first");
         assert_eq!(restored.log_views[&second].context_line, Some(3));
@@ -5874,7 +6442,7 @@ mod tests {
         );
         assert_eq!(reopened.log_view_count(), 1);
         assert_eq!(reopened.focused_log_view_id, second);
-        assert!(reopened.detached_views.contains(&ViewTab::Log(second)));
+        assert!(reopened.is_view_detached(ViewTab::Log(second)));
         std::fs::remove_file(path).ok();
     }
 

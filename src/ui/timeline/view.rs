@@ -50,7 +50,7 @@ const EYE_LEFT_PAD: f32 = 2.0;
 const LABEL_LANE_PAD: f32 = 3.0;
 /// Height of the header row (filter controls). Included in `panel_height` so
 /// the fixed top panel is tall enough for controls + body + minimap.
-const HEADER_HEIGHT: f32 = 24.0;
+const HEADER_HEIGHT: f32 = 22.0;
 
 fn minimap_height() -> f32 {
     8.0 + MINIMAP_HEIGHT
@@ -85,7 +85,7 @@ pub fn panel_height(tab: &LogTab) -> f32 {
 
     HEADER_HEIGHT
         + content_height
-        + (if has_lanes { 10.0 } else { 0.0 }) // gap after histo
+        + (if has_lanes { 4.0 } else { 0.0 }) // gap after histo to axis labels
         + 18.0 // axis labels row
         + minimap_height()
 }
@@ -96,24 +96,36 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let mut requested_mode = tab.timeline_display_mode;
     ui.horizontal(|ui| {
         ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
         filter_strip::add_filter_ui(ui, tab, theme);
 
         ui.separator();
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for mode in TimelineDisplayMode::ALL {
-            let enabled = mode == TimelineDisplayMode::Line || tab.doc.time_range.is_some();
-            let response = ui.add_enabled(
-                enabled,
-                egui::Button::new(RichText::new(mode.label()).small())
-                    .selected(requested_mode == mode),
-            );
-            if response.clicked() {
-                requested_mode = mode;
-            }
-            if !enabled {
-                response.on_disabled_hover_text("No valid log timestamps were detected");
-            }
-        }
+
+        egui::Frame::new()
+            .fill(theme.raised_surface)
+            .stroke(Stroke::new(1.0, theme.border))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(4, 0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for mode in TimelineDisplayMode::ALL {
+                    let enabled = mode == TimelineDisplayMode::Line || tab.doc.time_range.is_some();
+                    let response = ui.add_enabled(
+                        enabled,
+                        egui::Button::new(RichText::new(mode.label()).small())
+                            .selected(requested_mode == mode),
+                    );
+                    if response.clicked() {
+                        requested_mode = mode;
+                    }
+                    if !enabled {
+                        response.on_disabled_hover_text("No valid log timestamps were detected");
+                    }
+                }
+            });
+
+        ui.separator();
+
         ui.spacing_mut().item_spacing.x = 8.0;
 
         if zoomed
@@ -193,6 +205,10 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             }
         }
     });
+
+    // Eliminate spacing between header and content immediately after header closes
+    ui.spacing_mut().item_spacing.y = 0.0;
+
     if requested_mode != tab.timeline_display_mode {
         tab.set_timeline_display_mode(requested_mode);
     }
@@ -216,17 +232,11 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let lanes_height = total_lanes as f32 * LANE_HEIGHT;
     let content_height = HISTO_HEIGHT.max(lanes_height);
 
-    // egui inserts vertical item spacing between the header widget and this
-    // body allocation. Remove that inter-widget spacing for the boundary only;
-    // the timeline's internal axis/minimap spacing remains unchanged.
-    let previous_item_spacing_y = ui.spacing().item_spacing.y;
-    ui.spacing_mut().item_spacing.y = 0.0;
     let height = panel_height(tab) - HEADER_HEIGHT;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click_and_drag(),
     );
-    ui.spacing_mut().item_spacing.y = previous_item_spacing_y;
     if !ui.is_rect_visible(rect) {
         return;
     }
@@ -1028,7 +1038,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let domain_units = view_end.saturating_sub(view_start).saturating_add(1);
     let n_ticks = max_ticks_for_width.min(domain_units.clamp(1, 7) as usize);
     let label_y = lanes_bottom + 4.0;
-    let font_id = egui::FontId::monospace(11.0);
+    let font_id = egui::FontId::monospace(12.0);
     let mut tick_xs: Vec<f32> = Vec::with_capacity(n_ticks);
     let mut tick_vs: Vec<i64> = Vec::with_capacity(n_ticks);
 
@@ -1101,11 +1111,11 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         // Tick mark.
         painter.line_segment(
             [Pos2::new(x, label_y), Pos2::new(x, label_y + 6.0)],
-            Stroke::new(1.0_f32, theme.axis),
+            Stroke::new(1.0_f32, theme.text),
         );
         // Label. Use an egui label here so the time/line captions can be bold.
         let galley = ui.ctx().fonts_mut(|fonts| {
-            fonts.layout_no_wrap(labels[i].clone(), font_id.clone(), theme.axis)
+            fonts.layout_no_wrap(labels[i].clone(), font_id.clone(), theme.text)
         });
         let label_rect = Rect::from_center_size(
             Pos2::new(x, label_y + 2.0 + galley.size().y / 2.0),
@@ -1116,9 +1126,9 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             egui::Label::new(
                 RichText::new(&labels[i])
                     .monospace()
-                    .size(10.0)
+                    .size(11.0)
                     .strong()
-                    .color(theme.axis),
+                    .color(theme.text),
             ),
         );
         if tab.timeline_display_mode == TimelineDisplayMode::Line {
@@ -1135,13 +1145,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     }
 
     // ---- restrained duration labels between selected tick pairs ----
-    let dur_font = egui::FontId::monospace(8.5);
+    let dur_font = egui::FontId::monospace(9.5);
     for i in 1..n_ticks {
-        // Adjacent deltas repeat the same information on dense axes. Keep a
-        // couple of well-spaced guides only when the labels have room.
-        if n_ticks > 3 && i % 2 == 0 {
-            continue;
-        }
         let mid_x = (tick_xs[i - 1] + tick_xs[i]) / 2.0;
         let delta = if tab.timeline_display_mode.shows_time_labels() {
             tick_times[i]
@@ -1163,7 +1168,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                 egui::Align2::CENTER_TOP,
                 &dur_str,
                 dur_font.clone(),
-                theme.hint,
+                theme.text_muted,
             );
         }
     }

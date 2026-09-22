@@ -29,6 +29,7 @@ impl LogTab {
             self.timeline_line_zoom
         };
         self.timeline_brush_start = None;
+        self.pending_timeline_display_mode = Some(mode);
         self.ensure_visible();
     }
 
@@ -427,16 +428,20 @@ impl LogTab {
             pending_recent_search: None,
             pending_recent_field_search: None,
             pending_recent_filter: None,
+            pending_timeline_display_mode: None,
             filter_suggestions_open: false,
             filter_highlight: None,
             dock_state,
             detached_views: HashSet::new(),
             detached_locations: HashMap::new(),
             detached_dock_states: HashMap::new(),
+            detached_window_geometry: HashMap::new(),
+            pending_detached_window_geometry: HashSet::new(),
+            next_dock_window_id: 1,
             just_closed_viewports: Vec::new(),
             pending_detach: None,
             pending_add_log_view: None,
-            active_log_drag: None,
+            active_dock_drag: None,
             mcp_serving: false,
             stale: false,
             pending_sidecar_restore: None,
@@ -493,66 +498,169 @@ impl LogTab {
         id
     }
 
-    /// Move a Log View to the main dock or another detached native window.
-    /// The main dock is rebuilt into its intentional two-region form after a
-    /// move, so a transferred Log View can never land in the lower utility
-    /// panel.
-    pub fn dock_log_view(&mut self, id: LogViewId, target: LogDockTarget) -> bool {
-        let view_tab = ViewTab::Log(id);
-        if !self.log_views.contains_key(&id) {
+    pub fn detached_window_for(&self, view_tab: ViewTab) -> Option<DockWindowId> {
+        self.detached_dock_states
+            .iter()
+            .find_map(|(window, state)| state.find_tab(&view_tab).map(|_| *window))
+    }
+
+    pub fn is_view_detached(&self, view_tab: ViewTab) -> bool {
+        self.detached_window_for(view_tab).is_some()
+    }
+
+    pub fn dock_target_accepts(tab: ViewTab, target: DockDropTarget) -> bool {
+        match target {
+            DockDropTarget::MainLog => matches!(tab, ViewTab::Log(_)),
+            DockDropTarget::MainUtility => matches!(tab, ViewTab::Pinned | ViewTab::Templates),
+            DockDropTarget::JoinDetached { .. } | DockDropTarget::SplitDetached { .. } => {
+                !matches!(tab, ViewTab::Timeline)
+            }
+            DockDropTarget::TabInsert {
+                container, sibling, ..
+            } => match container {
+                DockContainer::Detached(_) => !matches!(tab, ViewTab::Timeline),
+                DockContainer::Main => {
+                    matches!((tab, sibling), (ViewTab::Log(_), ViewTab::Log(_)))
+                        || (matches!(tab, ViewTab::Pinned | ViewTab::Templates)
+                            && matches!(sibling, ViewTab::Pinned | ViewTab::Templates))
+                }
+            },
+        }
+    }
+
+    /// Move a workspace tab between the main window's fixed homes and any
+    /// detached free-form dock window.
+    pub fn dock_view(&mut self, view_tab: ViewTab, target: DockDropTarget) -> bool {
+        if matches!(view_tab, ViewTab::Log(id) if !self.log_views.contains_key(&id))
+            || !Self::dock_target_accepts(view_tab, target)
+        {
             return false;
         }
-        let target_window = match target {
-            LogDockTarget::Main => None,
-            LogDockTarget::Detached(window)
-                if matches!(window, ViewTab::Log(_)) && self.detached_views.contains(&window) =>
+        let _target_window = match target {
+            DockDropTarget::JoinDetached { window, .. }
+            | DockDropTarget::SplitDetached { window, .. }
+                if self.detached_views.contains(&window)
+                    && self.detached_dock_states.contains_key(&window) =>
             {
                 Some(window)
             }
-            LogDockTarget::Detached(_) => return false,
+            DockDropTarget::TabInsert {
+                container: DockContainer::Detached(window),
+                ..
+            } if self.detached_views.contains(&window)
+                && self.detached_dock_states.contains_key(&window) =>
+            {
+                Some(window)
+            }
+            DockDropTarget::JoinDetached { .. }
+            | DockDropTarget::SplitDetached { .. }
+            | DockDropTarget::TabInsert {
+                container: DockContainer::Detached(_),
+                ..
+            } => return false,
+            DockDropTarget::MainLog | DockDropTarget::MainUtility => None,
+            DockDropTarget::TabInsert {
+                container: DockContainer::Main,
+                ..
+            } => None,
         };
-
         let source_main = self.dock_state.find_tab(&view_tab).is_some();
-        let source_window = self
-            .detached_dock_states
-            .iter()
-            .find_map(|(window, state)| state.find_tab(&view_tab).map(|_| *window));
+        let source_window = self.detached_window_for(view_tab);
         if !source_main && source_window.is_none() {
             return false;
         }
-        if source_window.is_some() && source_window == target_window {
+        if matches!(target,
+            DockDropTarget::JoinDetached { sibling, .. }
+                | DockDropTarget::SplitDetached { sibling, .. }
+                | DockDropTarget::TabInsert { sibling, .. }
+                if sibling == view_tab
+        ) {
+            return false;
+        }
+        let target_exists = match target {
+            DockDropTarget::JoinDetached { window, sibling }
+            | DockDropTarget::SplitDetached {
+                window, sibling, ..
+            } => self
+                .detached_dock_states
+                .get(&window)
+                .is_some_and(|state| state.find_tab(&sibling).is_some()),
+            DockDropTarget::TabInsert {
+                container: DockContainer::Main,
+                sibling,
+                ..
+            } => self.dock_state.find_tab(&sibling).is_some(),
+            DockDropTarget::TabInsert {
+                container: DockContainer::Detached(window),
+                sibling,
+                ..
+            } => self
+                .detached_dock_states
+                .get(&window)
+                .is_some_and(|state| state.find_tab(&sibling).is_some()),
+            DockDropTarget::MainLog | DockDropTarget::MainUtility => true,
+        };
+        if !target_exists {
             return false;
         }
 
         if source_main {
-            let location = self
-                .dock_state
-                .find_tab(&view_tab)
-                .expect("located main Log View must still be present");
+            let location = self.dock_state.find_tab(&view_tab).unwrap();
             self.dock_state.remove_tab(location);
         } else if let Some(window) = source_window {
-            let state = self
-                .detached_dock_states
-                .get_mut(&window)
-                .expect("located detached Log View must retain its dock state");
-            let location = state
-                .find_tab(&view_tab)
-                .expect("located detached Log View must still be present");
+            let state = self.detached_dock_states.get_mut(&window).unwrap();
+            let location = state.find_tab(&view_tab).unwrap();
             state.remove_tab(location);
         }
 
-        match target_window {
-            Some(window) => {
-                let state = self
-                    .detached_dock_states
-                    .get_mut(&window)
-                    .expect("validated detached target must retain its dock state");
+        match target {
+            DockDropTarget::JoinDetached { window, sibling } => {
+                let state = self.detached_dock_states.get_mut(&window).unwrap();
+                let leaf = state.find_tab(&sibling).unwrap().node_path();
+                state.set_focused_node_and_surface(leaf);
                 state.push_to_focused_leaf(view_tab);
                 if source_main {
                     self.normalize_main_dock_layout();
                 }
             }
-            None => self.dock_log_view_in_main(id),
+            DockDropTarget::SplitDetached {
+                window,
+                sibling,
+                split,
+            } => {
+                let state = self.detached_dock_states.get_mut(&window).unwrap();
+                let leaf = state.find_tab(&sibling).unwrap().node_path();
+                state[leaf.surface].split_tabs(leaf.node, split, 0.5, vec![view_tab]);
+                if source_main {
+                    self.normalize_main_dock_layout();
+                }
+            }
+            DockDropTarget::TabInsert {
+                container,
+                sibling,
+                after,
+            } => {
+                let state = match container {
+                    DockContainer::Main => &mut self.dock_state,
+                    DockContainer::Detached(window) => {
+                        self.detached_dock_states.get_mut(&window).unwrap()
+                    }
+                };
+                let Some(sibling_path) = state.find_tab(&sibling) else {
+                    return false;
+                };
+                let Ok(leaf) = state.leaf_mut(sibling_path.node_path()) else {
+                    return false;
+                };
+                let index = sibling_path.tab.0 + usize::from(after);
+                leaf.insert_tab(egui_dock::TabIndex(index.min(leaf.tabs().len())), view_tab);
+                if source_main && !matches!(container, DockContainer::Main) {
+                    self.normalize_main_dock_layout();
+                }
+            }
+            DockDropTarget::MainLog | DockDropTarget::MainUtility => {
+                self.dock_view_in_main(view_tab)
+            }
         }
 
         if let Some(window) = source_window {
@@ -563,14 +671,17 @@ impl LogTab {
             if source_is_empty {
                 self.detached_dock_states.remove(&window);
                 self.detached_views.remove(&window);
-                self.detached_locations.remove(&window);
+                self.detached_window_geometry.remove(&window);
+                self.pending_detached_window_geometry.remove(&window);
             }
         }
-        self.focus_log_view(id);
+        if let ViewTab::Log(id) = view_tab {
+            self.focus_log_view(id);
+        }
         true
     }
 
-    fn dock_log_view_in_main(&mut self, id: LogViewId) {
+    fn dock_view_in_main(&mut self, view_tab: ViewTab) {
         let mut logs: Vec<_> = self
             .dock_state
             .iter_all_tabs()
@@ -579,10 +690,21 @@ impl LogTab {
                 _ => None,
             })
             .collect();
-        if !logs.contains(&id) {
-            logs.push(id);
+        let mut utilities: Vec<_> = self
+            .dock_state
+            .iter_all_tabs()
+            .filter_map(|(_, tab)| {
+                matches!(tab, ViewTab::Pinned | ViewTab::Templates).then_some(*tab)
+            })
+            .collect();
+        match view_tab {
+            ViewTab::Log(id) if !logs.contains(&id) => logs.push(id),
+            ViewTab::Pinned | ViewTab::Templates if !utilities.contains(&view_tab) => {
+                utilities.push(view_tab)
+            }
+            _ => {}
         }
-        self.rebuild_main_dock(logs);
+        self.rebuild_main_dock(logs, utilities);
     }
 
     /// Restore the only legal main-window arrangement: Log Views in the top
@@ -597,7 +719,14 @@ impl LogTab {
                 _ => None,
             })
             .collect();
-        self.rebuild_main_dock(logs);
+        let utilities = self
+            .dock_state
+            .iter_all_tabs()
+            .filter_map(|(_, tab)| {
+                matches!(tab, ViewTab::Pinned | ViewTab::Templates).then_some(*tab)
+            })
+            .collect();
+        self.rebuild_main_dock(logs, utilities);
     }
 
     /// Whether the visible main dock still matches the fixed top-Log / lower
@@ -639,30 +768,29 @@ impl LogTab {
                 _ => return false,
             }
         }
-        pinned == 1
-            && templates == 1
-            && utility_leaf.is_some()
-            && match log_leaf {
-                Some(log_leaf) => Some(log_leaf) != utility_leaf,
-                // The final Log View may be in a detached native window. The
-                // main window then legitimately retains just its utility tabs.
-                None => true,
+        pinned <= 1
+            && templates <= 1
+            && match (log_leaf, utility_leaf) {
+                (Some(log_leaf), Some(utility_leaf)) => log_leaf != utility_leaf,
+                _ => true,
             }
     }
 
-    fn rebuild_main_dock(&mut self, mut logs: Vec<LogViewId>) {
+    fn rebuild_main_dock(&mut self, mut logs: Vec<LogViewId>, mut utilities: Vec<ViewTab>) {
         logs.sort();
         logs.dedup();
+        utilities.sort();
+        utilities.dedup();
         if logs.is_empty() {
-            self.dock_state = DockState::new(vec![ViewTab::Pinned, ViewTab::Templates]);
+            self.dock_state = DockState::new(utilities);
             return;
         }
         let mut dock_state = DockState::new(logs.into_iter().map(ViewTab::Log).collect());
-        dock_state.main_surface_mut().split_below(
-            egui_dock::NodeIndex::root(),
-            0.8,
-            vec![ViewTab::Pinned, ViewTab::Templates],
-        );
+        if !utilities.is_empty() {
+            dock_state
+                .main_surface_mut()
+                .split_below(egui_dock::NodeIndex::root(), 0.8, utilities);
+        }
         if let Some(path) = dock_state.find_tab(&ViewTab::Log(self.focused_log_view_id)) {
             let _ = dock_state.set_active_tab(path);
         }
@@ -676,15 +804,21 @@ impl LogTab {
             return false;
         }
         let view_tab = ViewTab::Log(id);
-        self.detached_views.remove(&view_tab);
         self.detached_locations.remove(&view_tab);
         for state in self.detached_dock_states.values_mut() {
             state.retain_tabs(|candidate| *candidate != view_tab);
         }
-        self.detached_dock_states
-            .retain(|_, state| state.iter_all_tabs().next().is_some());
-        self.just_closed_viewports
-            .retain(|candidate| *candidate != view_tab);
+        let emptied: Vec<_> = self
+            .detached_dock_states
+            .iter()
+            .filter_map(|(window, state)| state.iter_all_tabs().next().is_none().then_some(*window))
+            .collect();
+        for window in emptied {
+            self.detached_dock_states.remove(&window);
+            self.detached_views.remove(&window);
+            self.detached_window_geometry.remove(&window);
+            self.pending_detached_window_geometry.remove(&window);
+        }
         if self.pending_detach == Some(view_tab) {
             self.pending_detach = None;
         }
@@ -708,33 +842,86 @@ impl LogTab {
 
     /// Move one dock item into the app's native detached-viewport registry.
     /// Each item retains its own best-effort return location.
-    pub fn detach_dock_view(&mut self, view_tab: ViewTab) -> bool {
-        if self.detached_views.contains(&view_tab)
-            || matches!(view_tab, ViewTab::Log(id) if !self.log_views.contains_key(&id))
-        {
-            return false;
+    pub fn detach_dock_view(&mut self, view_tab: ViewTab) -> Option<DockWindowId> {
+        if matches!(view_tab, ViewTab::Log(id) if !self.log_views.contains_key(&id)) {
+            return None;
         }
         let Some(location) = self.dock_state.find_tab(&view_tab) else {
-            return false;
+            return None;
         };
+        let window = DockWindowId(self.next_dock_window_id);
+        self.next_dock_window_id = self.next_dock_window_id.saturating_add(1);
         self.detached_locations.insert(view_tab, location);
-        self.detached_views.insert(view_tab);
+        self.detached_views.insert(window);
         self.detached_dock_states
-            .insert(view_tab, DockState::new(vec![view_tab]));
+            .insert(window, DockState::new(vec![view_tab]));
+        self.detached_window_geometry
+            .insert(window, DetachedWindowGeometry::default());
+        self.pending_detached_window_geometry.insert(window);
         self.dock_state.remove_tab(location);
         self.normalize_main_dock_layout();
-        true
+        Some(window)
+    }
+
+    /// Move a dockable tab into a new native dock window at a screen position.
+    pub fn detach_view_to_window(
+        &mut self,
+        view_tab: ViewTab,
+        position: Option<egui::Pos2>,
+    ) -> Option<DockWindowId> {
+        if matches!(view_tab, ViewTab::Timeline)
+            || matches!(view_tab, ViewTab::Log(id) if !self.log_views.contains_key(&id))
+        {
+            return None;
+        }
+        let source_main = self.dock_state.find_tab(&view_tab);
+        let source_window = self.detached_window_for(view_tab);
+        if source_main.is_none() && source_window.is_none() {
+            return None;
+        }
+        if let Some(location) = source_main {
+            self.detached_locations.insert(view_tab, location);
+            self.dock_state.remove_tab(location);
+            self.normalize_main_dock_layout();
+        } else if let Some(window) = source_window {
+            let state = self.detached_dock_states.get_mut(&window)?;
+            let location = state.find_tab(&view_tab)?;
+            state.remove_tab(location);
+            if state.iter_all_tabs().next().is_none() {
+                self.detached_dock_states.remove(&window);
+                self.detached_views.remove(&window);
+                self.detached_window_geometry.remove(&window);
+                self.pending_detached_window_geometry.remove(&window);
+            }
+        }
+
+        let window = DockWindowId(self.next_dock_window_id);
+        self.next_dock_window_id = self.next_dock_window_id.saturating_add(1);
+        self.detached_views.insert(window);
+        self.detached_dock_states
+            .insert(window, DockState::new(vec![view_tab]));
+        self.detached_window_geometry.insert(
+            window,
+            DetachedWindowGeometry {
+                position,
+                ..Default::default()
+            },
+        );
+        self.pending_detached_window_geometry.insert(window);
+        if let ViewTab::Log(id) = view_tab {
+            self.focus_log_view(id);
+        }
+        Some(window)
     }
 
     /// Return a native viewport to its recorded dock leaf. If dock edits made
     /// that leaf invalid while the window was open, use the focused leaf.
-    pub fn redock_view(&mut self, view_tab: ViewTab) -> bool {
-        let was_detached = self.detached_views.remove(&view_tab);
-        let location = self.detached_locations.remove(&view_tab);
-        let detached_state = self.detached_dock_states.remove(&view_tab);
-        if !was_detached
-            || matches!(view_tab, ViewTab::Log(id) if !self.log_views.contains_key(&id))
-        {
+    pub fn redock_view(&mut self, window: DockWindowId) -> bool {
+        let was_detached = self.detached_views.remove(&window);
+        self.detached_window_geometry.remove(&window);
+        self.pending_detached_window_geometry.remove(&window);
+        let detached_state = self.detached_dock_states.remove(&window);
+        if !was_detached {
             return false;
         }
         let tabs: Vec<_> = detached_state
@@ -749,27 +936,13 @@ impl LogTab {
         let tabs = if tabs.is_empty() {
             // Sidecar restores intentionally keep only logical detached
             // membership; rebuild the initial one-tab panel lazily.
-            vec![view_tab]
+            return false;
         } else {
             tabs
         };
-        if self.dock_state.find_tab(&view_tab).is_some() {
-            return true;
-        }
-        if let Some(location) = location {
-            if location.surface.is_main() {
-                if let Ok(leaf) = self.dock_state.leaf_mut(location.node_path()) {
-                    let index = egui_dock::TabIndex(location.tab.0.min(leaf.tabs().len()));
-                    for (offset, tab) in tabs.into_iter().enumerate() {
-                        leaf.insert_tab(egui_dock::TabIndex(index.0 + offset), tab);
-                    }
-                    self.normalize_main_dock_layout();
-                    return true;
-                }
-            }
-        }
         for tab in tabs {
-            self.dock_state.main_surface_mut().push_to_focused_leaf(tab);
+            self.detached_locations.remove(&tab);
+            self.dock_view_in_main(tab);
         }
         self.normalize_main_dock_layout();
         true
@@ -1397,7 +1570,7 @@ impl LogTab {
         // When Log and Pinned occupy the same dock leaf, make Log active long
         // enough to consume the scroll request before Pinned takes focus.
         let focused_log_tab = ViewTab::Log(self.focused_log_view_id);
-        if !self.detached_views.contains(&focused_log_tab) {
+        if !self.is_view_detached(focused_log_tab) {
             if let Some(path) = self.dock_state.find_tab(&focused_log_tab) {
                 let _ = self.dock_state.set_active_tab(path);
             }
@@ -1409,7 +1582,7 @@ impl LogTab {
     /// navigation without preventing the Log View from scrolling first.
     pub fn finish_pin_navigation(&mut self) {
         if !std::mem::take(&mut self.pending_pin_activation)
-            || self.detached_views.contains(&ViewTab::Pinned)
+            || self.is_view_detached(ViewTab::Pinned)
         {
             return;
         }

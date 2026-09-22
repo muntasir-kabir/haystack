@@ -138,6 +138,9 @@ pub struct Settings {
     /// Special detector-specific tabs are never persisted here.
     #[serde(default = "default_embedded_inspector_mode")]
     pub embedded_inspector_mode: String,
+    /// Last selected Timeline display mode (line, time, or real_time).
+    #[serde(default = "default_timeline_display_mode")]
+    pub timeline_display_mode: String,
 }
 
 fn default_sim_threshold() -> f64 {
@@ -151,6 +154,9 @@ fn default_drain_depth() -> usize {
 }
 fn default_embedded_inspector_mode() -> String {
     "pretty".to_owned()
+}
+fn default_timeline_display_mode() -> String {
+    "line".to_owned()
 }
 
 impl Default for Settings {
@@ -170,6 +176,7 @@ impl Default for Settings {
             drain_depth: default_drain_depth(),
             skip_filter_delete_confirm: false,
             embedded_inspector_mode: default_embedded_inspector_mode(),
+            timeline_display_mode: default_timeline_display_mode(),
         }
     }
 }
@@ -423,6 +430,7 @@ mod tests {
         let mut settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.log_line_display_mode, LogLineDisplayMode::Truncate);
         settings.log_line_display_mode = LogLineDisplayMode::Wrap;
+        settings.timeline_display_mode = "time".to_owned();
         settings.add_recent_search(" error ");
         settings.add_recent_search("warning");
         settings.add_recent_search("error");
@@ -441,6 +449,7 @@ mod tests {
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(restored.log_line_display_mode, LogLineDisplayMode::Wrap);
+        assert_eq!(restored.timeline_display_mode, "time");
         assert_eq!(restored.recent_searches, ["error", "warning"]);
         assert_eq!(
             restored.recent_field_searches,

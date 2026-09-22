@@ -90,6 +90,7 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             );
         });
     });
+    ui.spacing_mut().item_spacing.y = 0.0;
     let order = tab.template_browser.visible_order(&tab.doc);
     if order.is_empty() {
         ui.add_space(12.0);

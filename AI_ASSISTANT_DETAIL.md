@@ -7,8 +7,17 @@ long-line and per-view text-size controls beside the viewer. Detached Log Views
 put Return-to-main in their dock tab rather than a separate header, and source
 annotations use persistent quiet cues with hover, inspector, and context-menu
 access. The main workspace fixes Log Views in its upper dock panel and
-Pinned/Templates in its lower panel, while detached Log View windows remain
-free-form and can receive individual Log Views through drag-and-drop.
+Pinned/Templates in its lower panel. Detached docks have stable window
+identities, accept Log/Pinned/Templates tabs in free-form layouts, and use
+monitor-coordinate, source-captured drag-and-drop that does not rely on
+destination-window events. Dock dragging activates after four points and shows
+a tab ghost plus exact insertion, join, and directional split previews. A drop
+outside legal targets creates a native detached window at the pointer after
+showing a lightweight rectangle/title-strip preview; it never renders live pane
+content during the drag.
+Schema-4 sidecars persist each detached window's stable id, complete dock tree,
+and last known native position/inner size; schema-4 files without that optional
+data retain the earlier one-window-per-detached-tab restore behavior.
 Focus Log View temporarily hides the main-window timeline and dock peers
 without persisting or changing the underlying dock layout.
 
@@ -75,7 +84,7 @@ Rust, eframe/egui (GUI), memmap2 (mmap I/O), memchr (SIMD line indexing), aho-co
 | Focused desktop shell (`Haystack` naming, grouped primary/context/utility actions, responsive More menu below 1100px, cohesive file/loading tabs, task-oriented empty/error states, AI Assistant state menu) | `src/ui/app/{model,view}.rs`, `src/ui/settings/` |
 | Shared overlay input ownership (centered modal editors/inspectors, transparent popover shields, topmost Escape handling, and raw-input suppression across main/detached views) | `src/ui/app/overlay.rs`, `src/ui/app/view.rs`, `src/ui/{log_view,record_format,custom_date,settings}/` |
 | Embedded SVG action system (24×24 `currentColor` outline assets, exhaustive catalog parsing/raster tests, shared compact 22px icon-only/icon+label helpers plus emphasized primary actions, no runtime icon dependency) | `src/ui/icons.rs`, `src/ui/icons/` |
-| Three selectable Timeline domains + filter lanes: Line uses source-line positions and labels; Time retains source-line positions while labeling ticks and intervals with record timestamps; Real Time uses timestamp-sorted auxiliary indexes to proportionally expose inactive gaps from the oldest through latest event while all Log Views and occurrence navigation remain in physical source order. Overview density counts record starts, filter lanes count physical matches, clicks in Real Time gaps resolve to the nearest timestamped source line, the minimap follows the selected coordinates, and line/time zooms are retained independently during a session. | `src/core/timeline.rs`, `src/ui/timeline/`, `src/ui/app/{model,tab_model}.rs` |
+| Three selectable Timeline domains + filter lanes: Line uses source-line positions and labels; Time retains source-line positions while labeling ticks and intervals with record timestamps; Real Time uses timestamp-sorted auxiliary indexes to proportionally expose inactive gaps from the oldest through latest event while all Log Views and occurrence navigation remain in physical source order. Overview density counts record starts, filter lanes count physical matches, clicks in Real Time gaps resolve to the nearest timestamped source line, the minimap follows the selected coordinates, line/time zooms are retained independently during a session, and the selected timeline domain is persisted per-file (sidecar) and as the global default for new files (settings). | `src/core/timeline.rs`, `src/ui/timeline/`, `src/ui/app/{model,tab_model}.rs`, `src/core/sidecar.rs`, `src/core/settings.rs` |
 | Multi-tab log view (truncate / horizontal-scroll / wrap long-line modes, full-line inspector + untruncated copy, hidden-prefix search indication, interval highlighting, Shift-click filter-occurrence context with independent embedded-data scanning, compact `u32` Find/visible indexes, selection-aware minimal scrolling with distant-target centering and scroll-driven reselection; sorted-lane merge and cancellable background rebuild after lane toggles) | `src/ui/log_view/`, `src/ui/app/model.rs`, `src/ui/app/tab_model.rs`, `src/core/settings.rs` |
 | Embedded-data Log View helpers (per-format cue, dedicated one-KV-per-line bounded hover callout, content-sized/resizable inspector, remembered Pretty/Tree/Raw preference, Frames, and encoded Summary/Decode overlay) | `src/ui/log_view/embedded/`, `src/ui/log_view/{annotation_popup,view}.rs`, `src/ui/app/tab_model.rs`, `src/core/settings.rs` |
 | Log View advanced find + keyword highlight (text case modes, regex, typed Template ID, debounced validation, cancellable shared matcher scan, span/row highlighting, and filter promotion) | `src/core/search.rs`, `src/ui/app/tab_model.rs`, `src/ui/log_view/{view,highlight}.rs` |

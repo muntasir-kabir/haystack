@@ -345,7 +345,7 @@ impl HaystackApp {
             AppCommand::ToggleLogFocus => {
                 if let Some(tab) = self.active.and_then(|idx| self.tabs.get_mut(idx)) {
                     let focused = ViewTab::Log(tab.focused_log_view_id);
-                    if !tab.detached_views.contains(&focused) {
+                    if !tab.is_view_detached(focused) {
                         tab.log_focus_mode = !tab.log_focus_mode;
                     }
                 }
@@ -539,7 +539,7 @@ impl HaystackApp {
                 };
                 if icons::action_button_enabled(
                     ui,
-                    !tab.detached_views.contains(&focused),
+                    !tab.is_view_detached(focused),
                     Icon::Expand,
                     label,
                     self.theme.text,
@@ -941,9 +941,16 @@ struct TabViewer<'a> {
     /// Detached Log Views keep their return action in the tab header so it
     /// does not consume a second row above the reading surface.
     return_to_main: Option<&'a mut bool>,
-    /// `None` identifies the main dock. A detached Log window is identified
-    /// by the root tab that created its native viewport.
-    dock_container: Option<ViewTab>,
+    dock_container: DockContainer,
+    drop_targets: &'a mut Vec<DockTargetVisual>,
+}
+
+#[derive(Clone, Copy)]
+struct DockTargetVisual {
+    target: DockDropTarget,
+    hit_rect: egui::Rect,
+    preview_rect: egui::Rect,
+    label: &'static str,
 }
 
 impl<'a> egui_dock::TabViewer for TabViewer<'a> {
@@ -1002,27 +1009,77 @@ impl<'a> egui_dock::TabViewer for TabViewer<'a> {
                 accessible_label.clone(),
             )
         });
-        if let ViewTab::Log(id) = tab {
+        if !matches!(tab, ViewTab::Timeline) {
             // `egui_dock` replaces the original tab response with a drag
             // proxy once its internal drag threshold is crossed. Arm our
             // cross-window bridge while the original tab owns the press,
             // before that proxy exists.
             if response.is_pointer_button_down_on() {
-                self.tab.active_log_drag = Some((*id, self.dock_container));
+                let replace = self
+                    .tab
+                    .active_dock_drag
+                    .as_ref()
+                    .is_none_or(|drag| drag.tab != *tab || drag.source != self.dock_container);
+                if replace {
+                    self.tab.active_dock_drag =
+                        Some(DockDragSession::new(*tab, self.dock_container));
+                }
                 // A native child viewport owns the pointer while the tab is
                 // dragged. Repaint the main window so its cross-window drop
                 // marker appears as soon as the pointer enters it.
                 response.ctx.request_repaint_of(egui::ViewportId::ROOT);
             }
             if response.clicked() {
-                self.tab.focus_log_view(*id);
-                self.tab.active_log_drag = None;
+                if let ViewTab::Log(id) = tab {
+                    self.tab.focus_log_view(*id);
+                }
+                self.tab.active_dock_drag = None;
+            }
+            if self
+                .tab
+                .active_dock_drag
+                .as_ref()
+                .is_some_and(|drag| drag.active && drag.tab != *tab)
+            {
+                let midpoint = response.rect.center().x;
+                for (after, hit_rect, x) in [
+                    (
+                        false,
+                        egui::Rect::from_min_max(
+                            response.rect.min,
+                            egui::pos2(midpoint, response.rect.bottom()),
+                        ),
+                        response.rect.left(),
+                    ),
+                    (
+                        true,
+                        egui::Rect::from_min_max(
+                            egui::pos2(midpoint, response.rect.top()),
+                            response.rect.max,
+                        ),
+                        response.rect.right(),
+                    ),
+                ] {
+                    self.drop_targets.push(DockTargetVisual {
+                        target: DockDropTarget::TabInsert {
+                            container: self.dock_container,
+                            sibling: *tab,
+                            after,
+                        },
+                        hit_rect,
+                        preview_rect: egui::Rect::from_min_max(
+                            egui::pos2(x - 2.0, response.rect.top()),
+                            egui::pos2(x + 2.0, response.rect.bottom()),
+                        ),
+                        label: "Insert tab",
+                    });
+                }
             }
         }
         let action = if self.allow_popout {
             dock_tab_action_rects(*tab, response.rect, self.is_closeable(tab))
                 .map(|rect| (rect, Icon::ExternalWindow))
-        } else if self.return_to_main.is_some() && matches!(tab, ViewTab::Log(_)) {
+        } else if self.return_to_main.is_some() && !matches!(tab, ViewTab::Timeline) {
             dock_tab_action_rects(*tab, response.rect, self.is_closeable(tab))
                 .map(|rect| (rect, Icon::ArrowLeft))
         } else {
@@ -1055,7 +1112,7 @@ impl<'a> egui_dock::TabViewer for TabViewer<'a> {
             let tooltip = if self.allow_popout {
                 format!("Open {} in a separate window", dock_tab_name(*tab))
             } else {
-                "Return this Log View to the main window".to_owned()
+                "Return this detached dock to the main window".to_owned()
             };
             response.clone().on_hover_text(tooltip);
             if response.clicked()
@@ -1100,53 +1157,282 @@ fn log_view_pointer_interaction(ui: &egui::Ui) -> bool {
 /// Draw the explicit, cross-native-window Log View drop marker. `egui_dock`
 /// owns drag feedback inside one dock state; this bridge makes a dragged Log
 /// tab visible and droppable in another native viewport as well.
-fn show_cross_window_log_drop_marker(
+fn show_cross_window_drop_targets(
     ui: &egui::Ui,
     tab: &mut LogTab,
     theme: &Theme,
-    target: LogDockTarget,
-    target_container: Option<ViewTab>,
-    rect: egui::Rect,
+    target_container: DockContainer,
+    targets: &[DockTargetVisual],
 ) -> bool {
-    let Some((id, source_container)) = tab.active_log_drag else {
+    let Some(drag) = tab.active_dock_drag.as_mut() else {
         return false;
     };
-    if source_container == target_container || !tab.log_views.contains_key(&id) {
+    let dragged_tab = drag.tab;
+    if matches!(dragged_tab, ViewTab::Log(id) if !tab.log_views.contains_key(&id)) {
+        tab.active_dock_drag = None;
         return false;
     }
-    let pointer = ui
+
+    let viewport_origin = ui
         .ctx()
-        .pointer_hover_pos()
-        .or_else(|| ui.ctx().pointer_interact_pos());
-    let hovered = pointer.is_some_and(|pointer| rect.contains(pointer));
-    let stroke = if hovered {
-        Stroke::new(2.0, theme.selection_focused)
+        .input(|input| input.viewport().inner_rect.map(|r| r.min));
+    if let Some(origin) = viewport_origin {
+        if let Some(pointer) = ui
+            .ctx()
+            .pointer_interact_pos()
+            .or_else(|| ui.ctx().pointer_hover_pos())
+        {
+            drag.update_pointer(origin + pointer.to_vec2());
+        }
+        if drag.active {
+            for visual in targets {
+                if LogTab::dock_target_accepts(dragged_tab, visual.target)
+                    && !dock_target_points_to_tab(visual.target, dragged_tab)
+                {
+                    drag.register_target(
+                        visual.target,
+                        visual.hit_rect.translate(origin.to_vec2()),
+                    );
+                }
+            }
+        }
+    }
+
+    let local_target = if drag.active && viewport_origin.is_none() {
+        ui.ctx().pointer_hover_pos().and_then(|pointer| {
+            targets
+                .iter()
+                .filter(|visual| {
+                    LogTab::dock_target_accepts(dragged_tab, visual.target)
+                        && !dock_target_points_to_tab(visual.target, dragged_tab)
+                        && visual.hit_rect.contains(pointer)
+                })
+                .max_by_key(|visual| match visual.target {
+                    DockDropTarget::TabInsert { .. } => 3,
+                    DockDropTarget::SplitDetached { .. } => 2,
+                    _ => 1,
+                })
+                .map(|visual| visual.target)
+        })
     } else {
-        Stroke::new(1.0, theme.selection_focused)
+        None
     };
+    let active_target = drag.hovered_target().or(local_target);
+    let pointer_screen = drag.pointer_screen;
     let painter = ui.ctx().layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new(("cross_window_log_drop", target_container)),
     ));
-    painter.rect_stroke(rect.shrink(6.0), 6.0, stroke, egui::StrokeKind::Inside);
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "Drop Log View here",
-        egui::FontId::proportional(14.0),
-        theme.selection_focused,
-    );
-    if hovered {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Copy);
+    if drag.active && drag.source == target_container {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(pointer) = ui
+            .ctx()
+            .pointer_interact_pos()
+            .or_else(|| ui.ctx().pointer_hover_pos())
+        {
+            let ghost = egui::Rect::from_min_size(
+                pointer + egui::vec2(14.0, 14.0),
+                egui::vec2(150.0, 30.0),
+            );
+            painter.rect_filled(ghost, 5.0, theme.raised_surface);
+            painter.rect_stroke(
+                ghost,
+                5.0,
+                Stroke::new(1.5, theme.selection_focused),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                ghost.left_center() + egui::vec2(10.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                if active_target.is_some() {
+                    format!("Dock {}", dock_tab_name(dragged_tab))
+                } else {
+                    format!("New window · {}", dock_tab_name(dragged_tab))
+                },
+                egui::FontId::proportional(13.0),
+                theme.text,
+            );
+        }
     }
-    if hovered && ui.input(|input| input.pointer.primary_released()) {
-        let moved = tab.dock_log_view(id, target);
+    if drag.active {
+        for visual in targets.iter().filter(|visual| {
+            LogTab::dock_target_accepts(dragged_tab, visual.target)
+                && !dock_target_points_to_tab(visual.target, dragged_tab)
+        }) {
+            let hovered = active_target == Some(visual.target);
+            if hovered {
+                painter.rect_filled(
+                    visual.preview_rect,
+                    5.0,
+                    theme.selection_focused.gamma_multiply(0.16),
+                );
+            }
+            painter.rect_stroke(
+                visual.preview_rect,
+                5.0,
+                Stroke::new(if hovered { 2.0 } else { 1.0 }, theme.selection_focused),
+                egui::StrokeKind::Inside,
+            );
+            if hovered && !matches!(visual.target, DockDropTarget::TabInsert { .. }) {
+                painter.text(
+                    visual.preview_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    visual.label,
+                    egui::FontId::proportional(14.0),
+                    theme.selection_focused,
+                );
+            }
+        }
+        if active_target.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+    }
+    if drag.active && active_target.is_none() {
+        let preview_size = egui::vec2(520.0, 360.0);
+        let preview_screen = pointer_screen.map(|pointer| {
+            egui::Rect::from_min_size(pointer - egui::vec2(80.0, 18.0), preview_size)
+        });
+        let preview_local = match (preview_screen, viewport_origin) {
+            (Some(rect), Some(origin)) => Some(rect.translate(-origin.to_vec2())),
+            (None, None) => ui.ctx().pointer_hover_pos().map(|pointer| {
+                egui::Rect::from_min_size(pointer - egui::vec2(80.0, 18.0), preview_size)
+            }),
+            _ => None,
+        };
+        if let Some(preview) = preview_local {
+            painter.rect_filled(preview, 7.0, theme.canvas.gamma_multiply(0.82));
+            painter.rect_stroke(
+                preview,
+                7.0,
+                Stroke::new(2.0, theme.selection_focused),
+                egui::StrokeKind::Inside,
+            );
+            let title_bar = egui::Rect::from_min_max(
+                preview.min,
+                egui::pos2(preview.right(), preview.top() + 30.0),
+            );
+            painter.rect_filled(title_bar, 7.0, theme.raised_surface);
+            painter.text(
+                title_bar.left_center() + egui::vec2(10.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("New window · {}", dock_tab_name(dragged_tab)),
+                egui::FontId::proportional(13.0),
+                theme.text,
+            );
+        }
+    }
+    let released = ui.input(|input| input.pointer.primary_released());
+    if released {
+        let destination = tab
+            .active_dock_drag
+            .as_ref()
+            .and_then(DockDragSession::hovered_target)
+            .or(local_target);
+        let moved = if let Some(destination) = destination {
+            tab.dock_view(dragged_tab, destination)
+        } else if tab
+            .active_dock_drag
+            .as_ref()
+            .is_some_and(|drag| drag.active)
+        {
+            let position = pointer_screen.map(|pointer| pointer - egui::vec2(80.0, 18.0));
+            tab.detach_view_to_window(dragged_tab, position).is_some()
+        } else {
+            false
+        };
+        // Release always terminates the cross-window gesture, including when
+        // it occurs outside every legal target.
+        tab.active_dock_drag = None;
         if moved {
-            tab.active_log_drag = None;
+            ui.ctx().request_repaint();
         }
         return moved;
     }
+
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        tab.active_dock_drag = None;
+    }
     false
+}
+
+fn dock_target_points_to_tab(target: DockDropTarget, tab: ViewTab) -> bool {
+    matches!(
+        target,
+        DockDropTarget::JoinDetached { sibling, .. }
+            | DockDropTarget::SplitDetached { sibling, .. }
+            | DockDropTarget::TabInsert { sibling, .. }
+            if sibling == tab
+    )
+}
+
+fn append_detached_leaf_drop_targets(
+    targets: &mut Vec<DockTargetVisual>,
+    state: &DockState<ViewTab>,
+    window: DockWindowId,
+    dragged_tab: Option<ViewTab>,
+) {
+    for (_leaf, node) in state.iter_leaves() {
+        let Some(sibling) = node
+            .tabs()
+            .iter()
+            .copied()
+            .find(|candidate| Some(*candidate) != dragged_tab)
+        else {
+            continue;
+        };
+        let rect = node.rect().shrink(6.0);
+        if rect.width() < 40.0 || rect.height() < 40.0 {
+            continue;
+        }
+        let x1 = rect.left() + rect.width() * 0.25;
+        let x2 = rect.right() - rect.width() * 0.25;
+        let y1 = rect.top() + rect.height() * 0.25;
+        let y2 = rect.bottom() - rect.height() * 0.25;
+        let center = egui::Rect::from_min_max(egui::pos2(x1, y1), egui::pos2(x2, y2));
+        targets.push(DockTargetVisual {
+            target: DockDropTarget::JoinDetached { window, sibling },
+            hit_rect: center,
+            preview_rect: rect,
+            label: "Join tabs",
+        });
+        for (split, hit_rect, preview_rect, label) in [
+            (
+                egui_dock::Split::Left,
+                egui::Rect::from_min_max(rect.min, egui::pos2(x1, rect.bottom())),
+                egui::Rect::from_min_max(rect.min, egui::pos2(rect.center().x, rect.bottom())),
+                "Dock left",
+            ),
+            (
+                egui_dock::Split::Right,
+                egui::Rect::from_min_max(egui::pos2(x2, rect.top()), rect.max),
+                egui::Rect::from_min_max(egui::pos2(rect.center().x, rect.top()), rect.max),
+                "Dock right",
+            ),
+            (
+                egui_dock::Split::Above,
+                egui::Rect::from_min_max(egui::pos2(x1, rect.top()), egui::pos2(x2, y1)),
+                egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.center().y)),
+                "Dock above",
+            ),
+            (
+                egui_dock::Split::Below,
+                egui::Rect::from_min_max(egui::pos2(x1, y2), egui::pos2(x2, rect.bottom())),
+                egui::Rect::from_min_max(egui::pos2(rect.left(), rect.center().y), rect.max),
+                "Dock below",
+            ),
+        ] {
+            targets.push(DockTargetVisual {
+                target: DockDropTarget::SplitDetached {
+                    window,
+                    sibling,
+                    split,
+                },
+                hit_rect,
+                preview_rect,
+                label,
+            });
+        }
+    }
 }
 
 /// Render through the temporary compatibility bridge without allowing paint
@@ -1172,6 +1458,10 @@ fn show_log_view(
 
 fn detached_viewport_id(path: &std::ffi::OsStr, view_tab: ViewTab) -> egui::ViewportId {
     egui::ViewportId::from_hash_of((path, view_tab))
+}
+
+fn dock_window_viewport_id(path: &std::ffi::OsStr, window: DockWindowId) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of((path, "dock_window", window))
 }
 
 fn dock_tab_name(tab: ViewTab) -> &'static str {
@@ -1399,6 +1689,7 @@ impl HaystackApp {
         let mut close_request: Option<usize> = None;
         egui::Panel::top("top_panel").show(ui, |ui| {
             let compact = compact_top_bar(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
             ui.horizontal(|ui| {
                 ui.spacing_mut().interact_size.y = icons::ACTION_HEIGHT;
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -2253,7 +2544,7 @@ impl HaystackApp {
 
                 if tab.log_focus_mode {
                     let focused_id = tab.focused_log_view_id;
-                    if tab.detached_views.contains(&ViewTab::Log(focused_id)) {
+                    if tab.is_view_detached(ViewTab::Log(focused_id)) {
                         tab.log_focus_mode = false;
                     } else {
                         ui.horizontal(|ui| {
@@ -2284,16 +2575,20 @@ impl HaystackApp {
 
                 let mut dock_state = std::mem::replace(&mut tab.dock_state, DockState::new(vec![]));
                 let dock_path = tab.doc.path.clone();
-                let empty_main_drop_rect = (!dock_state
+                let main_workspace_rect = ui.available_rect_before_wrap();
+                let has_main_logs = dock_state
                     .iter_all_tabs()
-                    .any(|(_, view)| matches!(view, ViewTab::Log(_))))
+                    .any(|(_, view)| matches!(view, ViewTab::Log(_)));
+                let has_main_utilities = dock_state.iter_all_tabs().any(|(_, view)| {
+                    matches!(view, ViewTab::Pinned | ViewTab::Templates)
+                });
+                let empty_main_drop_rect = (!has_main_logs)
                 .then(|| {
-                    let available = ui.available_rect_before_wrap();
                     let rect = egui::Rect::from_min_max(
-                        available.min,
+                        main_workspace_rect.min,
                         egui::pos2(
-                            available.max.x,
-                            available.min.y + available.height() * 0.78,
+                            main_workspace_rect.max.x,
+                            main_workspace_rect.min.y + main_workspace_rect.height() * 0.78,
                         ),
                     );
                     ui.allocate_rect(rect, egui::Sense::hover());
@@ -2312,12 +2607,14 @@ impl HaystackApp {
                     );
                     rect
                 });
+                let mut drop_targets = Vec::new();
                 let mut tab_viewer = TabViewer {
                     tab,
                     theme: &self.theme,
                     allow_popout: true,
                     return_to_main: None,
-                    dock_container: None,
+                    dock_container: DockContainer::Main,
+                    drop_targets: &mut drop_targets,
                 };
                 let dock_style = crate::ui::theme::dock_style(self.dark_mode);
                 DockArea::new(&mut dock_state)
@@ -2327,6 +2624,7 @@ impl HaystackApp {
                     // standalone add button creates Log Views in the clicked leaf.
                     .show_close_buttons(true)
                     .show_add_buttons(true)
+                    .draggable_tabs(false)
                     // The main workspace has two fixed homes. Dragging is
                     // still supported for tab ordering and drop-on-tab, but
                     // the dock library must not offer arbitrary split sides.
@@ -2352,20 +2650,48 @@ impl HaystackApp {
                             .flatten()
                     })
                 });
+                let utility_drop_rect = if !has_main_logs || !has_main_utilities {
+                    Some(egui::Rect::from_min_max(
+                        egui::pos2(
+                            main_workspace_rect.min.x,
+                            main_workspace_rect.min.y + main_workspace_rect.height() * 0.78,
+                        ),
+                        main_workspace_rect.max,
+                    ))
+                } else {
+                    dock_state.iter_all_tabs().find_map(|(path, view)| {
+                        matches!(view, ViewTab::Pinned | ViewTab::Templates)
+                            .then(|| dock_state[path.node_path()].rect())
+                            .flatten()
+                    })
+                };
+                if let Some(main_drop_rect) = main_drop_rect {
+                    drop_targets.push(DockTargetVisual {
+                        target: DockDropTarget::MainLog,
+                        hit_rect: main_drop_rect,
+                        preview_rect: main_drop_rect.shrink(6.0),
+                        label: "Dock in Log panel",
+                    });
+                }
+                if let Some(utility_drop_rect) = utility_drop_rect {
+                    drop_targets.push(DockTargetVisual {
+                        target: DockDropTarget::MainUtility,
+                        hit_rect: utility_drop_rect,
+                        preview_rect: utility_drop_rect.shrink(6.0),
+                        label: "Dock in utility panel",
+                    });
+                }
                 tab.dock_state = dock_state;
                 if !tab.main_dock_layout_is_legal() {
                     tab.normalize_main_dock_layout();
                 }
-                if let Some(main_drop_rect) = main_drop_rect {
-                    show_cross_window_log_drop_marker(
-                        ui,
-                        tab,
-                        &self.theme,
-                        LogDockTarget::Main,
-                        None,
-                        main_drop_rect,
-                    );
-                }
+                show_cross_window_drop_targets(
+                    ui,
+                    tab,
+                    &self.theme,
+                    DockContainer::Main,
+                    &drop_targets,
+                );
                 // A Timeline pin click first lets Log consume its scroll
                 // request, then switches this dock leaf to the matching card.
                 tab.finish_pin_navigation();
@@ -2374,7 +2700,7 @@ impl HaystackApp {
 
         // ---- detached viewport windows (pop-out) ----
         if let Some(active_tab_idx) = self.active {
-            let (path, detached_views, file_name, timeline_detached) = {
+            let (path, detached_windows, file_name, timeline_detached) = {
                 let tab = &self.tabs[active_tab_idx];
                 (
                     tab.doc.path.clone(),
@@ -2383,14 +2709,23 @@ impl HaystackApp {
                     tab.timeline_detached,
                 )
             };
-            let mut detached_views = detached_views;
+            let mut detached: Vec<_> = detached_windows
+                .into_iter()
+                .map(|window| {
+                    (
+                        dock_window_viewport_id(path.as_os_str(), window),
+                        DetachedViewport::Dock(window),
+                    )
+                })
+                .collect();
             if timeline_detached {
-                detached_views.insert(ViewTab::Timeline);
+                detached.push((
+                    detached_viewport_id(path.as_os_str(), ViewTab::Timeline),
+                    DetachedViewport::Timeline,
+                ));
             }
 
-            for view_tab in detached_views {
-                let viewport_id = detached_viewport_id(path.as_os_str(), view_tab);
-
+            for (viewport_id, detached_viewport) in detached {
                 // Re-resolve tab index by path to avoid stale indices after tab reorder/removal
                 let resolved_idx = self
                     .tabs
@@ -2401,19 +2736,27 @@ impl HaystackApp {
                 // received the last Log View from this source window. The
                 // iteration snapshot still contains it, but recreating its
                 // dock state here would resurrect an empty native window.
-                if view_tab != ViewTab::Timeline
-                    && !self.tabs[resolved_idx].detached_views.contains(&view_tab)
-                {
-                    continue;
+                if let DetachedViewport::Dock(window) = detached_viewport {
+                    if !self.tabs[resolved_idx].detached_views.contains(&window) {
+                        continue;
+                    }
                 }
                 self.viewport_map
-                    .insert(viewport_id, (resolved_idx, view_tab));
+                    .insert(viewport_id, (resolved_idx, detached_viewport));
 
+                let representative = match detached_viewport {
+                    DetachedViewport::Timeline => ViewTab::Timeline,
+                    DetachedViewport::Dock(window) => self.tabs[resolved_idx]
+                        .detached_dock_states
+                        .get(&window)
+                        .and_then(|state| state.iter_all_tabs().next().map(|(_, tab)| *tab))
+                        .unwrap_or(ViewTab::Pinned),
+                };
                 let title = detached_view_title(
                     &file_name,
-                    view_tab,
+                    representative,
                     self.tabs[resolved_idx].log_view_count(),
-                    match view_tab {
+                    match representative {
                         ViewTab::Log(id) => self.tabs[resolved_idx]
                             .log_views
                             .get(&id)
@@ -2421,13 +2764,29 @@ impl HaystackApp {
                         _ => None,
                     },
                 );
+                let initial_geometry = match detached_viewport {
+                    DetachedViewport::Dock(window)
+                        if self.tabs[resolved_idx]
+                            .pending_detached_window_geometry
+                            .remove(&window) =>
+                    {
+                        self.tabs[resolved_idx]
+                            .detached_window_geometry
+                            .get(&window)
+                            .copied()
+                    }
+                    _ => None,
+                };
+                let mut viewport_builder = egui::ViewportBuilder::default().with_title(title);
+                if let Some(geometry) = initial_geometry {
+                    viewport_builder = viewport_builder.with_inner_size(geometry.inner_size);
+                    if let Some(position) = geometry.position {
+                        viewport_builder = viewport_builder.with_position(position);
+                    }
+                }
 
-                ui.ctx().show_viewport_immediate(
-                    viewport_id,
-                    egui::ViewportBuilder::default()
-                        .with_title(title)
-                        .with_inner_size([600.0, 400.0]),
-                    |ctx, _| {
+                ui.ctx()
+                    .show_viewport_immediate(viewport_id, viewport_builder, |ctx, _| {
                         // Apply the same token-driven styling in native child windows.
                         let resolved_dark_mode =
                             crate::ui::theme::apply_egui_theme(ctx, self.settings.theme_mode);
@@ -2439,36 +2798,53 @@ impl HaystackApp {
                             .position(|t| t.doc.path == path)
                             .unwrap_or(active_tab_idx);
                         self.viewport_map
-                            .insert(viewport_id, (resolved_idx, view_tab));
+                            .insert(viewport_id, (resolved_idx, detached_viewport));
 
-                        let mut permanently_close = None;
                         let mut return_to_main = false;
                         let mut dock_transfer_closed_viewport = false;
-                        if let Some(&(tab_idx, view_tab_inner)) =
+                        if let Some(&(tab_idx, detached_inner)) =
                             self.viewport_map.get(&viewport_id)
                         {
                             if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                                if let DetachedViewport::Dock(window) = detached_inner {
+                                    let (position, inner_size) = ctx.input(|input| {
+                                        (
+                                            input.viewport().outer_rect.map(|rect| rect.min),
+                                            input.viewport().inner_rect.map(|rect| rect.size()),
+                                        )
+                                    });
+                                    let geometry =
+                                        tab.detached_window_geometry.entry(window).or_default();
+                                    if position.is_some() {
+                                        geometry.position = position;
+                                    }
+                                    if let Some(inner_size) = inner_size {
+                                        geometry.inner_size = inner_size;
+                                    }
+                                }
                                 let viewport_focused =
                                     ctx.input(|input| input.viewport().focused.unwrap_or(false));
                                 egui::CentralPanel::default().show(
                                     ctx,
-                                    |ui| match view_tab_inner {
-                                        ViewTab::Timeline => timeline::show(ui, tab, &self.theme),
-                                        ViewTab::Log(id) => {
+                                    |ui| match detached_inner {
+                                        DetachedViewport::Timeline => {
+                                            timeline::show(ui, tab, &self.theme)
+                                        }
+                                        DetachedViewport::Dock(window) => {
                                             let mut detached_state = tab
                                                 .detached_dock_states
-                                                .remove(&view_tab_inner)
-                                                .unwrap_or_else(|| {
-                                                    DockState::new(vec![ViewTab::Log(id)])
-                                                });
+                                                .remove(&window)
+                                                .unwrap_or_else(|| DockState::new(vec![]));
                                             let dock_style =
                                                 crate::ui::theme::dock_style(resolved_dark_mode);
+                                            let mut drop_targets = Vec::new();
                                             let mut viewer = TabViewer {
                                                 tab,
                                                 theme: &self.theme,
                                                 allow_popout: false,
                                                 return_to_main: Some(&mut return_to_main),
-                                                dock_container: Some(view_tab_inner),
+                                                dock_container: DockContainer::Detached(window),
+                                                drop_targets: &mut drop_targets,
                                             };
                                             DockArea::new(&mut detached_state)
                                                 .id(egui::Id::new((
@@ -2478,6 +2854,7 @@ impl HaystackApp {
                                                 .style(dock_style)
                                                 .show_close_buttons(true)
                                                 .show_add_buttons(true)
+                                                .draggable_tabs(false)
                                                 .show_leaf_close_all_buttons(false)
                                                 .show_inside(ui, &mut viewer);
                                             drop(viewer);
@@ -2497,31 +2874,39 @@ impl HaystackApp {
                                                     }
                                                 }
                                             }
-                                            tab.detached_dock_states
-                                                .insert(view_tab_inner, detached_state);
-                                            let moved = show_cross_window_log_drop_marker(
+                                            append_detached_leaf_drop_targets(
+                                                &mut drop_targets,
+                                                &detached_state,
+                                                window,
+                                                tab.active_dock_drag.as_ref().map(|drag| drag.tab),
+                                            );
+                                            tab.detached_dock_states.insert(window, detached_state);
+                                            let moved = show_cross_window_drop_targets(
                                                 ui,
                                                 tab,
                                                 &self.theme,
-                                                LogDockTarget::Detached(view_tab_inner),
-                                                Some(view_tab_inner),
-                                                ui.max_rect(),
+                                                DockContainer::Detached(window),
+                                                &drop_targets,
                                             );
-                                            if moved
-                                                && !tab.detached_views.contains(&view_tab_inner)
-                                            {
+                                            if moved && !tab.detached_views.contains(&window) {
                                                 dock_transfer_closed_viewport = true;
                                             }
-                                            if !tab.log_views.contains_key(&id) {
-                                                permanently_close = Some(id);
-                                            }
                                             if viewport_focused {
-                                                tab.focus_log_view(id);
+                                                if let Some(id) = tab
+                                                    .detached_dock_states
+                                                    .get(&window)
+                                                    .and_then(|state| {
+                                                        state.iter_all_tabs().find_map(
+                                                            |(_, tab)| match tab {
+                                                                ViewTab::Log(id) => Some(*id),
+                                                                _ => None,
+                                                            },
+                                                        )
+                                                    })
+                                                {
+                                                    tab.focus_log_view(id);
+                                                }
                                             }
-                                        }
-                                        ViewTab::Pinned => pin_viewer::show(ui, tab, &self.theme),
-                                        ViewTab::Templates => {
-                                            template_view::show(ui, tab, &self.theme)
                                         }
                                     },
                                 );
@@ -2537,16 +2922,9 @@ impl HaystackApp {
                         if return_to_main {
                             self.viewport_map.remove(&viewport_id);
                             if let Some(tab) = self.tabs.get_mut(resolved_idx) {
-                                tab.just_closed_viewports.push(view_tab);
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            return;
-                        }
-
-                        if let Some(id) = permanently_close {
-                            self.viewport_map.remove(&viewport_id);
-                            if let Some(tab) = self.tabs.get_mut(resolved_idx) {
-                                tab.close_log_view(id);
+                                if let DetachedViewport::Dock(window) = detached_viewport {
+                                    tab.just_closed_viewports.push(window);
+                                }
                             }
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             return;
@@ -2554,21 +2932,21 @@ impl HaystackApp {
 
                         // Handle close: clean up state so the window isn't recreated
                         if ctx.input(|i| i.viewport().close_requested()) {
-                            if let Some((tab_idx, view_tab_inner)) =
+                            if let Some((tab_idx, detached_inner)) =
                                 self.viewport_map.remove(&viewport_id)
                             {
                                 if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                                    if view_tab_inner == ViewTab::Timeline {
-                                        tab.timeline_detached = false;
-                                    } else {
-                                        tab.just_closed_viewports.push(view_tab_inner);
+                                    match detached_inner {
+                                        DetachedViewport::Timeline => tab.timeline_detached = false,
+                                        DetachedViewport::Dock(window) => {
+                                            tab.just_closed_viewports.push(window)
+                                        }
                                     }
                                 }
                             }
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                    },
-                );
+                    });
             }
         }
 
@@ -2579,13 +2957,14 @@ impl HaystackApp {
         let emptied_detached_viewports: Vec<_> = self
             .viewport_map
             .iter()
-            .filter_map(|(viewport_id, (tab_idx, view_tab))| {
-                (matches!(view_tab, ViewTab::Log(_))
-                    && self
-                        .tabs
-                        .get(*tab_idx)
-                        .is_some_and(|tab| !tab.detached_views.contains(view_tab)))
-                .then_some(*viewport_id)
+            .filter_map(|(viewport_id, (tab_idx, detached))| {
+                let DetachedViewport::Dock(window) = detached else {
+                    return None;
+                };
+                self.tabs
+                    .get(*tab_idx)
+                    .is_some_and(|tab| !tab.detached_views.contains(window))
+                    .then_some(*viewport_id)
             })
             .collect();
         for viewport_id in emptied_detached_viewports {
@@ -2594,7 +2973,7 @@ impl HaystackApp {
                 .send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
         }
 
-        if self.tabs.iter().any(|tab| tab.active_log_drag.is_some()) {
+        if self.tabs.iter().any(|tab| tab.active_dock_drag.is_some()) {
             ui.ctx().request_repaint();
             for viewport_id in self.viewport_map.keys().copied() {
                 ui.ctx().request_repaint_of(viewport_id);
@@ -2986,33 +3365,50 @@ impl HaystackApp {
         self.dark_mode = crate::ui::theme::apply_egui_theme(ui.ctx(), self.settings.theme_mode);
         overlay::mark_background_input(ui.ctx(), overlay::interactive_surface_open(self, ui.ctx()));
 
-        let mut permanently_close = None;
         let mut return_to_main = false;
         let mut dock_transfer_closed_viewport = false;
         // Look up which tab + view this viewport belongs to
-        if let Some(&(tab_idx, view_tab)) = self.viewport_map.get(&viewport_id) {
+        if let Some(&(tab_idx, detached_viewport)) = self.viewport_map.get(&viewport_id) {
             if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                if permanently_close.is_none() && !return_to_main {
-                    egui::CentralPanel::default().show(ui, |ui| match view_tab {
-                        ViewTab::Timeline => timeline::show(ui, tab, &self.theme),
-                        ViewTab::Log(id) => {
+                if let DetachedViewport::Dock(window) = detached_viewport {
+                    let (position, inner_size) = ui.ctx().input(|input| {
+                        (
+                            input.viewport().outer_rect.map(|rect| rect.min),
+                            input.viewport().inner_rect.map(|rect| rect.size()),
+                        )
+                    });
+                    let geometry = tab.detached_window_geometry.entry(window).or_default();
+                    if position.is_some() {
+                        geometry.position = position;
+                    }
+                    if let Some(inner_size) = inner_size {
+                        geometry.inner_size = inner_size;
+                    }
+                }
+                if !return_to_main {
+                    egui::CentralPanel::default().show(ui, |ui| match detached_viewport {
+                        DetachedViewport::Timeline => timeline::show(ui, tab, &self.theme),
+                        DetachedViewport::Dock(window) => {
                             let mut detached_state = tab
                                 .detached_dock_states
-                                .remove(&view_tab)
-                                .unwrap_or_else(|| DockState::new(vec![ViewTab::Log(id)]));
+                                .remove(&window)
+                                .unwrap_or_else(|| DockState::new(vec![]));
                             let dock_style = crate::ui::theme::dock_style(self.dark_mode);
+                            let mut drop_targets = Vec::new();
                             let mut viewer = TabViewer {
                                 tab,
                                 theme: &self.theme,
                                 allow_popout: false,
                                 return_to_main: Some(&mut return_to_main),
-                                dock_container: Some(view_tab),
+                                dock_container: DockContainer::Detached(window),
+                                drop_targets: &mut drop_targets,
                             };
                             DockArea::new(&mut detached_state)
                                 .id(egui::Id::new(("detached_dock_area", viewport_id)))
                                 .style(dock_style)
                                 .show_close_buttons(true)
                                 .show_add_buttons(true)
+                                .draggable_tabs(false)
                                 .show_leaf_close_all_buttons(false)
                                 .show_inside(ui, &mut viewer);
                             drop(viewer);
@@ -3027,24 +3423,24 @@ impl HaystackApp {
                                     }
                                 }
                             }
-                            tab.detached_dock_states.insert(view_tab, detached_state);
-                            let moved = show_cross_window_log_drop_marker(
+                            append_detached_leaf_drop_targets(
+                                &mut drop_targets,
+                                &detached_state,
+                                window,
+                                tab.active_dock_drag.as_ref().map(|drag| drag.tab),
+                            );
+                            tab.detached_dock_states.insert(window, detached_state);
+                            let moved = show_cross_window_drop_targets(
                                 ui,
                                 tab,
                                 &self.theme,
-                                LogDockTarget::Detached(view_tab),
-                                Some(view_tab),
-                                ui.max_rect(),
+                                DockContainer::Detached(window),
+                                &drop_targets,
                             );
-                            if moved && !tab.detached_views.contains(&view_tab) {
+                            if moved && !tab.detached_views.contains(&window) {
                                 dock_transfer_closed_viewport = true;
                             }
-                            if !tab.log_views.contains_key(&id) {
-                                permanently_close = Some(id);
-                            }
                         }
-                        ViewTab::Pinned => pin_viewer::show(ui, tab, &self.theme),
-                        ViewTab::Templates => template_view::show(ui, tab, &self.theme),
                     });
                 }
             }
@@ -3058,21 +3454,11 @@ impl HaystackApp {
 
         if return_to_main {
             let tab_idx = self.viewport_map.get(&viewport_id).map(|(idx, _)| *idx);
-            let view_tab = self.viewport_map.get(&viewport_id).map(|(_, view)| *view);
+            let detached = self.viewport_map.get(&viewport_id).map(|(_, view)| *view);
             self.viewport_map.remove(&viewport_id);
-            if let (Some(tab_idx), Some(view_tab)) = (tab_idx, view_tab) {
+            if let (Some(tab_idx), Some(DetachedViewport::Dock(window))) = (tab_idx, detached) {
                 if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                    tab.just_closed_viewports.push(view_tab);
-                }
-            }
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-
-        if let Some(id) = permanently_close {
-            if let Some((tab_idx, _)) = self.viewport_map.remove(&viewport_id) {
-                if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                    tab.close_log_view(id);
+                    tab.just_closed_viewports.push(window);
                 }
             }
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3081,12 +3467,11 @@ impl HaystackApp {
 
         // Handle close: clean up state so the window isn't recreated
         if ui.ctx().input(|i| i.viewport().close_requested()) {
-            if let Some((tab_idx, view_tab)) = self.viewport_map.remove(&viewport_id) {
+            if let Some((tab_idx, detached)) = self.viewport_map.remove(&viewport_id) {
                 if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                    if view_tab == ViewTab::Timeline {
-                        tab.timeline_detached = false;
-                    } else {
-                        tab.just_closed_viewports.push(view_tab);
+                    match detached {
+                        DetachedViewport::Timeline => tab.timeline_detached = false,
+                        DetachedViewport::Dock(window) => tab.just_closed_viewports.push(window),
                     }
                 }
             }
