@@ -87,7 +87,16 @@ pub(crate) fn modal(
     default_size: egui::Vec2,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> egui::ModalResponse<()> {
-    modal_impl(ctx, id, title, default_size, true, add_contents)
+    modal_impl(
+        ctx,
+        id,
+        title,
+        default_size,
+        egui::vec2(280.0, 120.0),
+        None,
+        true,
+        add_contents,
+    )
 }
 
 /// Show a centered, resizable dialog without the built-in title row.
@@ -98,7 +107,38 @@ pub(crate) fn modal_without_title(
     default_size: egui::Vec2,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> egui::ModalResponse<()> {
-    modal_impl(ctx, id, "", default_size, false, add_contents)
+    modal_impl(
+        ctx,
+        id,
+        "",
+        default_size,
+        egui::vec2(280.0, 120.0),
+        None,
+        false,
+        add_contents,
+    )
+}
+
+/// Show a centered dialog with an explicit resize policy. The maximum size is
+/// still constrained to the current viewport by the caller.
+pub(crate) fn modal_without_title_with_policy(
+    ctx: &egui::Context,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    default_size: egui::Vec2,
+    min_size: egui::Vec2,
+    max_size: egui::Vec2,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::ModalResponse<()> {
+    modal_impl(
+        ctx,
+        id,
+        "",
+        default_size,
+        min_size,
+        Some(max_size),
+        false,
+        add_contents,
+    )
 }
 
 fn modal_impl(
@@ -106,6 +146,8 @@ fn modal_impl(
     id: impl std::hash::Hash + std::fmt::Debug,
     title: impl Into<egui::RichText>,
     default_size: egui::Vec2,
+    min_size: egui::Vec2,
+    max_size: Option<egui::Vec2>,
     show_title: bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> egui::ModalResponse<()> {
@@ -113,11 +155,13 @@ fn modal_impl(
     egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
         egui::Resize::default()
             .default_size(default_size)
-            .min_size(egui::vec2(280.0, 120.0))
-            .max_size(egui::vec2(
-                (viewport.x - 32.0).max(280.0),
-                (viewport.y - 32.0).max(120.0),
-            ))
+            .min_size(min_size)
+            .max_size(max_size.unwrap_or_else(|| {
+                egui::vec2(
+                    (viewport.x - 32.0).max(min_size.x),
+                    (viewport.y - 32.0).max(min_size.y),
+                )
+            }))
             .show(ui, |ui| {
                 if show_title {
                     ui.heading(title);

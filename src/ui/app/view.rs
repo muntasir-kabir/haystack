@@ -1021,8 +1021,17 @@ impl<'a> egui_dock::TabViewer for TabViewer<'a> {
                     .as_ref()
                     .is_none_or(|drag| drag.tab != *tab || drag.source != self.dock_container);
                 if replace {
-                    self.tab.active_dock_drag =
-                        Some(DockDragSession::new(*tab, self.dock_container));
+                    let mut drag = DockDragSession::new(*tab, self.dock_container);
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let pointer = response.ctx.input(|input| {
+                            input
+                                .viewport()
+                                .inner_rect
+                                .map_or(pointer, |rect| rect.min + pointer.to_vec2())
+                        });
+                        drag.update_pointer(pointer);
+                    }
+                    self.tab.active_dock_drag = Some(drag);
                 }
                 // A native child viewport owns the pointer while the tab is
                 // dragged. Repaint the main window so its cross-window drop
@@ -1154,9 +1163,16 @@ fn log_view_pointer_interaction(ui: &egui::Ui) -> bool {
         })
 }
 
-/// Draw the explicit, cross-native-window Log View drop marker. `egui_dock`
-/// owns drag feedback inside one dock state; this bridge makes a dragged Log
-/// tab visible and droppable in another native viewport as well.
+fn latest_pointer_move_position(events: &[egui::Event]) -> Option<egui::Pos2> {
+    events.iter().rev().find_map(|event| match event {
+        egui::Event::PointerMoved(position) => Some(*position),
+        _ => None,
+    })
+}
+
+/// Draw the explicit cross-native-window dock-tab marker. `egui_dock` owns
+/// drag feedback inside one dock state; this bridge makes Log, Pinned, and
+/// Templates tabs visible and droppable in another native viewport as well.
 fn show_cross_window_drop_targets(
     ui: &egui::Ui,
     tab: &mut LogTab,
@@ -1164,10 +1180,9 @@ fn show_cross_window_drop_targets(
     target_container: DockContainer,
     targets: &[DockTargetVisual],
 ) -> bool {
-    let Some(drag) = tab.active_dock_drag.as_mut() else {
+    let Some(dragged_tab) = tab.active_dock_drag.as_ref().map(|drag| drag.tab) else {
         return false;
     };
-    let dragged_tab = drag.tab;
     if matches!(dragged_tab, ViewTab::Log(id) if !tab.log_views.contains_key(&id)) {
         tab.active_dock_drag = None;
         return false;
@@ -1176,60 +1191,112 @@ fn show_cross_window_drop_targets(
     let viewport_origin = ui
         .ctx()
         .input(|input| input.viewport().inner_rect.map(|r| r.min));
-    if let Some(origin) = viewport_origin {
-        if let Some(pointer) = ui
-            .ctx()
-            .pointer_interact_pos()
-            .or_else(|| ui.ctx().pointer_hover_pos())
-        {
-            drag.update_pointer(origin + pointer.to_vec2());
-        }
-        if drag.active {
-            for visual in targets {
-                if LogTab::dock_target_accepts(dragged_tab, visual.target)
-                    && !dock_target_points_to_tab(visual.target, dragged_tab)
-                {
-                    drag.register_target(
-                        visual.target,
-                        visual.hit_rect.translate(origin.to_vec2()),
-                    );
+    let (raw_pointer_local, pointer_gone, pointer_motion, native_pixels_per_point) =
+        ui.ctx().input(|input| {
+            (
+                latest_pointer_move_position(&input.events),
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::PointerGone)),
+                input.pointer.motion(),
+                input.viewport().native_pixels_per_point.unwrap_or(1.0),
+            )
+        });
+    let pointer_local = ui
+        .ctx()
+        .pointer_interact_pos()
+        .or_else(|| ui.ctx().pointer_hover_pos())
+        .or(raw_pointer_local);
+    let published_targets: Vec<_> = targets
+        .iter()
+        .filter(|visual| {
+            LogTab::dock_target_accepts(dragged_tab, visual.target)
+                && !dock_target_points_to_tab(visual.target, dragged_tab)
+        })
+        .map(|visual| {
+            let rect = viewport_origin.map_or(visual.hit_rect, |origin| {
+                visual.hit_rect.translate(origin.to_vec2())
+            });
+            (visual.target, rect)
+        })
+        .collect();
+    let published_fallback_targets: Vec<_> = targets
+        .iter()
+        .filter(|visual| {
+            matches!(visual.target, DockDropTarget::JoinDetached { .. })
+                && LogTab::dock_target_accepts(dragged_tab, visual.target)
+                && !dock_target_points_to_tab(visual.target, dragged_tab)
+        })
+        .map(|visual| {
+            let rect = viewport_origin.map_or(visual.preview_rect, |origin| {
+                visual.preview_rect.translate(origin.to_vec2())
+            });
+            (visual.target, rect)
+        })
+        .collect();
+    let viewport_screen_rect = viewport_origin.map_or_else(
+        || ui.ctx().content_rect(),
+        |origin| ui.ctx().content_rect().translate(origin.to_vec2()),
+    );
+    let (source_container, active_target, pointer_screen, drag_active) = {
+        let drag = tab.active_dock_drag.as_mut().unwrap();
+        // Pointer routing differs by native backend: some keep sending motion
+        // to the source viewport while others deliver hover to the destination
+        // once the cursor crosses windows. Accept destination coordinates only
+        // while the cursor is actually inside that viewport, while always
+        // accepting the source's captured coordinates.
+        let pointer_is_over_viewport =
+            pointer_local.is_some_and(|pointer| ui.ctx().content_rect().contains(pointer));
+        if drag.source == target_container && pointer_gone {
+            drag.pointer_left_source = true;
+            drag.active = true;
+            if let Some(pointer) = raw_pointer_local {
+                let pointer = viewport_origin.map_or(pointer, |origin| origin + pointer.to_vec2());
+                drag.update_pointer(pointer);
+            } else if let (Some(pointer), Some(motion)) = (drag.pointer_screen, pointer_motion) {
+                drag.pointer_screen = Some(pointer + motion / native_pixels_per_point.max(0.1));
+            }
+        } else if drag.source == target_container {
+            if let Some(pointer) = pointer_local {
+                let pointer = viewport_origin.map_or(pointer, |origin| origin + pointer.to_vec2());
+                drag.update_pointer(pointer);
+                drag.pointer_left_source = !pointer_is_over_viewport;
+            } else if drag.pointer_left_source {
+                if let (Some(pointer), Some(motion)) = (drag.pointer_screen, pointer_motion) {
+                    drag.pointer_screen = Some(pointer + motion / native_pixels_per_point.max(0.1));
+                    drag.active = true;
                 }
             }
+        } else if pointer_is_over_viewport {
+            if let Some(pointer) = pointer_local {
+                let pointer = viewport_origin.map_or(pointer, |origin| origin + pointer.to_vec2());
+                drag.update_pointer(pointer);
+                drag.pointer_left_source = false;
+            }
         }
-    }
-
-    let local_target = if drag.active && viewport_origin.is_none() {
-        ui.ctx().pointer_hover_pos().and_then(|pointer| {
-            targets
-                .iter()
-                .filter(|visual| {
-                    LogTab::dock_target_accepts(dragged_tab, visual.target)
-                        && !dock_target_points_to_tab(visual.target, dragged_tab)
-                        && visual.hit_rect.contains(pointer)
-                })
-                .max_by_key(|visual| match visual.target {
-                    DockDropTarget::TabInsert { .. } => 3,
-                    DockDropTarget::SplitDetached { .. } => 2,
-                    _ => 1,
-                })
-                .map(|visual| visual.target)
-        })
-    } else {
-        None
+        drag.replace_targets(target_container, published_targets.iter().copied());
+        drag.replace_fallback_targets(target_container, published_fallback_targets.iter().copied());
+        drag.replace_container_rect(target_container, viewport_screen_rect);
+        (
+            drag.source,
+            drag.hovered_target(),
+            drag.pointer_screen,
+            drag.active,
+        )
     };
-    let active_target = drag.hovered_target().or(local_target);
-    let pointer_screen = drag.pointer_screen;
+    let pointer_over_container = pointer_screen.is_some_and(|pointer| {
+        published_targets
+            .iter()
+            .any(|(_, rect)| rect.contains(pointer))
+    });
     let painter = ui.ctx().layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new(("cross_window_log_drop", target_container)),
     ));
-    if drag.active && drag.source == target_container {
+    if drag_active && source_container == target_container {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        if let Some(pointer) = ui
-            .ctx()
-            .pointer_interact_pos()
-            .or_else(|| ui.ctx().pointer_hover_pos())
-        {
+        if let Some(pointer) = pointer_local {
             let ghost = egui::Rect::from_min_size(
                 pointer + egui::vec2(14.0, 14.0),
                 egui::vec2(150.0, 30.0),
@@ -1254,32 +1321,101 @@ fn show_cross_window_drop_targets(
             );
         }
     }
-    if drag.active {
+    let show_dock_controls = drag_active;
+    if show_dock_controls {
         for visual in targets.iter().filter(|visual| {
             LogTab::dock_target_accepts(dragged_tab, visual.target)
                 && !dock_target_points_to_tab(visual.target, dragged_tab)
         }) {
             let hovered = active_target == Some(visual.target);
-            if hovered {
+            let directional = matches!(
+                visual.target,
+                DockDropTarget::JoinDetached { .. } | DockDropTarget::SplitDetached { .. }
+            );
+            let main_panel = matches!(
+                visual.target,
+                DockDropTarget::MainLog | DockDropTarget::MainUtility
+            );
+            if hovered && !matches!(visual.target, DockDropTarget::TabInsert { .. }) {
                 painter.rect_filled(
                     visual.preview_rect,
                     5.0,
                     theme.selection_focused.gamma_multiply(0.16),
                 );
-            }
-            painter.rect_stroke(
-                visual.preview_rect,
-                5.0,
-                Stroke::new(if hovered { 2.0 } else { 1.0 }, theme.selection_focused),
-                egui::StrokeKind::Inside,
-            );
-            if hovered && !matches!(visual.target, DockDropTarget::TabInsert { .. }) {
+                painter.rect_stroke(
+                    visual.preview_rect,
+                    5.0,
+                    Stroke::new(2.0, theme.selection_focused),
+                    egui::StrokeKind::Inside,
+                );
                 painter.text(
-                    visual.preview_rect.center(),
-                    egui::Align2::CENTER_CENTER,
+                    visual.preview_rect.left_top() + egui::vec2(10.0, 10.0),
+                    egui::Align2::LEFT_TOP,
                     visual.label,
                     egui::FontId::proportional(14.0),
                     theme.selection_focused,
+                );
+            }
+            if directional {
+                painter.rect_filled(
+                    visual.hit_rect,
+                    5.0,
+                    if hovered {
+                        theme.selection_focused.linear_multiply(0.5)
+                    } else {
+                        theme.raised_surface.linear_multiply(0.5)
+                    },
+                );
+                painter.rect_stroke(
+                    visual.hit_rect,
+                    5.0,
+                    Stroke::new(if hovered { 2.0 } else { 1.0 }, theme.selection_focused),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    visual.hit_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    dock_target_symbol(visual.target),
+                    egui::FontId::proportional(17.0),
+                    theme.text,
+                );
+            } else if main_panel {
+                let indicator = egui::Rect::from_center_size(
+                    visual.preview_rect.center(),
+                    egui::vec2(92.0, 38.0),
+                );
+                painter.rect_filled(
+                    indicator,
+                    6.0,
+                    if hovered {
+                        theme.selection_focused.gamma_multiply(0.32)
+                    } else {
+                        theme.raised_surface.gamma_multiply(0.96)
+                    },
+                );
+                painter.rect_stroke(
+                    indicator,
+                    6.0,
+                    Stroke::new(if hovered { 2.0 } else { 1.0 }, theme.selection_focused),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    indicator.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if matches!(visual.target, DockDropTarget::MainLog) {
+                        "Dock Log"
+                    } else {
+                        "Dock Panel"
+                    },
+                    egui::FontId::proportional(13.0),
+                    theme.text,
+                );
+            } else if !directional {
+                painter.rect_stroke(
+                    visual.preview_rect,
+                    5.0,
+                    Stroke::new(if hovered { 2.0 } else { 1.0 }, theme.selection_focused),
+                    egui::StrokeKind::Inside,
                 );
             }
         }
@@ -1287,7 +1423,11 @@ fn show_cross_window_drop_targets(
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
     }
-    if drag.active && active_target.is_none() {
+    if drag_active
+        && source_container == target_container
+        && active_target.is_none()
+        && !pointer_over_container
+    {
         let preview_size = egui::vec2(520.0, 360.0);
         let preview_screen = pointer_screen.map(|pointer| {
             egui::Rect::from_min_size(pointer - egui::vec2(80.0, 18.0), preview_size)
@@ -1321,13 +1461,15 @@ fn show_cross_window_drop_targets(
             );
         }
     }
+    // Release may be reported by either the captured source or the hovered
+    // destination, depending on the window backend. Clearing the shared drag
+    // session below guarantees that it is consumed at most once.
     let released = ui.input(|input| input.pointer.primary_released());
     if released {
         let destination = tab
             .active_dock_drag
             .as_ref()
-            .and_then(DockDragSession::hovered_target)
-            .or(local_target);
+            .and_then(DockDragSession::hovered_target);
         let moved = if let Some(destination) = destination {
             tab.dock_view(dragged_tab, destination)
         } else if tab
@@ -1365,6 +1507,29 @@ fn dock_target_points_to_tab(target: DockDropTarget, tab: ViewTab) -> bool {
     )
 }
 
+fn dock_target_symbol(target: DockDropTarget) -> &'static str {
+    match target {
+        DockDropTarget::JoinDetached { .. } => "+",
+        DockDropTarget::SplitDetached {
+            split: egui_dock::Split::Left,
+            ..
+        } => "←",
+        DockDropTarget::SplitDetached {
+            split: egui_dock::Split::Right,
+            ..
+        } => "→",
+        DockDropTarget::SplitDetached {
+            split: egui_dock::Split::Above,
+            ..
+        } => "↑",
+        DockDropTarget::SplitDetached {
+            split: egui_dock::Split::Below,
+            ..
+        } => "↓",
+        _ => "",
+    }
+}
+
 fn append_detached_leaf_drop_targets(
     targets: &mut Vec<DockTargetVisual>,
     state: &DockState<ViewTab>,
@@ -1384,39 +1549,40 @@ fn append_detached_leaf_drop_targets(
         if rect.width() < 40.0 || rect.height() < 40.0 {
             continue;
         }
-        let x1 = rect.left() + rect.width() * 0.25;
-        let x2 = rect.right() - rect.width() * 0.25;
-        let y1 = rect.top() + rect.height() * 0.25;
-        let y2 = rect.bottom() - rect.height() * 0.25;
-        let center = egui::Rect::from_min_max(egui::pos2(x1, y1), egui::pos2(x2, y2));
+        let marker_edge = (rect.width().min(rect.height()) / 3.0).clamp(36.0, 72.0);
+        let marker_size = egui::Vec2::splat(marker_edge);
+        let marker_step = marker_edge + 8.0;
+        let center = rect.center();
+        let marker =
+            |offset: egui::Vec2| egui::Rect::from_center_size(center + offset, marker_size);
         targets.push(DockTargetVisual {
             target: DockDropTarget::JoinDetached { window, sibling },
-            hit_rect: center,
+            hit_rect: marker(egui::Vec2::ZERO),
             preview_rect: rect,
             label: "Join tabs",
         });
         for (split, hit_rect, preview_rect, label) in [
             (
                 egui_dock::Split::Left,
-                egui::Rect::from_min_max(rect.min, egui::pos2(x1, rect.bottom())),
+                marker(egui::vec2(-marker_step, 0.0)),
                 egui::Rect::from_min_max(rect.min, egui::pos2(rect.center().x, rect.bottom())),
                 "Dock left",
             ),
             (
                 egui_dock::Split::Right,
-                egui::Rect::from_min_max(egui::pos2(x2, rect.top()), rect.max),
+                marker(egui::vec2(marker_step, 0.0)),
                 egui::Rect::from_min_max(egui::pos2(rect.center().x, rect.top()), rect.max),
                 "Dock right",
             ),
             (
                 egui_dock::Split::Above,
-                egui::Rect::from_min_max(egui::pos2(x1, rect.top()), egui::pos2(x2, y1)),
+                marker(egui::vec2(0.0, -marker_step)),
                 egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.center().y)),
                 "Dock above",
             ),
             (
                 egui_dock::Split::Below,
-                egui::Rect::from_min_max(egui::pos2(x1, y2), egui::pos2(x2, rect.bottom())),
+                marker(egui::vec2(0.0, marker_step)),
                 egui::Rect::from_min_max(egui::pos2(rect.left(), rect.center().y), rect.max),
                 "Dock below",
             ),
@@ -1462,6 +1628,71 @@ fn detached_viewport_id(path: &std::ffi::OsStr, view_tab: ViewTab) -> egui::View
 
 fn dock_window_viewport_id(path: &std::ffi::OsStr, window: DockWindowId) -> egui::ViewportId {
     egui::ViewportId::from_hash_of((path, "dock_window", window))
+}
+
+fn dock_drag_preview_viewport_id(path: &std::ffi::OsStr) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of((path, "dock_drag_preview"))
+}
+
+fn show_outside_dock_drag_preview(ui: &egui::Ui, tab: &LogTab, theme: &Theme) {
+    if ui.ctx().embed_viewports() {
+        return;
+    }
+    let Some(drag) = tab.active_dock_drag.as_ref() else {
+        return;
+    };
+    if !drag.active || drag.hovered_target().is_some() || drag.pointer_is_over_application() {
+        return;
+    }
+    let Some(pointer) = drag.pointer_screen else {
+        return;
+    };
+
+    let preview_size = egui::vec2(520.0, 360.0);
+    let position = pointer - egui::vec2(80.0, 18.0);
+    let title = format!("New window · {}", dock_tab_name(drag.tab));
+    let builder = egui::ViewportBuilder::default()
+        .with_title(title.clone())
+        .with_position(position)
+        .with_inner_size(preview_size)
+        .with_min_inner_size(preview_size)
+        .with_max_inner_size(preview_size)
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_has_shadow(false)
+        .with_taskbar(false)
+        .with_active(false)
+        .with_mouse_passthrough(true)
+        .with_always_on_top();
+    ui.ctx().show_viewport_immediate(
+        dock_drag_preview_viewport_id(tab.doc.path.as_os_str()),
+        builder,
+        move |ctx, _| {
+            let rect = ctx.content_rect().shrink(2.0);
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("outside_dock_drag_preview"),
+            ));
+            painter.rect_filled(rect, 8.0, theme.canvas.linear_multiply(0.5));
+            painter.rect_stroke(
+                rect,
+                8.0,
+                Stroke::new(2.0, theme.selection_focused),
+                egui::StrokeKind::Inside,
+            );
+            let title_bar =
+                egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + 34.0));
+            painter.rect_filled(title_bar, 8.0, theme.raised_surface.linear_multiply(0.65));
+            painter.text(
+                title_bar.left_center() + egui::vec2(12.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                &title,
+                egui::FontId::proportional(14.0),
+                theme.text,
+            );
+        },
+    );
 }
 
 fn dock_tab_name(tab: ViewTab) -> &'static str {
@@ -2979,6 +3210,9 @@ impl HaystackApp {
                 ui.ctx().request_repaint_of(viewport_id);
             }
         }
+        if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
+            show_outside_dock_drag_preview(ui, tab, &self.theme);
+        }
 
         self.views_dropdown_ui(ui);
         format_menu::show(self, ui.ctx());
@@ -3496,8 +3730,8 @@ mod tests {
     use super::{
         compact_top_bar, detached_view_title, detached_viewport_id, dock_area_id,
         dock_tab_accessibility_label, dock_tab_action_rects, dock_tab_title,
-        document_status_context, dropdown_visibility, saved_filter_row_id, should_request_repaint,
-        LogViewId, TopPanelDropdown, ViewTab,
+        document_status_context, dropdown_visibility, latest_pointer_move_position,
+        saved_filter_row_id, should_request_repaint, LogViewId, TopPanelDropdown, ViewTab,
     };
 
     #[test]
@@ -3539,6 +3773,16 @@ mod tests {
     fn completed_loader_requests_a_follow_up_frame() {
         assert!(should_request_repaint(false, true, false, false));
         assert!(!should_request_repaint(false, false, false, false));
+    }
+
+    #[test]
+    fn raw_pointer_position_survives_pointer_gone_in_the_same_frame() {
+        let position = egui::pos2(640.0, -24.0);
+        let events = [
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerGone,
+        ];
+        assert_eq!(latest_pointer_move_position(&events), Some(position));
     }
 
     #[test]

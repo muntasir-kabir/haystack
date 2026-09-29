@@ -1,3 +1,15 @@
+# 2026-09-29
+- Bumped the application and packager version to 0.1.6 in preparation for the v0.1.6 release.
+- Added theme-aware shadow rectangles for pinned source ranges in the Timeline, layered beneath the Log View viewport shadow so pinned evidence remains visible without obscuring the current reading window.
+- Made mouse-selected text use a vivid, theme-aware inner selection with contrasting glyphs, distinct from the selected-line fill so nested text selection remains clearly visible in light and dark modes.
+- Fixed dock-tab previews and drops between main and detached windows, including detached-origin repositioning/redocking, by accepting backend-dependent pointer/release events from either source or hovered destination while publishing fresh per-window drop regions. Active drags retain raw exit motion for fast window crossings, default to the center join over a pane outside its large 50%-transparent compass buttons, and show a mouse-pass-through native window shadow beyond every application window.
+
+# 2026-09-28
+- Log View Find now cancels and clears stale results as soon as its query text changes; Shift-click occurrence context now uses a responsive viewport-bounded size policy with both-axis internal scrolling.
+- Fixed Timeline layout clipping by removing the unintended header-to-body gap and accounting for the top panel frame margins, keeping the minimap fully visible.
+- Simplified the Timeline header by removing the navigation label, arrow buttons, and clear-selection control while retaining keyboard occurrence navigation; long occurrence status text now truncates to the available width with a full-text tooltip.
+- Right-aligned the occurrence status within the remaining Timeline header width while retaining truncation and the full-text tooltip.
+
 # 2026-09-22
 - Fixed spacing mismatch in timeline panel_height calculation: reduced allocated gap after histogram from 10.0px to 4.0px to match actual rendering. This eliminates the 6.0px of unaccounted whitespace that was creating a visible gap between filter lanes and axis labels.
 - Eliminated vertical spacing between timeline header and filter lanes by setting item_spacing.y = 0.0 immediately after the header closes, before any subsequent layout operations. This removes implicit egui spacing that was visibly separating the filter input from the lane controls below.

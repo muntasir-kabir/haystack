@@ -373,20 +373,35 @@ pub enum DockDropTarget {
     },
 }
 
-/// Runtime state for one Log-tab drag that may cross native viewport bounds.
+impl DockDropTarget {
+    pub const fn container(self) -> DockContainer {
+        match self {
+            Self::MainLog | Self::MainUtility => DockContainer::Main,
+            Self::JoinDetached { window, .. } | Self::SplitDetached { window, .. } => {
+                DockContainer::Detached(window)
+            }
+            Self::TabInsert { container, .. } => container,
+        }
+    }
+}
+
+/// Runtime state for one dock-tab drag that may cross native viewport bounds.
 ///
-/// Native window backends normally keep pointer capture in the source window,
-/// so destination viewports cannot be expected to receive hover or release
-/// events. The source pointer and every legal destination are therefore kept
-/// in shared monitor coordinates.
+/// Native window backends disagree about whether cross-window motion/release
+/// stays with the source or moves to the hovered destination. The latest valid
+/// pointer and every legal destination are therefore kept in shared monitor
+/// coordinates.
 #[derive(Clone, Debug)]
 pub struct DockDragSession {
     pub tab: ViewTab,
     pub source: DockContainer,
     pub press_screen: Option<egui::Pos2>,
     pub pointer_screen: Option<egui::Pos2>,
+    pub pointer_left_source: bool,
     pub active: bool,
     pub targets: Vec<(DockDropTarget, egui::Rect)>,
+    pub fallback_targets: Vec<(DockDropTarget, egui::Rect)>,
+    pub container_rects: Vec<(DockContainer, egui::Rect)>,
 }
 
 impl DockDragSession {
@@ -396,21 +411,58 @@ impl DockDragSession {
             source,
             press_screen: None,
             pointer_screen: None,
+            pointer_left_source: false,
             active: false,
             targets: Vec::new(),
+            fallback_targets: Vec::new(),
+            container_rects: Vec::new(),
         }
     }
 
-    pub fn register_target(&mut self, target: DockDropTarget, rect: egui::Rect) {
+    /// Replace one viewport's drop regions while retaining the regions
+    /// published by the other native viewports. This keeps hit testing in
+    /// sync with moved/resized windows instead of accumulating stale rects.
+    pub fn replace_targets(
+        &mut self,
+        container: DockContainer,
+        targets: impl IntoIterator<Item = (DockDropTarget, egui::Rect)>,
+    ) {
+        self.targets
+            .retain(|(target, _)| target.container() != container);
+        self.targets.extend(targets);
+    }
+
+    pub fn replace_container_rect(&mut self, container: DockContainer, rect: egui::Rect) {
         if let Some((_, existing)) = self
-            .targets
+            .container_rects
             .iter_mut()
-            .find(|(candidate, _)| *candidate == target)
+            .find(|(candidate, _)| *candidate == container)
         {
             *existing = rect;
         } else {
-            self.targets.push((target, rect));
+            self.container_rects.push((container, rect));
         }
+    }
+
+    pub fn replace_fallback_targets(
+        &mut self,
+        container: DockContainer,
+        targets: impl IntoIterator<Item = (DockDropTarget, egui::Rect)>,
+    ) {
+        self.fallback_targets
+            .retain(|(target, _)| target.container() != container);
+        self.fallback_targets.extend(targets);
+    }
+
+    pub fn pointer_is_over_application(&self) -> bool {
+        if self.pointer_left_source {
+            return false;
+        }
+        self.pointer_screen.is_some_and(|pointer| {
+            self.container_rects
+                .iter()
+                .any(|(_, rect)| rect.contains(pointer))
+        })
     }
 
     pub fn update_pointer(&mut self, pointer: egui::Pos2) {
@@ -435,6 +487,13 @@ impl DockDragSession {
                 | DockDropTarget::JoinDetached { .. } => 1,
             })
             .map(|(target, _)| *target)
+            .or_else(|| {
+                self.fallback_targets
+                    .iter()
+                    .rev()
+                    .find(|(_, rect)| rect.contains(pointer))
+                    .map(|(target, _)| *target)
+            })
     }
 }
 
@@ -5123,7 +5182,10 @@ mod tests {
         let doc_timeless = LogDocument::open(&path_timeless).unwrap();
         let mut tab_timeless = LogTab::new(doc_timeless);
         tab_timeless.apply_sidecar_safe(&saved_state, &theme);
-        assert_eq!(tab_timeless.timeline_display_mode, TimelineDisplayMode::Line);
+        assert_eq!(
+            tab_timeless.timeline_display_mode,
+            TimelineDisplayMode::Line
+        );
 
         std::fs::remove_file(path).ok();
         std::fs::remove_file(path_timeless).ok();
@@ -6161,6 +6223,37 @@ mod tests {
     }
 
     #[test]
+    fn detached_tab_can_move_to_an_existing_detached_window_and_back_to_main() {
+        let path = write_temp("zero\none\ntwo\n");
+        let doc = LogDocument::open(&path).unwrap();
+        let mut tab = LogTab::new(doc);
+        let log = tab.focused_log_view_id;
+        let log_window = tab.detach_dock_view(ViewTab::Log(log)).unwrap();
+        let templates_window = tab.detach_dock_view(ViewTab::Templates).unwrap();
+
+        assert!(tab.dock_view(
+            ViewTab::Templates,
+            DockDropTarget::SplitDetached {
+                window: log_window,
+                sibling: ViewTab::Log(log),
+                split: egui_dock::Split::Below,
+            }
+        ));
+        assert!(!tab.detached_views.contains(&templates_window));
+        assert_eq!(
+            tab.detached_dock_states[&log_window].iter_leaves().count(),
+            2
+        );
+
+        assert!(tab.dock_view(ViewTab::Templates, DockDropTarget::MainUtility));
+        assert!(tab.dock_state.find_tab(&ViewTab::Templates).is_some());
+        assert!(tab.detached_dock_states[&log_window]
+            .find_tab(&ViewTab::Log(log))
+            .is_some());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn same_window_drop_reorders_main_tabs_and_splits_detached_tabs() {
         let path = write_temp("zero\none\ntwo\n");
         let doc = LogDocument::open(&path).unwrap();
@@ -6310,19 +6403,25 @@ mod tests {
     #[test]
     fn log_dock_drag_uses_the_last_overlapping_screen_target() {
         let mut drag = DockDragSession::new(ViewTab::Log(LogViewId(7)), DockContainer::Main);
-        drag.register_target(
-            DockDropTarget::JoinDetached {
-                window: DockWindowId(1),
-                sibling: ViewTab::Log(LogViewId(1)),
-            },
-            egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 300.0)),
+        drag.replace_targets(
+            DockContainer::Detached(DockWindowId(1)),
+            [(
+                DockDropTarget::JoinDetached {
+                    window: DockWindowId(1),
+                    sibling: ViewTab::Log(LogViewId(1)),
+                },
+                egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 300.0)),
+            )],
         );
-        drag.register_target(
-            DockDropTarget::JoinDetached {
-                window: DockWindowId(2),
-                sibling: ViewTab::Log(LogViewId(2)),
-            },
-            egui::Rect::from_min_max(egui::pos2(200.0, 200.0), egui::pos2(400.0, 400.0)),
+        drag.replace_targets(
+            DockContainer::Detached(DockWindowId(2)),
+            [(
+                DockDropTarget::JoinDetached {
+                    window: DockWindowId(2),
+                    sibling: ViewTab::Log(LogViewId(2)),
+                },
+                egui::Rect::from_min_max(egui::pos2(200.0, 200.0), egui::pos2(400.0, 400.0)),
+            )],
         );
 
         drag.pointer_screen = Some(egui::pos2(250.0, 250.0));
@@ -6345,21 +6444,99 @@ mod tests {
         let mut drag = DockDragSession::new(ViewTab::Pinned, DockContainer::Main);
         drag.active = true;
         drag.pointer_screen = Some(egui::pos2(50.0, 50.0));
-        drag.register_target(
-            DockDropTarget::SplitDetached {
-                window,
-                sibling: ViewTab::Templates,
-                split: egui_dock::Split::Left,
-            },
-            rect,
-        );
         let insertion = DockDropTarget::TabInsert {
             container: DockContainer::Detached(window),
             sibling: ViewTab::Templates,
             after: false,
         };
-        drag.register_target(insertion, rect);
+        drag.replace_targets(
+            DockContainer::Detached(window),
+            [
+                (
+                    DockDropTarget::SplitDetached {
+                        window,
+                        sibling: ViewTab::Templates,
+                        split: egui_dock::Split::Left,
+                    },
+                    rect,
+                ),
+                (insertion, rect),
+            ],
+        );
         assert_eq!(drag.hovered_target(), Some(insertion));
+    }
+
+    #[test]
+    fn dock_drag_replaces_each_containers_regions_without_stale_targets() {
+        let window = DockWindowId(9);
+        let mut drag = DockDragSession::new(ViewTab::Pinned, DockContainer::Main);
+        let old_main = egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(110.0, 110.0));
+        let new_main = egui::Rect::from_min_max(egui::pos2(300.0, 300.0), egui::pos2(400.0, 400.0));
+        let detached = egui::Rect::from_min_max(egui::pos2(500.0, 500.0), egui::pos2(700.0, 700.0));
+
+        drag.replace_targets(
+            DockContainer::Main,
+            [(DockDropTarget::MainUtility, old_main)],
+        );
+        drag.replace_targets(
+            DockContainer::Detached(window),
+            [(
+                DockDropTarget::JoinDetached {
+                    window,
+                    sibling: ViewTab::Templates,
+                },
+                detached,
+            )],
+        );
+        drag.replace_targets(
+            DockContainer::Main,
+            [(DockDropTarget::MainUtility, new_main)],
+        );
+
+        assert_eq!(drag.targets.len(), 2);
+        assert!(!drag.targets.iter().any(|(_, rect)| *rect == old_main));
+        assert!(drag.targets.iter().any(|(_, rect)| *rect == new_main));
+        assert!(drag.targets.iter().any(|(_, rect)| *rect == detached));
+
+        drag.replace_targets(DockContainer::Detached(window), []);
+        assert_eq!(drag.targets, vec![(DockDropTarget::MainUtility, new_main)]);
+
+        drag.replace_container_rect(DockContainer::Main, new_main);
+        drag.pointer_screen = Some(egui::pos2(350.0, 350.0));
+        assert!(drag.pointer_is_over_application());
+        drag.pointer_left_source = true;
+        assert!(!drag.pointer_is_over_application());
+        drag.pointer_left_source = false;
+        drag.pointer_screen = Some(egui::pos2(800.0, 800.0));
+        assert!(!drag.pointer_is_over_application());
+    }
+
+    #[test]
+    fn detached_pane_defaults_to_center_join_outside_compass_buttons() {
+        let window = DockWindowId(11);
+        let join = DockDropTarget::JoinDetached {
+            window,
+            sibling: ViewTab::Templates,
+        };
+        let mut drag = DockDragSession::new(ViewTab::Pinned, DockContainer::Main);
+        drag.active = true;
+        drag.pointer_screen = Some(egui::pos2(180.0, 180.0));
+        drag.replace_targets(
+            DockContainer::Detached(window),
+            [(
+                join,
+                egui::Rect::from_center_size(egui::pos2(100.0, 100.0), egui::vec2(40.0, 40.0)),
+            )],
+        );
+        drag.replace_fallback_targets(
+            DockContainer::Detached(window),
+            [(
+                join,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(200.0, 200.0)),
+            )],
+        );
+
+        assert_eq!(drag.hovered_target(), Some(join));
     }
 
     #[test]

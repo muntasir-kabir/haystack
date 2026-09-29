@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "haystack"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aho-corasick",
  "chrono",

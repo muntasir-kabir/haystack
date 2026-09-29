@@ -1,6 +1,6 @@
 [package]
 name = "haystack"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "High-performance log analysis and visualization: sift giant logs for the needle with clear visual cues and token-efficient AI data."
 
@@ -68,7 +68,7 @@ codegen-units = 1
 [package.metadata.packager]
 identifier = "com.muntasir-kabir.haystack"
 product-name = "Haystack"
-version = "0.1.5"
+version = "0.1.6"
 description = "High-performance log analysis and visualization"
 homepage = "https://github.com/muntasir-kabir/haystack"
 authors = ["MK <muntasir.kabir@gmail.com>"]

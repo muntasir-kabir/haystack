@@ -13,6 +13,11 @@ use crate::ui::app::overlay;
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::Theme;
 
+const OCCURRENCE_DIALOG_INSET: f32 = 32.0;
+const OCCURRENCE_DIALOG_MIN: egui::Vec2 = egui::Vec2::new(320.0, 180.0);
+const OCCURRENCE_DIALOG_DEFAULT_FRACTION: egui::Vec2 = egui::Vec2::new(0.9, 0.8);
+const OCCURRENCE_DIALOG_DEFAULT_MAX: egui::Vec2 = egui::Vec2::new(1000.0, 700.0);
+
 struct RowResult {
     response: egui::Response,
     open_embedded: Option<haystack::core::embedded_data::Detection>,
@@ -36,10 +41,13 @@ pub(super) fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let mut copy_context = false;
     let escape = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
-    let modal_response = overlay::modal_without_title(
+    let (default_size, min_size, max_size) = occurrence_dialog_size(ctx.content_rect().size());
+    let modal_response = overlay::modal_without_title_with_policy(
         &ctx,
         ("filter_occurrence_overlay", view_id),
-        egui::vec2(900.0, 620.0),
+        default_size,
+        min_size,
+        max_size,
         |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -81,15 +89,9 @@ pub(super) fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
             let font = crate::ui::fonts::log_font(tab.log_font_size);
             let row_height = ui.ctx().fonts_mut(|fonts| fonts.row_height(&font)) + 2.0;
             let available = ui.available_size();
-            let scroll = if tab.log_line_display_mode
-                == haystack::core::settings::LogLineDisplayMode::HorizontalScroll
-            {
-                egui::ScrollArea::both()
-            } else {
-                egui::ScrollArea::vertical()
-            }
-            .id_salt(("filter_occurrence_scroll", view_id))
-            .auto_shrink([false, false]);
+            let scroll = egui::ScrollArea::both()
+                .id_salt(("filter_occurrence_scroll", view_id))
+                .auto_shrink([false, false]);
 
             scroll
                 .max_height(available.y.max(row_height * 3.0))
@@ -178,6 +180,27 @@ pub(super) fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     if escape || modal_response.backdrop_response.clicked() || close {
         tab.close_occurrence_overlay();
     }
+}
+
+fn occurrence_dialog_size(viewport: egui::Vec2) -> (egui::Vec2, egui::Vec2, egui::Vec2) {
+    let max_size = egui::vec2(
+        (viewport.x - OCCURRENCE_DIALOG_INSET).max(1.0),
+        (viewport.y - OCCURRENCE_DIALOG_INSET).max(1.0),
+    );
+    let min_size = egui::vec2(
+        OCCURRENCE_DIALOG_MIN.x.min(max_size.x),
+        OCCURRENCE_DIALOG_MIN.y.min(max_size.y),
+    );
+    let default_size = egui::vec2(
+        (viewport.x * OCCURRENCE_DIALOG_DEFAULT_FRACTION.x)
+            .min(OCCURRENCE_DIALOG_DEFAULT_MAX.x)
+            .max(min_size.x),
+        (viewport.y * OCCURRENCE_DIALOG_DEFAULT_FRACTION.y)
+            .min(OCCURRENCE_DIALOG_DEFAULT_MAX.y)
+            .max(min_size.y),
+    )
+    .min(max_size);
+    (default_size, min_size, max_size)
 }
 
 fn context_text(tab: &LogTab, before: &[usize], selected_line: usize, after: &[usize]) -> String {
@@ -358,7 +381,9 @@ fn format_human_duration_ms(ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::relative_occurrence_text;
+    use eframe::egui;
+
+    use super::{occurrence_dialog_size, relative_occurrence_text};
 
     #[test]
     fn occurrence_tooltip_uses_human_time_before_and_after_the_source() {
@@ -379,5 +404,19 @@ mod tests {
             relative_occurrence_text(None, None, 10, 20),
             "after 10 lines"
         );
+    }
+
+    #[test]
+    fn occurrence_dialog_size_is_responsive_and_bounded() {
+        let (default_size, min_size, max_size) =
+            occurrence_dialog_size(egui::vec2(1600.0, 1000.0));
+        assert_eq!(min_size, egui::vec2(320.0, 180.0));
+        assert_eq!(max_size, egui::vec2(1568.0, 968.0));
+        assert_eq!(default_size, egui::vec2(1000.0, 700.0));
+
+        let (default_size, min_size, max_size) =
+            occurrence_dialog_size(egui::vec2(300.0, 140.0));
+        assert_eq!(min_size, max_size);
+        assert_eq!(default_size, max_size);
     }
 }

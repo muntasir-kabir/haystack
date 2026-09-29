@@ -1866,6 +1866,12 @@ fn show_search_ui(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         if input_resp.has_focus() && tab.find_input.trim().is_empty() {
             tab.search_suggestions_open = true;
         }
+        // A new query invalidates both completed results and an in-flight
+        // worker immediately. Enter then starts a fresh search for the new
+        // text instead of leaving stale matches visible while editing.
+        if input_resp.changed() && (tab.find_rx.is_some() || !tab.find_query.is_empty()) {
+            tab.clear_find();
+        }
         if input_resp.changed() && !tab.find_input.trim().is_empty() {
             tab.search_suggestions_open = false;
         }

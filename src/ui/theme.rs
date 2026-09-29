@@ -109,6 +109,12 @@ pub struct Theme {
     pub text_muted: Color32,
     /// Background of the selected / active line.
     pub selection_bg: Color32,
+    /// Fill painted over a selected line for a mouse-selected text range.
+    /// This must remain distinct from `selection_bg` so nested text selection
+    /// stays visible on top of the row selection.
+    pub text_selection_bg: Color32,
+    /// Glyph colour painted over a mouse-selected text range.
+    pub text_selection_fg: Color32,
     /// Accent colour for links, active indicators, etc.
     pub accent: Color32,
     /// Histogram bar colour (density plot).
@@ -144,6 +150,10 @@ pub struct Theme {
     pub viewport_shadow: Color32,
     /// Viewport shadow stroke on timeline.
     pub viewport_shadow_stroke: Color32,
+    /// Translucent fill for pinned source ranges on the timeline.
+    pub pinned_shadow: Color32,
+    /// Border for pinned source ranges on the timeline.
+    pub pinned_shadow_stroke: Color32,
     /// Warning / alert colour (e.g. trim indicator).
     pub warning: Color32,
     /// Analysis text colour (red in the bottom panel).
@@ -188,7 +198,9 @@ impl Theme {
             surface: Color32::from_rgb(0x22, 0x29, 0x34),
             text: Color32::from_rgb(0xd6, 0xdd, 0xe7),
             text_muted: Color32::from_rgb(0x9b, 0xa8, 0xba),
-            selection_bg: Color32::from_rgb(0x29, 0x3d, 0x58),
+            selection_bg: Color32::from_rgb(0x1f, 0x4d, 0x79),
+            text_selection_bg: Color32::from_rgb(0x00, 0xb8, 0xd4),
+            text_selection_fg: Color32::from_rgb(0x06, 0x1b, 0x25),
             accent: Color32::from_rgb(0x8a, 0xb4, 0xf8),
             histogram: Color32::from_rgba_unmultiplied(78, 78, 78, 82),
             minimap_bg: Color32::from_gray(38),
@@ -206,6 +218,8 @@ impl Theme {
             placeholder: Color32::GRAY,
             viewport_shadow: Color32::from_rgba_unmultiplied(130, 145, 165, 18),
             viewport_shadow_stroke: Color32::from_rgba_unmultiplied(130, 145, 165, 80),
+            pinned_shadow: Color32::from_rgba_unmultiplied(138, 180, 248, 28),
+            pinned_shadow_stroke: Color32::from_rgba_unmultiplied(138, 180, 248, 105),
             warning: Color32::from_rgb(0xe2, 0xb3, 0x5b),
             analysis_text: Color32::from_rgb(0xd6, 0xdd, 0xe7),
             selection_range_bg: Color32::from_rgba_unmultiplied(137, 180, 250, 40),
@@ -242,7 +256,9 @@ impl Theme {
             surface: Color32::from_rgb(0xff, 0xff, 0xff),
             text: Color32::from_rgb(0x24, 0x30, 0x41),
             text_muted: Color32::from_rgb(0x59, 0x65, 0x79),
-            selection_bg: Color32::from_rgb(0xe2, 0xec, 0xfa),
+            selection_bg: Color32::from_rgb(0xd8, 0xe9, 0xff),
+            text_selection_bg: Color32::from_rgb(0x1d, 0x63, 0xd8),
+            text_selection_fg: Color32::WHITE,
             accent: Color32::from_rgb(0x24, 0x5f, 0xbb),
             histogram: Color32::from_rgba_unmultiplied(120, 125, 135, 72),
             minimap_bg: Color32::from_gray(220),
@@ -260,6 +276,8 @@ impl Theme {
             placeholder: Color32::GRAY,
             viewport_shadow: Color32::from_rgba_unmultiplied(100, 110, 125, 20),
             viewport_shadow_stroke: Color32::from_rgba_unmultiplied(80, 95, 115, 90),
+            pinned_shadow: Color32::from_rgba_unmultiplied(36, 95, 187, 24),
+            pinned_shadow_stroke: Color32::from_rgba_unmultiplied(36, 95, 187, 105),
             warning: Color32::from_rgb(0x94, 0x60, 0x00),
             analysis_text: Color32::from_rgb(0x24, 0x30, 0x41),
             selection_range_bg: Color32::from_rgba_unmultiplied(30, 102, 245, 30),
@@ -296,8 +314,11 @@ pub fn egui_visuals(dark_mode: bool) -> Visuals {
     visuals.hyperlink_color = theme.accent;
     visuals.warn_fg_color = theme.severity_warning;
     visuals.error_fg_color = theme.severity_error;
-    visuals.selection.bg_fill = theme.selection_focused;
-    visuals.selection.stroke = Stroke::new(1.0, theme.focus_ring);
+    // Text selection is nested inside the selected-row fill in Log View. Keep
+    // it vivid and give the selected glyphs their own contrasting colour so
+    // the inner range remains obvious in both themes.
+    visuals.selection.bg_fill = theme.text_selection_bg;
+    visuals.selection.stroke = Stroke::new(1.0, theme.text_selection_fg);
     visuals.window_corner_radius = CornerRadius::same(4);
     visuals.menu_corner_radius = CornerRadius::same(4);
     visuals.window_shadow = eframe::epaint::Shadow::NONE;
@@ -444,9 +465,20 @@ mod tests {
         let theme = Theme::dark();
         let visuals = egui_visuals(true);
         let dock = dock_style(true);
-        assert_eq!(visuals.selection.bg_fill, theme.selection_focused);
+        assert_eq!(visuals.selection.bg_fill, theme.text_selection_bg);
+        assert_eq!(visuals.selection.stroke.color, theme.text_selection_fg);
         assert_eq!(visuals.widgets.hovered.bg_fill, theme.hover);
         assert_eq!(dock.tab.tab_body.bg_fill, theme.log_surface);
         assert_eq!(dock.separator.color_idle, theme.border);
+    }
+
+    #[test]
+    fn nested_text_selection_is_distinct_from_selected_line_in_both_themes() {
+        for (dark_mode, theme) in [(true, Theme::dark()), (false, Theme::light())] {
+            let visuals = egui_visuals(dark_mode);
+            assert_ne!(theme.text_selection_bg, theme.selection_bg);
+            assert_eq!(visuals.selection.bg_fill, theme.text_selection_bg);
+            assert_eq!(visuals.selection.stroke.color, theme.text_selection_fg);
+        }
     }
 }

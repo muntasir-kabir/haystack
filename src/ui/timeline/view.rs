@@ -37,6 +37,8 @@ const DENSE_BUCKET_HEIGHT: f32 = 11.0;
 const SMALL_BUCKET_MAX_OCCURRENCES: u32 = 4;
 const MEDIUM_BUCKET_MAX_OCCURRENCES: u32 = 16;
 const MINIMAP_HEIGHT: f32 = 12.0;
+/// The default top-panel frame has 2px of inner margin on each vertical edge.
+const PANEL_FRAME_VERTICAL_MARGIN: f32 = 4.0;
 /// Vertical placement of the minimap after the gesture hint row was removed.
 const MINIMAP_AXIS_OFFSET: f32 = 16.0;
 /// Zoom factor per scroll tick.
@@ -63,7 +65,9 @@ fn minimap_color(theme: &Theme) -> Color32 {
 
 /// Compute the total height of the timeline panel for the given tab.
 /// Used by the fixed top panel so the whole timeline (header, histogram,
-/// all filter lanes, axis labels, and minimap) is always fully visible.
+/// all filter lanes, axis labels, and minimap) is always fully visible. The
+/// panel frame's vertical margins are included because `Panel::exact_size`
+/// measures the outer panel size.
 pub fn panel_height(tab: &LogTab) -> f32 {
     let n_filter_lanes = tab
         .timeline
@@ -83,7 +87,8 @@ pub fn panel_height(tab: &LogTab) -> f32 {
     let lanes_height = total_lanes as f32 * LANE_HEIGHT;
     let content_height = HISTO_HEIGHT.max(lanes_height);
 
-    HEADER_HEIGHT
+    PANEL_FRAME_VERTICAL_MARGIN
+        + HEADER_HEIGHT
         + content_height
         + (if has_lanes { 4.0 } else { 0.0 }) // gap after histo to axis labels
         + 18.0 // axis labels row
@@ -92,6 +97,11 @@ pub fn panel_height(tab: &LogTab) -> f32 {
 
 pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
     let zoomed = tab.timeline_zoom.is_some();
+
+    // The body follows the header immediately. Set this before the header is
+    // allocated; changing item spacing afterward cannot remove the gap that
+    // egui already reserves between the two rows.
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     let mut requested_mode = tab.timeline_display_mode;
     ui.horizontal(|ui| {
@@ -139,49 +149,15 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
 
         if tab.selected_lane.is_some() {
             // Keep this navigation hint inside the fixed header row. A bare
-            // right-to-left layout inherits the full panel height and centers
-            // its contents over the lanes, making the header look like it is
-            // part of the timeline body and stealing lane hit-testing space.
+            // layout inherits the full panel height and can center its
+            // contents over the lanes, making the header look like it is part
+            // of the timeline body and stealing lane hit-testing space.
             let header_width = ui.available_width().max(0.0);
-            let mut unselect = false;
             ui.allocate_ui_with_layout(
                 egui::vec2(header_width, HEADER_HEIGHT),
-                egui::Layout::right_to_left(egui::Align::Center),
+                egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    if icons::action_button(
-                        ui,
-                        Icon::Close,
-                        "Clear selection",
-                        theme.text,
-                        "Clear the selected filter lane",
-                    )
-                    .clicked()
-                    {
-                        unselect = true;
-                    }
-                    ui.add_space(8.0);
-                    ui.add(icons::icon_image(
-                        ui.ctx(),
-                        Icon::ArrowRight,
-                        12.0,
-                        theme.text_muted,
-                    ))
-                    .on_hover_text("Next filter occurrence (Right Arrow)");
-                    ui.add_space(7.0);
-                    ui.add(icons::icon_image(
-                        ui.ctx(),
-                        Icon::ArrowLeft,
-                        12.0,
-                        theme.text_muted,
-                    ))
-                    .on_hover_text("Previous filter occurrence (Left Arrow)");
-                    ui.add_space(5.0);
-                    ui.label(RichText::new("Navigate").small().color(theme.text_muted))
-                        .on_hover_text(
-                            "Use Left and Right arrows to move through occurrences in the selected lane",
-                        );
                     if let Some(text) = occurrence_navigation_text(tab) {
-                        ui.add_space(10.0);
                         let changed = tab
                             .occurrence_navigation_animation
                             .as_ref()
@@ -200,14 +176,8 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
                     }
                 },
             );
-            if unselect {
-                tab.selected_lane = None;
-            }
         }
     });
-
-    // Eliminate spacing between header and content immediately after header closes
-    ui.spacing_mut().item_spacing.y = 0.0;
 
     if requested_mode != tab.timeline_display_mode {
         tab.set_timeline_display_mode(requested_mode);
@@ -966,6 +936,33 @@ pub fn show(ui: &mut egui::Ui, tab: &mut LogTab, theme: &Theme) {
         );
     }
 
+    // ---- pinned ranges: shaded bands showing saved source ranges ----
+    for pin in &tab.pins {
+        let Some((first_line, last_line)) = pin.visible_bounds(tab.doc.total_lines()) else {
+            continue;
+        };
+        let Some((v0, v1)) = axis_bounds_for_line_range(tab, first_line, last_line) else {
+            continue;
+        };
+        let range_start = v0.min(v1);
+        let range_end = v0.max(v1);
+        if range_end < view_start || range_start > view_end {
+            continue;
+        }
+        let x0 = x_to_px(range_start);
+        let x1 = x_to_px(range_end);
+        let Some(pin_rect) = pinned_range_rect(hist, x0, x1) else {
+            continue;
+        };
+        painter.rect_filled(pin_rect, egui::CornerRadius::same(2), theme.pinned_shadow);
+        painter.rect_stroke(
+            pin_rect,
+            egui::CornerRadius::same(2),
+            Stroke::new(1.0, theme.pinned_shadow_stroke),
+            egui::StrokeKind::Middle,
+        );
+    }
+
     // ---- viewport shadow: shaded band showing log view's current scroll range ----
     {
         let mut shadow_first = tab.viewport_range.map(|(f, _)| f);
@@ -1559,6 +1556,33 @@ fn minimap_rect(hist: Rect, axis_top: f32) -> Rect {
     )
 }
 
+/// Clamp a pinned range to the visible timeline and keep a single-line pin
+/// visible when both endpoints map to the same pixel.
+fn pinned_range_rect(hist: Rect, x0: f32, x1: f32) -> Option<Rect> {
+    let raw_left = x0.min(x1);
+    let raw_right = x0.max(x1);
+    if raw_right < hist.left() || raw_left > hist.right() {
+        return None;
+    }
+
+    let left = raw_left.max(hist.left());
+    let right = raw_right.min(hist.right());
+    const MIN_WIDTH: f32 = 3.0;
+    if right - left >= MIN_WIDTH {
+        return Some(Rect::from_min_max(
+            Pos2::new(left, hist.top()),
+            Pos2::new(right, hist.bottom()),
+        ));
+    }
+
+    let center = ((left + right) / 2.0).clamp(hist.left(), hist.right());
+    let half_width = MIN_WIDTH / 2.0;
+    Some(Rect::from_min_max(
+        Pos2::new((center - half_width).max(hist.left()), hist.top()),
+        Pos2::new((center + half_width).min(hist.right()), hist.bottom()),
+    ))
+}
+
 fn format_human_duration_ms(ms: i64) -> String {
     let value = unsigned_human_duration_ms(ms.unsigned_abs());
     if ms < 0 {
@@ -1650,11 +1674,17 @@ fn show_occurrence_navigation(
         )
     };
     ui.add_space(offset);
-    ui.label(
-        RichText::new(text)
-            .size(12.0)
-            .color(animated_color(theme.text_muted)),
+    let response = ui.add_sized(
+        egui::vec2(ui.available_width().max(0.0), HEADER_HEIGHT),
+        egui::Label::new(
+            RichText::new(text)
+                .size(12.0)
+                .color(animated_color(theme.text_muted)),
+        )
+        .halign(egui::Align::RIGHT)
+        .truncate(),
     );
+    response.on_hover_text(text);
 }
 
 fn domain_span(domain: &TimelineDomain, total_lines: usize) -> (i64, i64) {
@@ -1822,6 +1852,27 @@ mod tests {
             minimap_color(&Theme::dark()),
             Color32::from_rgba_unmultiplied(130, 130, 130, 255)
         );
+    }
+
+    #[test]
+    fn pinned_range_rect_keeps_single_line_pins_visible() {
+        let hist = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(110.0, 80.0));
+        let rect = pinned_range_rect(hist, 60.0, 60.0).unwrap();
+
+        assert_eq!(rect.top(), hist.top());
+        assert_eq!(rect.bottom(), hist.bottom());
+        assert_eq!(rect.width(), 3.0);
+        assert_eq!(rect.center().x, 60.0);
+    }
+
+    #[test]
+    fn pinned_range_rect_clips_ranges_to_the_histogram() {
+        let hist = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(110.0, 80.0));
+        let rect = pinned_range_rect(hist, 0.0, 50.0).unwrap();
+
+        assert_eq!(rect.left(), hist.left());
+        assert_eq!(rect.right(), 50.0);
+        assert!(pinned_range_rect(hist, 0.0, 5.0).is_none());
     }
 
     #[test]

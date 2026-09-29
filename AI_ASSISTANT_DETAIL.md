@@ -9,12 +9,15 @@ annotations use persistent quiet cues with hover, inspector, and context-menu
 access. The main workspace fixes Log Views in its upper dock panel and
 Pinned/Templates in its lower panel. Detached docks have stable window
 identities, accept Log/Pinned/Templates tabs in free-form layouts, and use
-monitor-coordinate, source-captured drag-and-drop that does not rely on
-destination-window events. Dock dragging activates after four points and shows
-a tab ghost plus exact insertion, join, and directional split previews. A drop
-outside legal targets creates a native detached window at the pointer after
-showing a lightweight rectangle/title-strip preview; it never renders live pane
-content during the drag.
+monitor-coordinate drag-and-drop that accepts backend-dependent motion and
+release events from the source or hovered destination window. Dock dragging
+activates after four points and shows a tab ghost, exact insertion markers, a
+large 50%-transparent five-button detached-pane docking compass, and explicit
+main-panel targets. A detached pane defaults to its center join outside the
+directional buttons. Outside every application window, a transparent,
+mouse-pass-through native viewport follows the pointer as the lightweight
+rectangle/title-strip preview; raw motion preserves fast crossings, and the
+preview never renders live pane content during the drag.
 Schema-4 sidecars persist each detached window's stable id, complete dock tree,
 and last known native position/inner size; schema-4 files without that optional
 data retain the earlier one-window-per-detached-tab restore behavior.
